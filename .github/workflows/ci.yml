@@ -30,3 +30,6 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+      - name: CLI smoke test
+        run: trademind
