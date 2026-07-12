@@ -8,6 +8,7 @@ from trademind import __version__
 from trademind.config import Settings
 from trademind.logging_config import configure_logging
 from trademind.market.mock_provider import MockMarketDataProvider
+from trademind.signals import SignalEngine
 
 LOGGER = logging.getLogger("trademind")
 
@@ -34,18 +35,24 @@ def main() -> int:
         LOGGER.error("Market-data provider healthcheck failed")
         return 1
 
+    engine = SignalEngine()
     for symbol in settings.symbols:
-        candles = provider.get_candles(symbol, settings.timeframe, count=3)
-        latest = candles[-1]
+        candles = provider.get_candles(symbol, settings.timeframe, count=60)
+        result = engine.analyze(candles)
         LOGGER.info(
-            "%s %s latest close=%.5f time=%s",
-            symbol,
-            settings.timeframe,
-            latest.close,
-            latest.time.isoformat(),
+            "%s %s action=%s score=%d confidence=%d EMA9=%.5f EMA21=%.5f RSI=%.2f ATR=%.5f",
+            result.symbol,
+            result.timeframe,
+            result.action,
+            result.score,
+            result.confidence,
+            result.ema_fast,
+            result.ema_slow,
+            result.rsi,
+            result.atr,
         )
 
-    LOGGER.info("Core smoke test completed successfully")
+    LOGGER.info("Signal engine smoke test completed successfully")
     return 0
 
 
