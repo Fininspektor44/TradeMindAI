@@ -25,13 +25,16 @@ if (-not (Test-Path $DataDir -PathType Container)) {
     throw "MT5 data directory not found: $DataDir"
 }
 
-$primarySymbol = ($Symbols -split ",")[0].Trim().ToUpperInvariant()
+$symbolNames = @(
+    $Symbols -split "," |
+        ForEach-Object { $_.Trim().ToUpperInvariant() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+)
 $timeframeName = $Timeframe.Trim().ToUpperInvariant()
-$primaryCsv = Join-Path $DataDir "${primarySymbol}_${timeframeName}.csv"
 
 $env:TRADEMIND_PROVIDER = "csv"
 $env:TRADEMIND_DATA_DIR = $DataDir
-$env:TRADEMIND_SYMBOLS = $Symbols
+$env:TRADEMIND_SYMBOLS = ($symbolNames -join ",")
 $env:TRADEMIND_TIMEFRAME = $timeframeName
 $env:TRADEMIND_MAX_DATA_AGE_SECONDS = [string]$MaxDataAgeSeconds
 $env:TRADEMIND_JOURNAL_DIR = $journalPath
@@ -42,33 +45,40 @@ Write-Host "TradeMind live watcher started"
 Write-Host "Project: $projectPath"
 Write-Host "Data:    $DataDir"
 Write-Host "Journal: $journalPath"
-Write-Host "Trigger: $primaryCsv"
+Write-Host "Watching: $($symbolNames -join ',') $timeframeName"
 Write-Host "Press Ctrl+C to stop."
 
-$lastProcessedCandle = $null
+$lastProcessedSignature = $null
 
 while ($true) {
     try {
-        if (-not (Test-Path $primaryCsv -PathType Leaf)) {
-            throw "Trigger CSV not found: $primaryCsv"
+        $signatureParts = foreach ($symbol in $symbolNames) {
+            $csvPath = Join-Path $DataDir "${symbol}_${timeframeName}.csv"
+            if (-not (Test-Path $csvPath -PathType Leaf)) {
+                "${symbol}=MISSING"
+                continue
+            }
+
+            $latestRow = Import-Csv $csvPath | Select-Object -Last 1
+            $latestCandle = $latestRow.time
+            if ([string]::IsNullOrWhiteSpace($latestCandle)) {
+                "${symbol}=EMPTY"
+            }
+            else {
+                "${symbol}=${latestCandle}"
+            }
         }
+        $currentSignature = $signatureParts -join ";"
 
-        $latestRow = Import-Csv $primaryCsv | Select-Object -Last 1
-        $latestCandle = $latestRow.time
-
-        if ([string]::IsNullOrWhiteSpace($latestCandle)) {
-            throw "Latest candle timestamp is missing in $primaryCsv"
-        }
-
-        if ($latestCandle -ne $lastProcessedCandle) {
-            Write-Host "`nNew closed candle detected: $latestCandle"
+        if ($currentSignature -ne $lastProcessedSignature) {
+            Write-Host "`nMarket-data update detected: $currentSignature"
             & $trademindExe
 
             if ($LASTEXITCODE -eq 0) {
-                $lastProcessedCandle = $latestCandle
+                $lastProcessedSignature = $currentSignature
             }
             else {
-                Write-Warning "TradeMind exited with code $LASTEXITCODE. The candle will be retried."
+                Write-Warning "TradeMind exited with code $LASTEXITCODE. Data will be retried."
             }
         }
     }
