@@ -6,6 +6,7 @@ import logging
 
 from trademind import __version__
 from trademind.config import Settings
+from trademind.journal import SignalJournal
 from trademind.logging_config import configure_logging
 from trademind.market.csv_provider import CsvMarketDataProvider
 from trademind.market.mock_provider import MockMarketDataProvider
@@ -43,15 +44,31 @@ def main() -> int:
         LOGGER.error("Market-data provider healthcheck failed")
         return 1
 
+    try:
+        journal = SignalJournal(
+            settings.journal_dir,
+            horizons=settings.evaluation_horizons,
+            point_sizes=settings.point_sizes,
+        )
+    except (OSError, ValueError) as exc:
+        LOGGER.error("Signal journal initialization failed: %s", exc)
+        return 1
+
+    LOGGER.info("Signal journal=%s", journal.path)
     engine = SignalEngine()
+    successful_symbols = 0
+    failed_symbols = 0
+
     for symbol in settings.symbols:
         try:
             candles = provider.get_candles(symbol, settings.timeframe, count=60)
             result = engine.analyze(candles)
         except (FileNotFoundError, ValueError) as exc:
+            failed_symbols += 1
             LOGGER.error("%s %s analysis failed: %s", symbol, settings.timeframe, exc)
-            return 1
+            continue
 
+        successful_symbols += 1
         LOGGER.info(
             "%s %s action=%s score=%d confidence=%d EMA9=%.5f EMA21=%.5f RSI=%.2f ATR=%.5f",
             result.symbol,
@@ -65,7 +82,30 @@ def main() -> int:
             result.atr,
         )
 
-    LOGGER.info("Signal engine completed successfully")
+        try:
+            recorded = journal.record(result, candles[-1])
+            evaluated = journal.evaluate(result.symbol, result.timeframe, candles)
+            LOGGER.info(
+                "%s %s journal recorded=%s evaluations_updated=%d",
+                result.symbol,
+                result.timeframe,
+                recorded,
+                evaluated,
+            )
+        except (OSError, ValueError) as exc:
+            LOGGER.error("%s %s journal update failed: %s", symbol, settings.timeframe, exc)
+
+    if successful_symbols == 0:
+        LOGGER.error("Signal engine failed for all configured symbols")
+        return 1
+    if failed_symbols:
+        LOGGER.warning(
+            "Signal engine completed with %d healthy and %d failed symbols",
+            successful_symbols,
+            failed_symbols,
+        )
+    else:
+        LOGGER.info("Signal engine completed successfully")
     return 0
 
 
