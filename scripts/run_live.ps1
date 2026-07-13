@@ -15,6 +15,7 @@ if ($PollSeconds -lt 1) {
 
 $projectPath = (Resolve-Path $ProjectDir).Path
 $trademindExe = Join-Path $projectPath ".venv\Scripts\trademind.exe"
+$journalPath = Join-Path $projectPath "data\journal"
 
 if (-not (Test-Path $trademindExe)) {
     throw "TradeMind executable not found: $trademindExe"
@@ -33,10 +34,14 @@ $env:TRADEMIND_DATA_DIR = $DataDir
 $env:TRADEMIND_SYMBOLS = $Symbols
 $env:TRADEMIND_TIMEFRAME = $timeframeName
 $env:TRADEMIND_MAX_DATA_AGE_SECONDS = [string]$MaxDataAgeSeconds
+$env:TRADEMIND_JOURNAL_DIR = $journalPath
+$env:TRADEMIND_EVAL_HORIZONS = "3,6,12"
+$env:TRADEMIND_POINT_SIZES = "XAUUSD=0.01,EURUSD=0.00001,GBPUSD=0.00001"
 
 Write-Host "TradeMind live watcher started"
 Write-Host "Project: $projectPath"
 Write-Host "Data:    $DataDir"
+Write-Host "Journal: $journalPath"
 Write-Host "Trigger: $primaryCsv"
 Write-Host "Press Ctrl+C to stop."
 
