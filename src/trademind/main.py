@@ -7,6 +7,7 @@ import logging
 from trademind import __version__
 from trademind.config import Settings
 from trademind.logging_config import configure_logging
+from trademind.market.csv_provider import CsvMarketDataProvider
 from trademind.market.mock_provider import MockMarketDataProvider
 from trademind.signals import SignalEngine
 
@@ -26,19 +27,31 @@ def main() -> int:
         ",".join(settings.symbols),
     )
 
-    if settings.provider != "mock":
-        LOGGER.error("Provider '%s' is not implemented yet", settings.provider)
+    if settings.provider == "mock":
+        provider = MockMarketDataProvider()
+    elif settings.provider == "csv":
+        provider = CsvMarketDataProvider(
+            settings.market_data_dir,
+            max_age_seconds=settings.max_data_age_seconds,
+        )
+        LOGGER.info("MT5 CSV directory=%s", provider.data_dir)
+    else:
+        LOGGER.error("Provider '%s' is not implemented", settings.provider)
         return 2
 
-    provider = MockMarketDataProvider()
     if not provider.healthcheck():
         LOGGER.error("Market-data provider healthcheck failed")
         return 1
 
     engine = SignalEngine()
     for symbol in settings.symbols:
-        candles = provider.get_candles(symbol, settings.timeframe, count=60)
-        result = engine.analyze(candles)
+        try:
+            candles = provider.get_candles(symbol, settings.timeframe, count=60)
+            result = engine.analyze(candles)
+        except (FileNotFoundError, ValueError) as exc:
+            LOGGER.error("%s %s analysis failed: %s", symbol, settings.timeframe, exc)
+            return 1
+
         LOGGER.info(
             "%s %s action=%s score=%d confidence=%d EMA9=%.5f EMA21=%.5f RSI=%.2f ATR=%.5f",
             result.symbol,
@@ -52,7 +65,7 @@ def main() -> int:
             result.atr,
         )
 
-    LOGGER.info("Signal engine smoke test completed successfully")
+    LOGGER.info("Signal engine completed successfully")
     return 0
 
 
