@@ -1,7 +1,7 @@
 param(
     [string]$ProjectDir = (Split-Path -Parent $PSScriptRoot),
     [string]$DataDir = "$env:APPDATA\MetaQuotes\Terminal\Common\Files\TradeMindAI",
-    [string]$Symbols = "XAUUSD,EURUSD,GBPUSD",
+    [string]$Symbols = "XAUUSD",
     [string]$Timeframe = "M5",
     [int]$PollSeconds = 10,
     [int]$MaxDataAgeSeconds = 900
