@@ -70,7 +70,8 @@ def main() -> int:
 
         successful_symbols += 1
         LOGGER.info(
-            "%s %s action=%s score=%d confidence=%d EMA9=%.5f EMA21=%.5f RSI=%.2f ATR=%.5f",
+            "%s %s action=%s score=%d confidence=%d EMA9=%.5f EMA21=%.5f "
+            "RSI=%.2f ATR=%.5f spread=%d volume=%d",
             result.symbol,
             result.timeframe,
             result.action,
@@ -80,10 +81,12 @@ def main() -> int:
             result.ema_slow,
             result.rsi,
             result.atr,
+            candles[-1].spread,
+            candles[-1].tick_volume,
         )
 
         try:
-            recorded = journal.record(result, candles[-1])
+            recorded = journal.record(result, candles[-1], history=candles)
             evaluated = journal.evaluate(result.symbol, result.timeframe, candles)
             LOGGER.info(
                 "%s %s journal recorded=%s evaluations_updated=%d",
