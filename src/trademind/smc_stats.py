@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-from trademind.stats import _float, _metrics, _non_overlapping
+from trademind.stats import _float, _non_overlapping
 
 _HORIZON_PATTERN = re.compile(r"^outcome_(\d+)$")
 _EVENT_ORDER = (
@@ -22,6 +22,14 @@ _EVENT_ORDER = (
     "SSL_SWEEP",
     "BULLISH_FVG",
     "BEARISH_FVG",
+)
+_CONTEXT_ORDER = (
+    "HIGH_VOLUME",
+    "NORMAL_VOLUME",
+    "LOW_SPREAD",
+    "HIGH_SPREAD",
+    "STRUCTURE_ALIGNED",
+    "STRUCTURE_CONFLICT",
 )
 
 
@@ -84,6 +92,46 @@ def _prepared(
     return _non_overlapping(rows, horizon) if non_overlap else rows
 
 
+def _normalized_net(row: dict[str, str], horizon: int) -> float | None:
+    stored = row.get(f"progress_atr_{horizon}", "").strip()
+    if stored:
+        return float(stored)
+    atr = _float(row, "atr")
+    if atr <= 0:
+        return None
+    return _float(row, f"net_move_{horizon}") / atr
+
+
+def _normalized_metrics(rows: list[dict[str, str]], horizon: int) -> dict[str, float]:
+    """Return metrics that remain comparable across instruments and price scales."""
+    evaluated = [
+        row
+        for row in rows
+        if row.get("action") in {"BUY", "SELL"}
+        and row.get(f"outcome_{horizon}") in {"WIN", "LOSS", "FLAT"}
+    ]
+    values = [
+        value
+        for row in evaluated
+        if (value := _normalized_net(row, horizon)) is not None
+    ]
+    wins = sum(row[f"outcome_{horizon}"] == "WIN" for row in evaluated)
+    losses = sum(row[f"outcome_{horizon}"] == "LOSS" for row in evaluated)
+    positive = sum(value for value in values if value > 0)
+    negative = abs(sum(value for value in values if value < 0))
+    decided = wins + losses
+    return {
+        "total": float(len(evaluated)),
+        "wins": float(wins),
+        "losses": float(losses),
+        "win_rate": wins / decided * 100.0 if decided else 0.0,
+        "avg_net_atr": sum(values) / len(values) if values else 0.0,
+        "profit_factor_atr": (
+            positive / negative if negative else (float("inf") if positive else 0.0)
+        ),
+    }
+
+
 def _print_group(
     label: str,
     rows: list[dict[str, str]],
@@ -92,14 +140,14 @@ def _print_group(
     minimum_sample: int,
     non_overlap: bool,
 ) -> None:
-    metrics = _metrics(_prepared(rows, horizon, non_overlap), horizon)
+    metrics = _normalized_metrics(_prepared(rows, horizon, non_overlap), horizon)
     trades = int(metrics["total"])
-    profit_factor = metrics["profit_factor"]
+    profit_factor = metrics["profit_factor_atr"]
     pf_text = "inf" if profit_factor == float("inf") else f"{profit_factor:.2f}"
     print(
         f"{label:<22} observations={len(rows):>5} trades={trades:>5} "
         f"status={_sample_status(trades, minimum_sample):<19} "
-        f"WR={metrics['win_rate']:>6.2f}% PF={pf_text:>6} "
+        f"WR={metrics['win_rate']:>6.2f}% PF_ATR={pf_text:>6} "
         f"avg_net/ATR={metrics['avg_net_atr']:>8.3f}"
     )
 
@@ -151,6 +199,47 @@ def _apply_filters(
     return filtered
 
 
+def _report_scope(
+    rows: list[dict[str, str]],
+    horizon: int,
+    *,
+    minimum_sample: int,
+    non_overlap: bool,
+    volume_threshold: float,
+    spread_atr_threshold: float,
+) -> None:
+    event_groups = _event_groups(rows)
+    context_groups = _context_groups(
+        rows,
+        volume_threshold=volume_threshold,
+        spread_atr_threshold=spread_atr_threshold,
+    )
+
+    print("  SMC events")
+    for label in _EVENT_ORDER:
+        group_rows = event_groups.get(label, [])
+        if group_rows:
+            _print_group(
+                label,
+                group_rows,
+                horizon,
+                minimum_sample=minimum_sample,
+                non_overlap=non_overlap,
+            )
+
+    print("  Context cuts")
+    for label in _CONTEXT_ORDER:
+        group_rows = context_groups.get(label, [])
+        if group_rows:
+            _print_group(
+                label,
+                group_rows,
+                horizon,
+                minimum_sample=minimum_sample,
+                non_overlap=non_overlap,
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Summarize observation-only TradeMind SMC features"
@@ -170,6 +259,11 @@ def main() -> int:
         action="store_true",
         help="Count only one fixed-horizon position per symbol at a time",
     )
+    parser.add_argument(
+        "--by-symbol",
+        action="store_true",
+        help="Show complete event and context sections separately for every symbol",
+    )
     args = parser.parse_args()
 
     if args.min_sample < 1:
@@ -178,6 +272,8 @@ def main() -> int:
         parser.error("--volume-threshold must be greater than zero")
     if args.spread_atr_threshold <= 0:
         parser.error("--spread-atr-threshold must be greater than zero")
+    if args.symbol and args.by_symbol:
+        parser.error("--symbol and --by-symbol cannot be used together")
 
     journal_path = args.journal.expanduser().resolve()
     if not journal_path.is_file():
@@ -214,6 +310,7 @@ def main() -> int:
     print(f"Matching observations: {len(rows)}")
     print(f"Schema version: {args.schema_version}")
     print(f"Mode: {mode}")
+    print("Cross-symbol PF unit: ATR-normalized net movement")
     print(f"Minimum research sample: {args.min_sample} evaluated trades")
     print(
         f"Context thresholds: volume>={args.volume_threshold:.2f}x mean, "
@@ -222,44 +319,33 @@ def main() -> int:
     if args.symbol:
         print(f"Symbol: {args.symbol.upper()}")
 
-    event_groups = _event_groups(rows)
-    context_groups = _context_groups(
-        rows,
-        volume_threshold=args.volume_threshold,
-        spread_atr_threshold=args.spread_atr_threshold,
-    )
+    grouped_symbols: dict[str, list[dict[str, str]]] = defaultdict(list)
+    if args.by_symbol:
+        for row in rows:
+            grouped_symbols[row.get("symbol", "UNKNOWN").upper()].append(row)
 
     for horizon in horizons:
         print(f"\nForward horizon: {horizon} candles")
-        print("  SMC events")
-        for label in _EVENT_ORDER:
-            group_rows = event_groups.get(label, [])
-            if group_rows:
-                _print_group(
-                    label,
-                    group_rows,
-                    horizon,
-                    minimum_sample=args.min_sample,
-                    non_overlap=args.non_overlap,
-                )
+        print("Portfolio-normalized overview")
+        _report_scope(
+            rows,
+            horizon,
+            minimum_sample=args.min_sample,
+            non_overlap=args.non_overlap,
+            volume_threshold=args.volume_threshold,
+            spread_atr_threshold=args.spread_atr_threshold,
+        )
 
-        print("  Context cuts")
-        for label in (
-            "HIGH_VOLUME",
-            "NORMAL_VOLUME",
-            "LOW_SPREAD",
-            "HIGH_SPREAD",
-            "STRUCTURE_ALIGNED",
-            "STRUCTURE_CONFLICT",
-        ):
-            group_rows = context_groups.get(label, [])
-            if group_rows:
-                _print_group(
-                    label,
-                    group_rows,
+        if args.by_symbol:
+            for symbol_name in sorted(grouped_symbols):
+                print(f"\nSymbol detail: {symbol_name}")
+                _report_scope(
+                    grouped_symbols[symbol_name],
                     horizon,
                     minimum_sample=args.min_sample,
                     non_overlap=args.non_overlap,
+                    volume_threshold=args.volume_threshold,
+                    spread_atr_threshold=args.spread_atr_threshold,
                 )
     return 0
 
