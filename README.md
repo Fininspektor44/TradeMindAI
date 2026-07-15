@@ -4,9 +4,9 @@ TradeMind AI is an explainable market-screening and trader-analytics platform.
 
 ## Current milestone
 
-`v1.1.0` adds a stability-validation layer to the read-only ECN research pipeline. Patterns are now
-validated separately for each instrument and horizon. Cross-symbol aggregates remain informational
-and cannot become trading candidates.
+`v1.2.0` adds a candidate-history watcher to the read-only ECN research pipeline. Every per-symbol
+feature and horizon now has a durable change history, a current-state snapshot and important status
+transition events. Cross-symbol aggregates remain informational and cannot become trading candidates.
 
 For every newly closed configured M5 candle the runtime stores:
 
@@ -48,6 +48,15 @@ The `trademind-validate` command checks each feature group separately by instrum
 - `UNSTABLE` when the edge disappears in either half;
 - `VALIDATED` only after 300 trades and a positive lower confidence bound.
 
+The `trademind-candidate-watch` command tracks:
+
+- append-only pattern history only when observations or metrics change;
+- atomic current state for every instrument, feature and horizon;
+- transitions into and out of research-candidate status;
+- rejection when the 30-trade threshold is reached without stability;
+- validation and validation-loss events;
+- no duplicate history when the same dataset is checked repeatedly.
+
 The `trademind-dashboard` command generates a dependency-free local HTML dashboard with:
 
 - overall data-health status;
@@ -69,6 +78,7 @@ The SMC report is documented in [`docs/SMC_REPORT.md`](docs/SMC_REPORT.md).
 Daily control is documented in
 [`docs/RESEARCH_AUTOMATION.md`](docs/RESEARCH_AUTOMATION.md).
 The validation dashboard is documented in [`docs/DASHBOARD.md`](docs/DASHBOARD.md).
+Candidate history is documented in [`docs/CANDIDATE_WATCHER.md`](docs/CANDIDATE_WATCHER.md).
 Existing journal rows are preserved. Fields that were not collected historically remain blank.
 
 A broken or stale symbol does not block analysis of the remaining healthy symbols.
@@ -100,7 +110,8 @@ A broken or stale symbol does not block analysis of the remaining healthy symbol
 16. Standalone local research dashboard
 17. Per-symbol temporal stability validation
 18. Drawdown, loss-streak and confidence-interval diagnostics
-19. Automated tests and GitHub Actions checks
+19. Candidate-state history and transition events
+20. Automated tests and GitHub Actions checks
 
 ## Quick start
 
@@ -145,14 +156,15 @@ trademind-smc-stats --symbol XAUUSD --non-overlap
 trademind-smc-stats --horizon 12 --non-overlap --by-symbol --min-sample 300
 ```
 
-Run the stability validator:
+Run the stability validator and candidate watcher:
 
 ```bash
 trademind-validate --candidate-min 30 --min-sample 300
 trademind-validate --symbol XAUUSD --horizon 3 --horizon 6 --horizon 12
+trademind-candidate-watch --candidate-min 30 --min-sample 300
 ```
 
-Check health, generate the dashboard and open it on Windows:
+Check health, update candidate history, generate the dashboard and open it on Windows:
 
 ```powershell
 .\.venv\Scripts\trademind-health.exe
@@ -166,5 +178,6 @@ Generate the complete daily research package and install automation:
 .\scripts\install_daily_research_task.ps1 -DailyTime "23:55" -RunNow
 ```
 
-The live system remains read-only in v1.1.0. It records observations, evaluates outcomes, validates
-research stability and produces reports; no orders are sent to MetaTrader 5.
+The live system remains read-only in v1.2.0. It records observations, evaluates outcomes, validates
+research stability, tracks candidate transitions and produces reports; no orders are sent to
+MetaTrader 5.
