@@ -231,12 +231,9 @@ class WatchPaths:
         )
 
 
-def _fingerprint_float(value: float) -> float | str:
-    if math.isinf(value):
-        return "inf" if value > 0 else "-inf"
-    if math.isnan(value):
-        return "nan"
-    return round(value, 12)
+def _fingerprint_float(value: float) -> str:
+    """Return the exact canonical representation persisted to CSV."""
+    return _format_float(value)
 
 
 def _format_float(value: float) -> str:
