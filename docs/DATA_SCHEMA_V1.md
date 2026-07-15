@@ -1,14 +1,14 @@
-# TradeMind Data Schema v1.0
+# TradeMind Data Schema v1.1
 
 TradeMind records market observations for research. These fields are descriptive inputs and
-forward outcomes. They do not directly change BUY, SELL or WAIT decisions in v0.6.0.
+forward outcomes. They do not directly change BUY, SELL or WAIT decisions in v0.7.0.
 
 ## Identity
 
 - `schema_version`: journal schema version.
 - `signal_id`: unique `symbol:timeframe:timestamp` key.
 - `signal_time`, `symbol`, `timeframe`: closed-candle identity.
-- `action`, `score`, `confidence`, `reasons`: output of the current transparent signal engine.
+- `action`, `score`, `confidence`, `reasons`: output of the transparent signal engine.
 
 ## Spread
 
@@ -26,6 +26,27 @@ MT5 supplies tick volume, not centralized exchange volume.
 - `volume_mean_20`: mean tick volume of the previous 20 closed candles.
 - `volume_ratio_20`: signal-candle volume divided by the previous-20 mean.
 - `volume_change_pct`: percentage change from the immediately preceding candle.
+
+## Market structure
+
+The structure module is observation-only and has zero signal-score weight.
+
+- `structure_version`: version of the deterministic structure definitions.
+- `internal_bias`: `BULLISH`, `BEARISH` or `NEUTRAL` from the prior 4-bar window.
+- `internal_reference_high`, `internal_reference_low`: internal reference range.
+- `internal_break`: internal `BOS`, `CHOCH`, neutral-direction break or `NONE`.
+- `swing_bias`: bias from the prior 30-bar window.
+- `swing_reference_high`, `swing_reference_low`: swing reference range.
+- `swing_break`: swing `BOS`, `CHOCH`, neutral-direction break or `NONE`.
+- `liquidity_reference_high`, `liquidity_reference_low`: prior 20-bar liquidity range.
+- `bsl_sweep`, `ssl_sweep`: one when price takes the reference extreme and closes back inside.
+- `bsl_sweep_depth`, `ssl_sweep_depth`: sweep depth in price units.
+- `bsl_sweep_depth_atr`, `ssl_sweep_depth_atr`: sweep depth normalized by entry ATR.
+- `fvg_direction`: `BULLISH`, `BEARISH` or `NONE` for the latest three-candle pattern.
+- `fvg_size`, `fvg_size_atr`: FVG size in price and ATR units.
+- `structure_event_count`: number of structure events recorded on the observation candle.
+
+Exact definitions are in [`SMC_OBSERVATION_SPEC.md`](SMC_OBSERVATION_SPEC.md).
 
 ## Progress
 
@@ -48,4 +69,4 @@ For every configured horizon, currently 3, 6 and 12 closed candles:
 ## Compatibility
 
 Existing journal rows are preserved. When the journal is next rewritten, legacy rows receive
-blank values for fields that were not collected at the time. New rows use schema version 1.0.
+blank values for fields that were not collected at the time. New rows use schema version 1.1.
