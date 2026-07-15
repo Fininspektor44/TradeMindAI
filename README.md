@@ -4,21 +4,26 @@ TradeMind AI is an explainable market-screening and trader-analytics platform.
 
 ## Current milestone
 
-`v0.6.0` expands the persistent journal into a market-observation dataset. The current signal
-logic remains unchanged while every new closed-candle observation records richer evidence for
-future setup-quality research.
+`v0.7.0` adds an observation-only market-structure module to the existing ECN research
+pipeline. It records transparent SMC-style features without changing BUY/SELL/WAIT decisions.
 
-For every configured MT5 symbol and M5 candle the runtime stores:
+For every newly closed configured M5 candle the runtime stores:
 
-- BUY / SELL / WAIT, score, confidence and decision reasons;
-- entry price and spread in points, price units, ATR units and percentage terms;
-- signal-candle tick volume, previous-20 mean, relative volume and one-bar volume change;
-- outcomes after 3, 6 and 12 closed candles;
-- directional and net movement after configured spread cost;
-- movement, MFE and MAE normalized by entry ATR;
-- bars needed to reach maximum favorable and adverse excursion.
+- signal action, score, confidence and indicator context;
+- spread cost and tick-volume features;
+- forward progress and outcomes after 3, 6 and 12 candles;
+- internal structure using a 4-bar reference window;
+- swing structure using a 30-bar reference window;
+- BOS and CHoCH observations;
+- buy-side and sell-side liquidity sweeps with depth in price and ATR;
+- bullish or bearish three-candle FVG with size in price and ATR.
+
+All market-structure fields are experimental observations. They have zero score weight and do
+not alter trade direction. Their value will be judged only from forward results after spread.
 
 The data schema is documented in [`docs/DATA_SCHEMA_V1.md`](docs/DATA_SCHEMA_V1.md).
+The structure definitions are documented in
+[`docs/SMC_OBSERVATION_SPEC.md`](docs/SMC_OBSERVATION_SPEC.md).
 Existing journal rows are preserved. Fields that were not collected historically remain blank.
 
 A broken or stale symbol does not block analysis of the remaining healthy symbols.
@@ -43,7 +48,8 @@ A broken or stale symbol does not block analysis of the remaining healthy symbol
 9. Spread and relative tick-volume features
 10. Forward progress and outcome evaluation
 11. Non-overlapping performance statistics
-12. Automated tests and GitHub Actions checks
+12. Observation-only market structure: BOS, CHoCH, sweeps and FVG
+13. Automated tests and GitHub Actions checks
 
 ## Quick start
 
@@ -81,5 +87,5 @@ trademind-stats --symbol XAUUSD --horizon 12 --non-overlap \
   --group-confidence --group-action
 ```
 
-The live system remains read-only in v0.6.0. It records observations and evaluates outcomes;
+The live system remains read-only in v0.7.0. It records observations and evaluates outcomes;
 no orders are sent to MetaTrader 5.
