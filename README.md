@@ -4,9 +4,9 @@ TradeMind AI is an explainable market-screening and trader-analytics platform.
 
 ## Current milestone
 
-`v0.8.0` adds a dedicated research report for the observation-only market-structure dataset.
-The report measures SMC-style events against forward outcomes without changing
-BUY/SELL/WAIT decisions.
+`v0.9.0` adds automated research control around the read-only ECN pipeline. The system now checks
+whether MT5 candle files and the journal are healthy, records operational warnings and errors, and
+can generate dated daily research reports for horizons 3, 6 and 12 candles.
 
 For every newly closed configured M5 candle the runtime stores:
 
@@ -22,19 +22,31 @@ For every newly closed configured M5 candle the runtime stores:
 The `trademind-smc-stats` command reports:
 
 - counts and outcomes for BOS, CHoCH, sweeps and FVG;
-- win rate, profit factor and average net result in ATR after spread;
+- win rate, ATR-normalized profit factor and average net result after spread;
 - high-volume versus normal-volume cuts;
 - low-spread versus high-spread cuts;
 - aligned versus conflicting internal and swing structure;
-- `INSUFFICIENT_SAMPLE` until a configured minimum number of evaluated trades exists.
+- `INSUFFICIENT_SAMPLE` until a configured minimum number of evaluated trades exists;
+- portfolio-normalized and complete per-symbol sections.
 
-All market-structure fields are experimental observations. They have zero score weight and do
-not alter trade direction. Their value will be judged only from forward results after spread.
+The `trademind-health` command checks:
+
+- missing, invalid or stale MT5 CSV files;
+- zero spread and zero tick volume;
+- recent candle gaps;
+- missing or stale journal observations;
+- duplicate signal IDs;
+- schema `1.1` coverage for every configured symbol.
+
+All market-structure fields are experimental observations. They have zero score weight and do not
+alter trade direction. Their value will be judged only from forward results after spread.
 
 The data schema is documented in [`docs/DATA_SCHEMA_V1.md`](docs/DATA_SCHEMA_V1.md).
 The structure definitions are documented in
 [`docs/SMC_OBSERVATION_SPEC.md`](docs/SMC_OBSERVATION_SPEC.md).
-The report is documented in [`docs/SMC_REPORT.md`](docs/SMC_REPORT.md).
+The SMC report is documented in [`docs/SMC_REPORT.md`](docs/SMC_REPORT.md).
+Daily control is documented in
+[`docs/RESEARCH_AUTOMATION.md`](docs/RESEARCH_AUTOMATION.md).
 Existing journal rows are preserved. Fields that were not collected historically remain blank.
 
 A broken or stale symbol does not block analysis of the remaining healthy symbols.
@@ -60,8 +72,10 @@ A broken or stale symbol does not block analysis of the remaining healthy symbol
 10. Forward progress and outcome evaluation
 11. Non-overlapping performance statistics
 12. Observation-only market structure: BOS, CHoCH, sweeps and FVG
-13. SMC research reporting with sample-size guards
-14. Automated tests and GitHub Actions checks
+13. ATR-normalized SMC research reporting with sample-size guards
+14. Market-data and journal health checks
+15. Dated daily research reports and Windows Task Scheduler automation
+16. Automated tests and GitHub Actions checks
 
 ## Quick start
 
@@ -103,8 +117,16 @@ Show observation-only SMC research:
 
 ```bash
 trademind-smc-stats --symbol XAUUSD --non-overlap
-trademind-smc-stats --horizon 12 --min-sample 300
+trademind-smc-stats --horizon 12 --non-overlap --by-symbol --min-sample 300
 ```
 
-The live system remains read-only in v0.8.0. It records observations and evaluates outcomes;
-no orders are sent to MetaTrader 5.
+Check ECN research health and generate a daily report on Windows:
+
+```powershell
+.\.venv\Scripts\trademind-health.exe
+.\scripts\generate_daily_research_report.ps1
+.\scripts\install_daily_research_task.ps1 -DailyTime "23:55" -RunNow
+```
+
+The live system remains read-only in v0.9.0. It records observations, evaluates outcomes and
+checks research health; no orders are sent to MetaTrader 5.
