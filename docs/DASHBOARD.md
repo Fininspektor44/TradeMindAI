@@ -1,6 +1,6 @@
-# TradeMind Research Dashboard
+# TradeMind Validation Dashboard
 
-TradeMind v1.0 generates a standalone local HTML dashboard. It does not require a web server,
+TradeMind v1.1 generates a standalone local HTML dashboard. It does not require a web server,
 database or JavaScript package manager. The file can be opened directly in a browser on the SER8.
 
 ## Generate and open on Windows
@@ -16,6 +16,38 @@ data\dashboard\index.html
 ```
 
 The daily research task also regenerates this file after creating the dated text report.
+
+## Validation policy
+
+The dashboard does not promote cross-symbol portfolio aggregates into candidates. A candidate must
+belong to one specific instrument and one specific horizon.
+
+A group becomes a research candidate only when:
+
+- it has at least 30 evaluated non-overlapping trades;
+- the early chronological half has positive average net ATR and PF_ATR above 1.0;
+- the late chronological half has positive average net ATR and PF_ATR above 1.0;
+- the overall result after spread is positive.
+
+A group becomes validated only when:
+
+- all candidate conditions remain true;
+- it has at least 300 evaluated non-overlapping trades;
+- the lower bound of the approximate 95% confidence interval for mean net ATR is above zero.
+
+Validated does not mean production-ready. Market-regime, execution and out-of-sample checks are
+still required before signal weights may change.
+
+## Risk and stability fields
+
+The full table shows:
+
+- early-half and late-half average net ATR;
+- maximum cumulative drawdown in ATR units;
+- maximum consecutive losing-trade streak;
+- approximate 95% confidence interval for mean net ATR;
+- `UNSTABLE` when one half or the total result is not positive;
+- `PORTFOLIO_ONLY` for cross-symbol informational rows.
 
 ## Dashboard sections
 
@@ -36,23 +68,13 @@ Every instrument card shows:
 - CSV row count and age;
 - latest spread and tick volume.
 
-### Confirmed patterns
+### Pattern sections
 
-A pattern appears in the confirmed section only when all conditions are true:
+Confirmed patterns contain only `VALIDATED` per-symbol groups. Stable research candidates contain
+only `RESEARCH_CANDIDATE` per-symbol groups. Portfolio aggregates remain visible in the full table
+but cannot appear in either promotion section.
 
-- the group has reached `--min-sample`, default `300`, evaluated non-overlapping trades;
-- ATR-normalized profit factor is above `1.0`;
-- average net result after spread is positive.
-
-Passing these gates does not make the pattern production-ready. It still requires stability checks
-across time periods and market regimes.
-
-### Research candidates
-
-Candidates are early positive groups with at least 10 evaluated trades but fewer than the minimum
-research sample. They are displayed only as investigation targets and must not change signal weights.
-
-### Full research table
+### Full validation table
 
 The table contains portfolio-normalized and per-symbol rows for:
 
@@ -63,7 +85,7 @@ The table contains portfolio-normalized and per-symbol rows for:
 - volume and spread cuts;
 - aligned and conflicting internal/swing structure.
 
-Filters allow the user to narrow the table by instrument, horizon and sample status.
+Filters narrow the table by instrument, horizon and validation status.
 
 ## Direct CLI use
 
@@ -71,8 +93,18 @@ Filters allow the user to narrow the table by instrument, horizon and sample sta
 .\.venv\Scripts\trademind-dashboard.exe `
   --journal .\data\journal_ecn\signals.csv `
   --output .\data\dashboard\index.html `
+  --candidate-min 30 `
   --min-sample 300
 ```
 
-The dashboard remains read-only. It never sends an order to MetaTrader 5 and does not change the
-BUY, SELL or WAIT score.
+Run the text validator directly:
+
+```powershell
+.\.venv\Scripts\trademind-validate.exe `
+  --journal .\data\journal_ecn\signals.csv `
+  --candidate-min 30 `
+  --min-sample 300
+```
+
+The dashboard and validator remain read-only. They never send an order to MetaTrader 5 and do not
+change the BUY, SELL or WAIT score.
