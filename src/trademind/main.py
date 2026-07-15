@@ -11,6 +11,7 @@ from trademind.logging_config import configure_logging
 from trademind.market.csv_provider import CsvMarketDataProvider
 from trademind.market.mock_provider import MockMarketDataProvider
 from trademind.signals import SignalEngine
+from trademind.structure import MarketStructureEngine, StructureObservation
 
 LOGGER = logging.getLogger("trademind")
 
@@ -55,18 +56,30 @@ def main() -> int:
         return 1
 
     LOGGER.info("Signal journal=%s", journal.path)
-    engine = SignalEngine()
+    signal_engine = SignalEngine()
+    structure_engine = MarketStructureEngine()
     successful_symbols = 0
     failed_symbols = 0
 
     for symbol in settings.symbols:
         try:
             candles = provider.get_candles(symbol, settings.timeframe, count=60)
-            result = engine.analyze(candles)
+            result = signal_engine.analyze(candles)
         except (FileNotFoundError, ValueError) as exc:
             failed_symbols += 1
             LOGGER.error("%s %s analysis failed: %s", symbol, settings.timeframe, exc)
             continue
+
+        structure: StructureObservation | None = None
+        try:
+            structure = structure_engine.analyze(candles, atr=result.atr)
+        except ValueError as exc:
+            LOGGER.warning(
+                "%s %s structure observation skipped: %s",
+                symbol,
+                settings.timeframe,
+                exc,
+            )
 
         successful_symbols += 1
         LOGGER.info(
@@ -84,9 +97,29 @@ def main() -> int:
             candles[-1].spread,
             candles[-1].tick_volume,
         )
+        if structure is not None:
+            LOGGER.info(
+                "%s %s structure internal=%s/%s swing=%s/%s "
+                "BSL=%s SSL=%s FVG=%s events=%d",
+                result.symbol,
+                result.timeframe,
+                structure.internal_bias,
+                structure.internal_break,
+                structure.swing_bias,
+                structure.swing_break,
+                structure.bsl_sweep,
+                structure.ssl_sweep,
+                structure.fvg_direction,
+                structure.event_count,
+            )
 
         try:
-            recorded = journal.record(result, candles[-1], history=candles)
+            recorded = journal.record(
+                result,
+                candles[-1],
+                history=candles,
+                structure=structure,
+            )
             evaluated = journal.evaluate(result.symbol, result.timeframe, candles)
             LOGGER.info(
                 "%s %s journal recorded=%s evaluations_updated=%d",
