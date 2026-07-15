@@ -3,6 +3,7 @@ param(
     [string]$DataDir = "$env:APPDATA\MetaQuotes\Terminal\Common\Files\TradeMindAI_ECN",
     [string]$Symbols = "XAUUSD,XAGUSD,.USTECHCash,.US500Cash,.US30Cash,WTI,BRENT",
     [string]$Timeframe = "M5",
+    [int]$CandidateMinimum = 30,
     [int]$MinimumSample = 300,
     [int]$MaxAgeMinutes = 30,
     [string]$Output = "",
@@ -30,6 +31,7 @@ if ([string]::IsNullOrWhiteSpace($Output)) {
     --output $Output `
     --symbols $Symbols `
     --timeframe $Timeframe `
+    --candidate-min $CandidateMinimum `
     --min-sample $MinimumSample `
     --max-age-minutes $MaxAgeMinutes
 
@@ -37,7 +39,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "TradeMind dashboard exited with code $LASTEXITCODE"
 }
 
-Write-Host "TradeMind dashboard ready: $Output"
+Write-Host "TradeMind validation dashboard ready: $Output"
 
 if ($Open) {
     Start-Process $Output
