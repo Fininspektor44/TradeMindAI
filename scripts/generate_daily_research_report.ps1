@@ -4,6 +4,7 @@ param(
     [string]$Symbols = "XAUUSD,XAGUSD,.USTECHCash,.US500Cash,.US30Cash,WTI,BRENT",
     [string]$Timeframe = "M5",
     [int]$MaxAgeMinutes = 30,
+    [int]$CandidateMinimum = 30,
     [int]$MinimumSample = 300,
     [string]$ReportsDir = ""
 )
@@ -14,6 +15,7 @@ Set-Location $projectPath
 
 $healthExe = Join-Path $projectPath ".venv\Scripts\trademind-health.exe"
 $smcExe = Join-Path $projectPath ".venv\Scripts\trademind-smc-stats.exe"
+$validationExe = Join-Path $projectPath ".venv\Scripts\trademind-validate.exe"
 $dashboardScript = Join-Path $projectPath "scripts\generate_dashboard.ps1"
 $journalFile = Join-Path $projectPath "data\journal_ecn\signals.csv"
 
@@ -22,6 +24,9 @@ if (-not (Test-Path $healthExe -PathType Leaf)) {
 }
 if (-not (Test-Path $smcExe -PathType Leaf)) {
     throw "TradeMind SMC report executable not found: $smcExe"
+}
+if (-not (Test-Path $validationExe -PathType Leaf)) {
+    throw "TradeMind validation executable not found: $validationExe"
 }
 if (-not (Test-Path $dashboardScript -PathType Leaf)) {
     throw "TradeMind dashboard script not found: $dashboardScript"
@@ -45,6 +50,8 @@ $latestPath = Join-Path $ReportsDir "latest.txt"
     "Journal: $journalFile"
     "Symbols: $Symbols"
     "Timeframe: $Timeframe"
+    "Candidate minimum: $CandidateMinimum"
+    "Research minimum: $MinimumSample"
     ""
     "============================================================"
     "DATA HEALTH"
@@ -81,22 +88,44 @@ foreach ($horizon in @(3, 6, 12)) {
     }
 }
 
+@(
+    ""
+    "============================================================"
+    "PER-SYMBOL STABILITY VALIDATION"
+    "============================================================"
+) | Add-Content $reportPath -Encoding utf8
+
+$validationOutput = & $validationExe `
+    --journal $journalFile `
+    --candidate-min $CandidateMinimum `
+    --min-sample $MinimumSample 2>&1
+$validationCode = $LASTEXITCODE
+$validationOutput | Add-Content $reportPath -Encoding utf8
+if ($validationCode -ne 0) {
+    "Validation exited with code $validationCode" | Add-Content $reportPath -Encoding utf8
+}
+
 Copy-Item $reportPath $latestPath -Force
 Write-Host "TradeMind research report saved: $reportPath"
 Write-Host "Latest report copy: $latestPath"
 Write-Host "Health exit code: $healthCode"
+Write-Host "Validation exit code: $validationCode"
 
 & $dashboardScript `
     -ProjectDir $projectPath `
     -DataDir $DataDir `
     -Symbols $Symbols `
     -Timeframe $Timeframe `
+    -CandidateMinimum $CandidateMinimum `
     -MinimumSample $MinimumSample `
     -MaxAgeMinutes $MaxAgeMinutes
 
 if ($healthCode -ge 2) {
     Write-Warning "Research data health contains ERROR items. Open the report before trusting statistics."
     exit $healthCode
+}
+if ($validationCode -ne 0) {
+    throw "TradeMind validation failed with exit code $validationCode"
 }
 
 Write-Host "TradeMind daily research report completed successfully."
