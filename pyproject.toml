@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "0.6.0"
+version = "0.7.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,7 @@ trademind-stats = "trademind.stats:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["trademind", "trademind.market", "trademind.signals"]
+packages = ["trademind", "trademind.market", "trademind.signals", "trademind.structure"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
