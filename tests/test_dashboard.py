@@ -6,11 +6,12 @@ from trademind.dashboard import (
     DashboardSnapshot,
     MetricLine,
     SymbolLine,
-    _confirmed_patterns,
     _research_candidates,
+    _validated_patterns,
     render_dashboard,
 )
 from trademind.health import DataHealth, JournalHealth
+from trademind.validation import SegmentMetrics, ValidationResult
 
 
 def _metric(
@@ -22,61 +23,81 @@ def _metric(
     profit_factor: float,
     average: float,
 ) -> MetricLine:
+    segment = SegmentMetrics(
+        trades=trades,
+        win_rate=60.0,
+        profit_factor_atr=profit_factor,
+        avg_net_atr=average,
+    )
+    validation = ValidationResult(
+        status=status,
+        total=segment,
+        early=segment,
+        late=segment,
+        max_drawdown_atr=1.2,
+        max_loss_streak=3,
+        mean_ci_low=average - 0.05,
+        mean_ci_high=average + 0.05,
+        reasons=(),
+    )
     return MetricLine(
         scope=scope,
         label=label,
         horizon=3,
         observations=trades + 4,
-        trades=trades,
-        status=status,
-        win_rate=60.0,
-        profit_factor_atr=profit_factor,
-        avg_net_atr=average,
+        validation=validation,
     )
 
 
-def test_confirmed_patterns_require_research_sample_and_positive_edge() -> None:
-    confirmed = _metric(
+def test_validated_patterns_require_validation_status() -> None:
+    validated = _metric(
         trades=300,
-        status="RESEARCH_SAMPLE",
+        status="VALIDATED",
         profit_factor=1.4,
         average=0.2,
     )
-    too_small = _metric(
+    candidate = _metric(
         trades=299,
-        status="INSUFFICIENT_SAMPLE",
+        status="RESEARCH_CANDIDATE",
         profit_factor=3.0,
         average=0.8,
     )
-    negative = _metric(
+    unstable = _metric(
         label="SSL_SWEEP",
         trades=320,
-        status="RESEARCH_SAMPLE",
-        profit_factor=0.8,
-        average=-0.1,
+        status="UNSTABLE",
+        profit_factor=1.5,
+        average=0.1,
     )
 
-    assert _confirmed_patterns((too_small, negative, confirmed)) == [confirmed]
+    assert _validated_patterns((candidate, unstable, validated)) == [validated]
 
 
-def test_candidates_are_limited_to_positive_early_groups() -> None:
+def test_candidates_exclude_portfolio_and_unstable_rows() -> None:
     candidate = _metric(
-        trades=20,
-        status="INSUFFICIENT_SAMPLE",
+        trades=40,
+        status="RESEARCH_CANDIDATE",
         profit_factor=1.5,
         average=0.2,
     )
-    tiny = _metric(
-        trades=9,
-        status="INSUFFICIENT_SAMPLE",
+    portfolio = _metric(
+        scope="ALL",
+        trades=100,
+        status="PORTFOLIO_ONLY",
         profit_factor=2.0,
         average=0.4,
     )
+    unstable = _metric(
+        trades=50,
+        status="UNSTABLE",
+        profit_factor=1.8,
+        average=0.3,
+    )
 
-    assert _research_candidates((tiny, candidate)) == [candidate]
+    assert _research_candidates((portfolio, unstable, candidate)) == [candidate]
 
 
-def test_render_dashboard_contains_health_and_escapes_labels() -> None:
+def test_render_dashboard_contains_validation_and_escapes_labels() -> None:
     now = datetime(2026, 7, 15, 20, 0, tzinfo=timezone.utc)
     health = DataHealth(
         symbol="XAUUSD",
@@ -116,6 +137,7 @@ def test_render_dashboard_contains_health_and_escapes_labels() -> None:
             ),
         ),
         metrics=(metric,),
+        candidate_minimum=30,
         minimum_sample=300,
         schema_version="1.1",
         timeframe="M5",
@@ -123,7 +145,8 @@ def test_render_dashboard_contains_health_and_escapes_labels() -> None:
 
     output = render_dashboard(snapshot)
 
-    assert "TradeMind AI v1.0" in output
+    assert "TradeMind AI v1.1" in output
     assert "Подтверждённых закономерностей пока нет" in output
+    assert "CI95 avg" in output
     assert "&lt;BOS&gt;" in output
     assert "<BOS>" not in output
