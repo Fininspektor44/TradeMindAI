@@ -6,7 +6,8 @@ param(
     [int]$MaxAgeMinutes = 30,
     [int]$CandidateMinimum = 30,
     [int]$MinimumSample = 300,
-    [string]$ReportsDir = ""
+    [string]$ReportsDir = "",
+    [string]$HistoryDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +17,7 @@ Set-Location $projectPath
 $healthExe = Join-Path $projectPath ".venv\Scripts\trademind-health.exe"
 $smcExe = Join-Path $projectPath ".venv\Scripts\trademind-smc-stats.exe"
 $validationExe = Join-Path $projectPath ".venv\Scripts\trademind-validate.exe"
+$candidateWatchExe = Join-Path $projectPath ".venv\Scripts\trademind-candidate-watch.exe"
 $dashboardScript = Join-Path $projectPath "scripts\generate_dashboard.ps1"
 $journalFile = Join-Path $projectPath "data\journal_ecn\signals.csv"
 
@@ -28,12 +30,18 @@ if (-not (Test-Path $smcExe -PathType Leaf)) {
 if (-not (Test-Path $validationExe -PathType Leaf)) {
     throw "TradeMind validation executable not found: $validationExe"
 }
+if (-not (Test-Path $candidateWatchExe -PathType Leaf)) {
+    throw "TradeMind candidate watcher executable not found: $candidateWatchExe"
+}
 if (-not (Test-Path $dashboardScript -PathType Leaf)) {
     throw "TradeMind dashboard script not found: $dashboardScript"
 }
 
 if ([string]::IsNullOrWhiteSpace($ReportsDir)) {
     $ReportsDir = Join-Path $projectPath "data\research_reports"
+}
+if ([string]::IsNullOrWhiteSpace($HistoryDir)) {
+    $HistoryDir = Join-Path $projectPath "data\candidate_history"
 }
 
 $dayFolder = Join-Path $ReportsDir (Get-Date -Format "yyyy-MM-dd")
@@ -52,6 +60,7 @@ $latestPath = Join-Path $ReportsDir "latest.txt"
     "Timeframe: $Timeframe"
     "Candidate minimum: $CandidateMinimum"
     "Research minimum: $MinimumSample"
+    "Candidate history: $HistoryDir"
     ""
     "============================================================"
     "DATA HEALTH"
@@ -105,11 +114,31 @@ if ($validationCode -ne 0) {
     "Validation exited with code $validationCode" | Add-Content $reportPath -Encoding utf8
 }
 
+@(
+    ""
+    "============================================================"
+    "CANDIDATE WATCHER"
+    "============================================================"
+) | Add-Content $reportPath -Encoding utf8
+
+$candidateOutput = & $candidateWatchExe `
+    --journal $journalFile `
+    --history-dir $HistoryDir `
+    --symbols $Symbols `
+    --candidate-min $CandidateMinimum `
+    --min-sample $MinimumSample 2>&1
+$candidateCode = $LASTEXITCODE
+$candidateOutput | Add-Content $reportPath -Encoding utf8
+if ($candidateCode -ne 0) {
+    "Candidate watcher exited with code $candidateCode" | Add-Content $reportPath -Encoding utf8
+}
+
 Copy-Item $reportPath $latestPath -Force
 Write-Host "TradeMind research report saved: $reportPath"
 Write-Host "Latest report copy: $latestPath"
 Write-Host "Health exit code: $healthCode"
 Write-Host "Validation exit code: $validationCode"
+Write-Host "Candidate watcher exit code: $candidateCode"
 
 & $dashboardScript `
     -ProjectDir $projectPath `
@@ -118,7 +147,9 @@ Write-Host "Validation exit code: $validationCode"
     -Timeframe $Timeframe `
     -CandidateMinimum $CandidateMinimum `
     -MinimumSample $MinimumSample `
-    -MaxAgeMinutes $MaxAgeMinutes
+    -MaxAgeMinutes $MaxAgeMinutes `
+    -HistoryDir $HistoryDir `
+    -SkipCandidateWatch
 
 if ($healthCode -ge 2) {
     Write-Warning "Research data health contains ERROR items. Open the report before trusting statistics."
@@ -126,6 +157,9 @@ if ($healthCode -ge 2) {
 }
 if ($validationCode -ne 0) {
     throw "TradeMind validation failed with exit code $validationCode"
+}
+if ($candidateCode -ne 0) {
+    throw "TradeMind candidate watcher failed with exit code $candidateCode"
 }
 
 Write-Host "TradeMind daily research report completed successfully."
