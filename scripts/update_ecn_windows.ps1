@@ -21,9 +21,13 @@ Get-CimInstance Win32_Process |
 
 $python = Join-Path $projectPath ".venv\Scripts\python.exe"
 $ruff = Join-Path $projectPath ".venv\Scripts\ruff.exe"
+$dashboardScript = Join-Path $projectPath "scripts\generate_dashboard.ps1"
 
 if (-not (Test-Path $python -PathType Leaf)) {
     throw "Virtual-environment Python not found: $python"
+}
+if (-not (Test-Path $dashboardScript -PathType Leaf)) {
+    throw "Dashboard generator not found: $dashboardScript"
 }
 
 Write-Host "Installing current TradeMind source..."
@@ -54,6 +58,12 @@ $processes = Get-CimInstance Win32_Process |
 
 if (-not $processes) {
     throw "TradeMind ECN watcher did not start. Check logs\ecn_live.log and Task Scheduler."
+}
+
+Write-Host "Generating TradeMind research dashboard..."
+& $dashboardScript -ProjectDir $projectPath
+if ($LASTEXITCODE -ne 0) {
+    throw "Dashboard generation failed with exit code $LASTEXITCODE"
 }
 
 Write-Host "TradeMind ECN update completed successfully."
