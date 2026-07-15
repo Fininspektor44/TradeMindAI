@@ -4,10 +4,9 @@ TradeMind AI is an explainable market-screening and trader-analytics platform.
 
 ## Current milestone
 
-`v1.0.0` adds a standalone research dashboard to the read-only ECN pipeline. The dashboard combines
-market-data health, journal coverage and ATR-normalized SMC statistics in one local HTML file. It
-shows early research candidates, but only promotes a pattern to the confirmed section after the
-configured minimum sample has been reached.
+`v1.1.0` adds a stability-validation layer to the read-only ECN research pipeline. Patterns are now
+validated separately for each instrument and horizon. Cross-symbol aggregates remain informational
+and cannot become trading candidates.
 
 For every newly closed configured M5 candle the runtime stores:
 
@@ -39,15 +38,26 @@ The `trademind-health` command checks:
 - duplicate signal IDs;
 - schema `1.1` coverage for every configured symbol.
 
+The `trademind-validate` command checks each feature group separately by instrument and horizon:
+
+- at least 30 non-overlapping trades before candidate status;
+- positive average net ATR and PF_ATR above 1.0 in both chronological halves;
+- maximum drawdown in ATR units;
+- maximum consecutive losing-trade streak;
+- approximate 95% confidence interval for mean net ATR;
+- `UNSTABLE` when the edge disappears in either half;
+- `VALIDATED` only after 300 trades and a positive lower confidence bound.
+
 The `trademind-dashboard` command generates a dependency-free local HTML dashboard with:
 
 - overall data-health status;
 - observation and evaluated-trade counts for every instrument;
 - horizons 3, 6 and 12 candles;
 - BOS, CHoCH, sweeps, FVG, volume, spread and structure relations;
-- win rate, `PF_ATR` and average net result in ATR;
-- explicit separation between insufficient and research-sized samples;
-- confirmed patterns only after the minimum sample threshold is reached.
+- early-half and late-half performance;
+- maximum drawdown, loss streak and confidence interval;
+- stable candidates only for individual instruments;
+- portfolio aggregates clearly marked as informational only.
 
 All market-structure fields are experimental observations. They have zero score weight and do not
 alter trade direction. Their value will be judged only from forward results after spread.
@@ -58,7 +68,7 @@ The structure definitions are documented in
 The SMC report is documented in [`docs/SMC_REPORT.md`](docs/SMC_REPORT.md).
 Daily control is documented in
 [`docs/RESEARCH_AUTOMATION.md`](docs/RESEARCH_AUTOMATION.md).
-The dashboard is documented in [`docs/DASHBOARD.md`](docs/DASHBOARD.md).
+The validation dashboard is documented in [`docs/DASHBOARD.md`](docs/DASHBOARD.md).
 Existing journal rows are preserved. Fields that were not collected historically remain blank.
 
 A broken or stale symbol does not block analysis of the remaining healthy symbols.
@@ -88,7 +98,9 @@ A broken or stale symbol does not block analysis of the remaining healthy symbol
 14. Market-data and journal health checks
 15. Dated daily research reports and Windows Task Scheduler automation
 16. Standalone local research dashboard
-17. Automated tests and GitHub Actions checks
+17. Per-symbol temporal stability validation
+18. Drawdown, loss-streak and confidence-interval diagnostics
+19. Automated tests and GitHub Actions checks
 
 ## Quick start
 
@@ -133,6 +145,13 @@ trademind-smc-stats --symbol XAUUSD --non-overlap
 trademind-smc-stats --horizon 12 --non-overlap --by-symbol --min-sample 300
 ```
 
+Run the stability validator:
+
+```bash
+trademind-validate --candidate-min 30 --min-sample 300
+trademind-validate --symbol XAUUSD --horizon 3 --horizon 6 --horizon 12
+```
+
 Check health, generate the dashboard and open it on Windows:
 
 ```powershell
@@ -147,5 +166,5 @@ Generate the complete daily research package and install automation:
 .\scripts\install_daily_research_task.ps1 -DailyTime "23:55" -RunNow
 ```
 
-The live system remains read-only in v1.0.0. It records observations, evaluates outcomes, checks
-research health and produces research reports; no orders are sent to MetaTrader 5.
+The live system remains read-only in v1.1.0. It records observations, evaluates outcomes, validates
+research stability and produces reports; no orders are sent to MetaTrader 5.
