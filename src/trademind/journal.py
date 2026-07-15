@@ -8,8 +8,9 @@ from pathlib import Path
 
 from trademind.market.models import Candle
 from trademind.signals.models import SignalAction, SignalResult
+from trademind.structure.models import StructureObservation
 
-_SCHEMA_VERSION = "1.0"
+_SCHEMA_VERSION = "1.1"
 _VOLUME_WINDOW = 20
 
 _BASE_FIELDS = [
@@ -36,6 +37,27 @@ _BASE_FIELDS = [
     "rsi",
     "atr",
     "reasons",
+    "structure_version",
+    "internal_bias",
+    "internal_reference_high",
+    "internal_reference_low",
+    "internal_break",
+    "swing_bias",
+    "swing_reference_high",
+    "swing_reference_low",
+    "swing_break",
+    "liquidity_reference_high",
+    "liquidity_reference_low",
+    "bsl_sweep",
+    "ssl_sweep",
+    "bsl_sweep_depth",
+    "ssl_sweep_depth",
+    "bsl_sweep_depth_atr",
+    "ssl_sweep_depth_atr",
+    "fvg_direction",
+    "fvg_size",
+    "fvg_size_atr",
+    "structure_event_count",
 ]
 
 
@@ -89,6 +111,7 @@ class SignalJournal:
         result: SignalResult,
         candle: Candle,
         history: Sequence[Candle] | None = None,
+        structure: StructureObservation | None = None,
     ) -> bool:
         """Append a signal unless the same symbol/timeframe/candle already exists."""
         signal_id = self._signal_id(candle)
@@ -130,6 +153,9 @@ class SignalJournal:
                 "reasons": " | ".join(result.reasons),
             }
         )
+        if structure is not None:
+            row.update(self._structure_fields(structure))
+
         rows.append(row)
         self._write_rows(rows)
         return True
@@ -212,6 +238,32 @@ class SignalJournal:
             self._write_rows(rows)
         return updated
 
+    @classmethod
+    def _structure_fields(cls, structure: StructureObservation) -> dict[str, str]:
+        return {
+            "structure_version": structure.version,
+            "internal_bias": structure.internal_bias.value,
+            "internal_reference_high": cls._number(structure.internal_reference_high),
+            "internal_reference_low": cls._number(structure.internal_reference_low),
+            "internal_break": structure.internal_break.value,
+            "swing_bias": structure.swing_bias.value,
+            "swing_reference_high": cls._number(structure.swing_reference_high),
+            "swing_reference_low": cls._number(structure.swing_reference_low),
+            "swing_break": structure.swing_break.value,
+            "liquidity_reference_high": cls._number(structure.liquidity_reference_high),
+            "liquidity_reference_low": cls._number(structure.liquidity_reference_low),
+            "bsl_sweep": cls._boolean(structure.bsl_sweep),
+            "ssl_sweep": cls._boolean(structure.ssl_sweep),
+            "bsl_sweep_depth": cls._number(structure.bsl_sweep_depth),
+            "ssl_sweep_depth": cls._number(structure.ssl_sweep_depth),
+            "bsl_sweep_depth_atr": cls._optional_number(structure.bsl_sweep_depth_atr),
+            "ssl_sweep_depth_atr": cls._optional_number(structure.ssl_sweep_depth_atr),
+            "fvg_direction": structure.fvg_direction.value,
+            "fvg_size": cls._number(structure.fvg_size),
+            "fvg_size_atr": cls._optional_number(structure.fvg_size_atr),
+            "structure_event_count": str(structure.event_count),
+        }
+
     @staticmethod
     def _volume_features(
         candle: Candle,
@@ -281,6 +333,10 @@ class SignalJournal:
     @classmethod
     def _optional_number(cls, value: float | None) -> str:
         return "" if value is None else cls._number(value)
+
+    @staticmethod
+    def _boolean(value: bool) -> str:
+        return "1" if value else "0"
 
     @staticmethod
     def _outcome(net_move: float) -> str:
