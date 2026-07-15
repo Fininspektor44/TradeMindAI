@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.10"
+#property version   "1.20"
 #property description "Read-only RoboForex ECN candle exporter for TradeMind AI"
 
 input string          InpSymbols         = "XAUUSD,XAGUSD,.USTECHCash,.US500Cash,.US30Cash,WTI,BRENT";
@@ -30,6 +30,21 @@ string SafeFilename(string value)
    return value;
 }
 
+long CurrentSpreadPoints(string symbol)
+{
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   MqlTick tick;
+   if(point > 0.0 && SymbolInfoTick(symbol, tick) && tick.ask > 0.0 && tick.bid > 0.0)
+   {
+      long spread = (long)MathRound((tick.ask - tick.bid) / point);
+      if(spread > 0)
+         return spread;
+   }
+
+   long broker_spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
+   return broker_spread > 0 ? broker_spread : 0;
+}
+
 bool ExportSymbol(string symbol)
 {
    if(!SymbolSelect(symbol, true))
@@ -56,7 +71,7 @@ bool ExportSymbol(string symbol)
    }
 
    string filename = InpOutputFolder + "\\" + SafeFilename(symbol) + "_" +
-                     TimeframeLabel() + ".csv";
+                      TimeframeLabel() + ".csv";
    int handle = FileOpen(
       filename,
       FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_COMMON | FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -87,8 +102,17 @@ bool ExportSymbol(string symbol)
    );
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   long live_spread = CurrentSpreadPoints(symbol);
    for(int index = 0; index < copied; index++)
    {
+      long spread = rates[index].spread;
+
+      // Some CFD feeds return zero spread in MqlRates. For the newest completed
+      // candle, use a live bid/ask snapshot so each newly recorded signal has a
+      // realistic spread instead of a false zero. Historical rows remain untouched.
+      if(index == copied - 1 && spread <= 0 && live_spread > 0)
+         spread = live_spread;
+
       FileWrite(
          handle,
          (long)rates[index].time,
@@ -99,7 +123,7 @@ bool ExportSymbol(string symbol)
          DoubleToString(rates[index].low, digits),
          DoubleToString(rates[index].close, digits),
          (long)rates[index].tick_volume,
-         rates[index].spread
+         spread
       );
    }
 
