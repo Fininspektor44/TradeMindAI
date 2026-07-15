@@ -3,6 +3,7 @@ from __future__ import annotations
 from trademind.smc_stats import (
     _context_groups,
     _event_labels,
+    _normalized_metrics,
     _sample_status,
     _structure_relation,
 )
@@ -71,3 +72,28 @@ def test_context_groups_split_volume_spread_and_structure() -> None:
 def test_sample_status_guards_small_samples() -> None:
     assert _sample_status(299, 300) == "INSUFFICIENT_SAMPLE"
     assert _sample_status(300, 300) == "RESEARCH_SAMPLE"
+
+
+def test_normalized_metrics_do_not_mix_raw_price_scales() -> None:
+    rows = [
+        {
+            "action": "BUY",
+            "outcome_3": "WIN",
+            "net_move_3": "10",
+            "atr": "10",
+            "progress_atr_3": "1.0",
+        },
+        {
+            "action": "SELL",
+            "outcome_3": "LOSS",
+            "net_move_3": "-1000",
+            "atr": "1000",
+            "progress_atr_3": "-1.0",
+        },
+    ]
+
+    metrics = _normalized_metrics(rows, horizon=3)
+
+    assert metrics["win_rate"] == 50.0
+    assert metrics["profit_factor_atr"] == 1.0
+    assert metrics["avg_net_atr"] == 0.0
