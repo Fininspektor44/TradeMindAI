@@ -4,9 +4,10 @@ TradeMind AI is an explainable market-screening and trader-analytics platform.
 
 ## Current milestone
 
-`v0.9.0` adds automated research control around the read-only ECN pipeline. The system now checks
-whether MT5 candle files and the journal are healthy, records operational warnings and errors, and
-can generate dated daily research reports for horizons 3, 6 and 12 candles.
+`v1.0.0` adds a standalone research dashboard to the read-only ECN pipeline. The dashboard combines
+market-data health, journal coverage and ATR-normalized SMC statistics in one local HTML file. It
+shows early research candidates, but only promotes a pattern to the confirmed section after the
+configured minimum sample has been reached.
 
 For every newly closed configured M5 candle the runtime stores:
 
@@ -38,6 +39,16 @@ The `trademind-health` command checks:
 - duplicate signal IDs;
 - schema `1.1` coverage for every configured symbol.
 
+The `trademind-dashboard` command generates a dependency-free local HTML dashboard with:
+
+- overall data-health status;
+- observation and evaluated-trade counts for every instrument;
+- horizons 3, 6 and 12 candles;
+- BOS, CHoCH, sweeps, FVG, volume, spread and structure relations;
+- win rate, `PF_ATR` and average net result in ATR;
+- explicit separation between insufficient and research-sized samples;
+- confirmed patterns only after the minimum sample threshold is reached.
+
 All market-structure fields are experimental observations. They have zero score weight and do not
 alter trade direction. Their value will be judged only from forward results after spread.
 
@@ -47,6 +58,7 @@ The structure definitions are documented in
 The SMC report is documented in [`docs/SMC_REPORT.md`](docs/SMC_REPORT.md).
 Daily control is documented in
 [`docs/RESEARCH_AUTOMATION.md`](docs/RESEARCH_AUTOMATION.md).
+The dashboard is documented in [`docs/DASHBOARD.md`](docs/DASHBOARD.md).
 Existing journal rows are preserved. Fields that were not collected historically remain blank.
 
 A broken or stale symbol does not block analysis of the remaining healthy symbols.
@@ -75,7 +87,8 @@ A broken or stale symbol does not block analysis of the remaining healthy symbol
 13. ATR-normalized SMC research reporting with sample-size guards
 14. Market-data and journal health checks
 15. Dated daily research reports and Windows Task Scheduler automation
-16. Automated tests and GitHub Actions checks
+16. Standalone local research dashboard
+17. Automated tests and GitHub Actions checks
 
 ## Quick start
 
@@ -120,13 +133,19 @@ trademind-smc-stats --symbol XAUUSD --non-overlap
 trademind-smc-stats --horizon 12 --non-overlap --by-symbol --min-sample 300
 ```
 
-Check ECN research health and generate a daily report on Windows:
+Check health, generate the dashboard and open it on Windows:
 
 ```powershell
 .\.venv\Scripts\trademind-health.exe
+.\scripts\generate_dashboard.ps1 -Open
+```
+
+Generate the complete daily research package and install automation:
+
+```powershell
 .\scripts\generate_daily_research_report.ps1
 .\scripts\install_daily_research_task.ps1 -DailyTime "23:55" -RunNow
 ```
 
-The live system remains read-only in v0.9.0. It records observations, evaluates outcomes and
-checks research health; no orders are sent to MetaTrader 5.
+The live system remains read-only in v1.0.0. It records observations, evaluates outcomes, checks
+research health and produces research reports; no orders are sent to MetaTrader 5.
