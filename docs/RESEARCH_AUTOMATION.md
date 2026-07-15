@@ -1,6 +1,6 @@
 # TradeMind Research Automation
 
-TradeMind v0.9 adds read-only operational control around the ECN research pipeline. It does not
+TradeMind v1.1 keeps read-only operational control around the ECN research pipeline. It does not
 change BUY, SELL or WAIT decisions and does not send orders.
 
 ## Health checks
@@ -34,8 +34,10 @@ Example:
 
 1. market-data and journal health;
 2. non-overlapping SMC research for horizons 3, 6 and 12 candles;
-3. a portfolio-normalized overview;
-4. complete per-symbol sections.
+3. portfolio-normalized informational sections;
+4. complete per-symbol sections;
+5. per-symbol temporal validation with early and late history halves;
+6. maximum drawdown, loss streak and approximate CI95 diagnostics.
 
 Reports are stored under:
 
@@ -49,10 +51,18 @@ The newest report is also copied to:
 data\research_reports\latest.txt
 ```
 
+The HTML validation dashboard is regenerated at:
+
+```text
+data\dashboard\index.html
+```
+
 Run one report manually:
 
 ```powershell
-.\scripts\generate_daily_research_report.ps1
+.\scripts\generate_daily_research_report.ps1 `
+  -CandidateMinimum 30 `
+  -MinimumSample 300
 ```
 
 ## Scheduled task
@@ -69,6 +79,7 @@ immediate validation after installation.
 
 ## Interpretation rule
 
-A generated report is operational evidence, not permission to trade. Any line marked
-`INSUFFICIENT_SAMPLE` remains exploratory regardless of win rate or profit factor. Health `ERROR`
-items must be resolved before statistics are trusted.
+A generated report is operational evidence, not permission to trade. `PORTFOLIO_ONLY` rows are
+informational. `INSUFFICIENT_SAMPLE` and `UNSTABLE` rows must not alter signal weights. A
+`RESEARCH_CANDIDATE` must still reach the full research sample and a positive lower CI95 bound before
+becoming `VALIDATED`. Health `ERROR` items must be resolved before statistics are trusted.
