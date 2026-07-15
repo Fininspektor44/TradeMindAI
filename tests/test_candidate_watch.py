@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from trademind.candidate_watch import (
@@ -90,3 +91,23 @@ def test_persistence_deduplicates_unchanged_snapshots_and_writes_event(tmp_path)
     assert len(event_rows) == 1
     assert event_rows[0]["event"] == "CANDIDATE_REACHED"
     assert load_latest_states(paths.latest)[promoted.key].status == "RESEARCH_CANDIDATE"
+
+
+def test_persistence_deduplicates_after_csv_float_round_trip(tmp_path) -> None:
+    paths = WatchPaths.under(tmp_path)
+    precise = replace(
+        _state("INSUFFICIENT_SAMPLE", 29),
+        profit_factor_atr=12345.678901234,
+        avg_net_atr=0.123456789012345,
+        early_avg_net_atr=-0.000000123456789012345,
+        late_avg_net_atr=987654.3210987654,
+        mean_ci_low=-12345.678901234,
+        mean_ci_high=0.000000987654321098765,
+    )
+
+    first = persist_states([precise], paths, candidate_minimum=30)
+    second = persist_states([precise], paths, candidate_minimum=30)
+
+    assert first.changed_states == 1
+    assert second.changed_states == 0
+    assert second.events == ()
