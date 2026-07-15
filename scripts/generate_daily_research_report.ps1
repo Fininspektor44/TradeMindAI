@@ -14,6 +14,7 @@ Set-Location $projectPath
 
 $healthExe = Join-Path $projectPath ".venv\Scripts\trademind-health.exe"
 $smcExe = Join-Path $projectPath ".venv\Scripts\trademind-smc-stats.exe"
+$dashboardScript = Join-Path $projectPath "scripts\generate_dashboard.ps1"
 $journalFile = Join-Path $projectPath "data\journal_ecn\signals.csv"
 
 if (-not (Test-Path $healthExe -PathType Leaf)) {
@@ -21,6 +22,9 @@ if (-not (Test-Path $healthExe -PathType Leaf)) {
 }
 if (-not (Test-Path $smcExe -PathType Leaf)) {
     throw "TradeMind SMC report executable not found: $smcExe"
+}
+if (-not (Test-Path $dashboardScript -PathType Leaf)) {
+    throw "TradeMind dashboard script not found: $dashboardScript"
 }
 
 if ([string]::IsNullOrWhiteSpace($ReportsDir)) {
@@ -81,6 +85,14 @@ Copy-Item $reportPath $latestPath -Force
 Write-Host "TradeMind research report saved: $reportPath"
 Write-Host "Latest report copy: $latestPath"
 Write-Host "Health exit code: $healthCode"
+
+& $dashboardScript `
+    -ProjectDir $projectPath `
+    -DataDir $DataDir `
+    -Symbols $Symbols `
+    -Timeframe $Timeframe `
+    -MinimumSample $MinimumSample `
+    -MaxAgeMinutes $MaxAgeMinutes
 
 if ($healthCode -ge 2) {
     Write-Warning "Research data health contains ERROR items. Open the report before trusting statistics."
