@@ -6,6 +6,7 @@ on:
       - '.github/workflows/build-aox-v115.yml'
       - 'mt5/AOExtremum_Portfolio4_v1_15.mq5'
       - 'mt5/AOExtremum_Portfolio4_v1_14.mq5'
+  pull_request:
 
 jobs:
   package:
