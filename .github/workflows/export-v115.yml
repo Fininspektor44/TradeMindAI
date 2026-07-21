@@ -1,0 +1,32 @@
+name: Export AOExtremum v1.15
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify source files
+        run: |
+          test -f mt5/AOExtremum_Portfolio4_v1_14.mq5
+          test -f mt5/AOExtremum_Portfolio4_v1_15.mq5
+
+      - name: Upload v1.15 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOExtremum_Portfolio4_v1_15
+          path: |
+            mt5/AOExtremum_Portfolio4_v1_14.mq5
+            mt5/AOExtremum_Portfolio4_v1_15.mq5
+          if-no-files-found: error
+          retention-days: 1
