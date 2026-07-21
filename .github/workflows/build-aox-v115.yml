@@ -1,0 +1,28 @@
+name: Build AOExtremum v1.15 package
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-aox-v115.yml'
+      - 'mt5/AOExtremum_Portfolio4_v1_15.mq5'
+      - 'mt5/AOExtremum_Portfolio4_v1_14.mq5'
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build ZIP
+        run: |
+          mkdir -p package
+          cp mt5/AOExtremum_Portfolio4_v1_15.mq5 package/
+          cp mt5/AOExtremum_Portfolio4_v1_14.mq5 package/
+          cd package
+          zip AOExtremum_Portfolio4_v1_15.zip AOExtremum_Portfolio4_v1_15.mq5 AOExtremum_Portfolio4_v1_14.mq5
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOExtremum_Portfolio4_v1_15
+          path: package/AOExtremum_Portfolio4_v1_15.zip
+          retention-days: 1
