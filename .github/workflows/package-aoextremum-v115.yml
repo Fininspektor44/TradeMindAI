@@ -1,0 +1,29 @@
+name: Package AOExtremum v1.15
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare package
+        run: |
+          mkdir -p package
+          cp mt5/AOExtremum_Portfolio4_v1_14.mq5 package/
+          cp mt5/AOExtremum_Portfolio4_v1_15.mq5 package/
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOExtremum_Portfolio4_v1_15
+          path: package/
+          if-no-files-found: error
+          retention-days: 7
