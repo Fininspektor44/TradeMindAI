@@ -1,0 +1,25 @@
+name: Package AOExtremum MQ5
+
+on:
+  pull_request:
+    paths:
+      - 'mt5/AOExtremum_Portfolio4_v1_16_manual.mq5'
+      - '.github/workflows/package-aoextremum.yml'
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Upload MQ5 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AOExtremum_Portfolio4_v1_16_manual
+          path: |
+            mt5/AOExtremum_Portfolio4_v1_16_manual.mq5
+            mt5/AOExtremum_Portfolio4_v1_15.mq5
+            mt5/AOExtremum_Portfolio4_v1_14.mq5
+          if-no-files-found: error
+          retention-days: 7
