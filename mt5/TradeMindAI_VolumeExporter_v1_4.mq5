@@ -255,7 +255,7 @@ bool AppendBar(const string symbol,const MqlRates &bar)
       DoubleToString(tick_rate,8),
       bid_up,bid_down,ask_up,ask_down,
       mid_up,mid_down,buy_ticks,sell_ticks,
-      LongToString((long)trade_volume),
+      (long)trade_volume,
       DoubleToString(trade_volume_real,8),
       DoubleToString(spread_mean,6),
       DoubleToString(spread_min,6),
