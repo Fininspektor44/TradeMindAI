@@ -6,7 +6,6 @@ import argparse
 import csv
 import html
 import json
-import math
 import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -62,6 +61,16 @@ def _now_utc(now: datetime | None = None) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _market_closed(now: datetime) -> bool:
+    """Treat the normal Friday-night to Sunday-night FX closure as non-fatal."""
+    weekday = now.weekday()
+    if weekday == 5:
+        return True
+    if weekday == 4 and now.hour >= 22:
+        return True
+    return weekday == 6 and now.hour < 22
+
+
 def _age_minutes(path: Path, now: datetime) -> float:
     modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     return max(0.0, (now - modified).total_seconds() / 60.0)
@@ -70,8 +79,8 @@ def _age_minutes(path: Path, now: datetime) -> float:
 def _status_for_age(age: float, maximum: int, now: datetime) -> tuple[str, str]:
     if age <= maximum:
         return "OK", "fresh"
-    if now.weekday() >= 5:
-        return "WARN", f"stale during weekend: {age:.1f} min"
+    if _market_closed(now):
+        return "WARN", f"stale while market is closed: {age:.1f} min"
     return "ERROR", f"stale: {age:.1f} min, limit {maximum} min"
 
 
@@ -166,7 +175,7 @@ def inspect_source_streams(
         status = "ERROR"
         messages.append("bad stream: " + ",".join(bad_status))
     if stale:
-        stale_status = "WARN" if now.weekday() >= 5 else "ERROR"
+        stale_status = "WARN" if _market_closed(now) else "ERROR"
         if SEVERITY[stale_status] > SEVERITY[status]:
             status = stale_status
         messages.append("stale: " + ",".join(stale))
