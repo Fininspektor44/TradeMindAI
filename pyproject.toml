@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.3.0"
+version = "1.4.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,7 @@ trademind-validate = "trademind.validation:main"
 trademind-candidate-watch = "trademind.candidate_watch:main"
 trademind-action-validate = "trademind.action_validation:main"
 trademind-paper-gate = "trademind.paper_gate:main"
+trademind-volume-collect = "trademind.volume:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
