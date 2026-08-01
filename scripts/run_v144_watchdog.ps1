@@ -2,10 +2,12 @@ param(
     [string]$SourceDir = "$env:APPDATA\MetaQuotes\Terminal\Common\Files\TradeMindAI_Volume_v1_4",
     [string]$Volume = ".\data\volume_v1_4\volume_bars.csv",
     [string]$ResearchDir = ".\data\fx_research_v1_4_2",
+    [string]$OteDir = ".\data\smc_ote_v1_5",
     [string]$OutputDir = ".\data\watchdog_v1_4_4",
     [string[]]$TaskNames = @(
         "TradeMindAI-v1.4-VolumeCollector",
-        "TradeMindAI-v1.4.2-FXResearch"
+        "TradeMindAI-v1.4.2-FXResearch",
+        "TradeMindAI-v1.5-SMC-OTE"
     ),
     [ValidateRange(5, 240)]
     [int]$SourceMaxAgeMinutes = 20,
@@ -60,13 +62,19 @@ $taskRows | ConvertTo-Json -Depth 4 | Set-Content -Path $taskSnapshot -Encoding 
 $observations = Join-Path $ResearchDir "observations.csv"
 $states = Join-Path $ResearchDir "latest.csv"
 $dashboard = Join-Path $ResearchDir "dashboard\index.html"
+$oteSignals = Join-Path $OteDir "signals.csv"
+$oteStates = Join-Path $OteDir "latest.csv"
+$oteDashboard = Join-Path $OteDir "dashboard\index.html"
 
-& ".\.venv\Scripts\trademind-watchdog.exe" `
+& ".\.venv\Scripts\trademind-watchdog-ote.exe" `
     --source-dir $SourceDir `
     --volume $Volume `
     --observations $observations `
     --states $states `
     --dashboard $dashboard `
+    --ote-signals $oteSignals `
+    --ote-states $oteStates `
+    --ote-dashboard $oteDashboard `
     --task-snapshot $taskSnapshot `
     --status $statusPath `
     --report $reportPath `
