@@ -1,4 +1,4 @@
-"""CLI and orchestration for TradeMind v1.5 SMC OTE shadow research."""
+"""CLI and orchestration for TradeMind SMC OTE shadow research."""
 
 from __future__ import annotations
 
@@ -11,6 +11,18 @@ from trademind.ote_engine import build_ote_signals
 from trademind.ote_models import DEFAULT_SYMBOLS, HORIZON_BARS, OteSummary, load_volume_rows
 from trademind.ote_report import build_states, write_outputs
 
+CRYPTO_SYMBOLS = (
+    "BTCUSD",
+    "ETHUSD",
+    "SOLUSD",
+    "XRPUSD",
+    "LTCUSD",
+    "BCHUSD",
+    "ADAUSD",
+    "DOGEUSD",
+)
+MONITORED_SYMBOLS = DEFAULT_SYMBOLS + CRYPTO_SYMBOLS
+
 
 def run_ote_research(
     volume_path: Path,
@@ -18,7 +30,7 @@ def run_ote_research(
     states_path: Path,
     dashboard_path: Path,
     *,
-    symbols: Iterable[str] = DEFAULT_SYMBOLS,
+    symbols: Iterable[str] = MONITORED_SYMBOLS,
     server_utc_offset_hours: int = 0,
 ) -> OteSummary:
     rows, source_rows = load_volume_rows(volume_path, symbols)
@@ -55,7 +67,7 @@ def main() -> int:
         "--dashboard", type=Path, default=Path("data/smc_ote_v1_5/dashboard/index.html")
     )
     parser.add_argument("--server-utc-offset-hours", type=int, default=0)
-    parser.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS))
+    parser.add_argument("--symbols", default=",".join(MONITORED_SYMBOLS))
     args = parser.parse_args()
     if not -14 <= args.server_utc_offset_hours <= 14:
         parser.error("server UTC offset must be between -14 and 14")
@@ -78,7 +90,7 @@ def main() -> int:
     except (OSError, TypeError, ValueError) as exc:
         print(f"SMC OTE research failed: {exc}")
         return 1
-    print("TradeMind v1.5 SMC + Fibonacci OTE shadow research")
+    print("TradeMind SMC + Fibonacci OTE shadow research")
     print(f"Canonical source rows: {summary.source_rows}")
     print(f"Healthy M5 rows: {summary.healthy_rows}")
     print(f"OTE signals: {summary.signals}")
