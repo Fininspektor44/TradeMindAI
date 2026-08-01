@@ -39,7 +39,7 @@ trademind-smc-ote = "trademind.smc_ote:main"
 trademind-unified-center = "trademind.unified_center:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"]
+package-dir = {"" = "src"}
 packages = ["trademind", "trademind.market", "trademind.signals", "trademind.structure"]
 
 [tool.pytest.ini_options]
