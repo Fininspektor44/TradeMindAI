@@ -34,6 +34,7 @@ trademind-fx-research = "trademind.fx_research:main"
 trademind-fx-dashboard = "trademind.fx_dashboard:main"
 trademind-watchdog = "trademind.watchdog:main"
 trademind-watchdog-ote = "trademind.watchdog_ote:main"
+trademind-watchdog-unified = "trademind.watchdog_unified:main"
 trademind-smc-ote = "trademind.smc_ote:main"
 trademind-unified-center = "trademind.unified_center:main"
 
