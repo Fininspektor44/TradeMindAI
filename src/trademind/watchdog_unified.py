@@ -1,4 +1,4 @@
-"""TradeMind v1.6 watchdog extension for the Unified Signal Center."""
+"""TradeMind v1.7 watchdog for Unified Signal Center and crypto streams."""
 
 from __future__ import annotations
 
@@ -7,8 +7,10 @@ import csv
 import json
 import os
 from dataclasses import asdict, replace
+from datetime import datetime
 from pathlib import Path
 
+from trademind.crypto_watch import inspect_crypto_streams
 from trademind.watchdog import (
     DEFAULT_SYMBOLS,
     WatchdogCheck,
@@ -22,7 +24,7 @@ from trademind.watchdog import (
 )
 from trademind.watchdog_ote import run_watchdog_ote
 
-SCHEMA_VERSION = "1.6.0"
+SCHEMA_VERSION = "1.7.0"
 
 
 def inspect_unified_states(path: Path) -> tuple[WatchdogCheck, dict[str, int]]:
@@ -82,6 +84,7 @@ def run_watchdog_unified(
     status_path: Path,
     report_path: Path,
     html_path: Path,
+    crypto_manifest_path: Path | None = None,
     expected_symbols: tuple[str, ...] = DEFAULT_SYMBOLS,
     source_max_age_minutes: int = 20,
     derived_max_age_minutes: int = 20,
@@ -104,10 +107,7 @@ def run_watchdog_unified(
         source_max_age_minutes=source_max_age_minutes,
         derived_max_age_minutes=derived_max_age_minutes,
     )
-    report_time = snapshot.generated_at
-    from datetime import datetime
-
-    now = datetime.fromisoformat(report_time)
+    now = datetime.fromisoformat(snapshot.generated_at)
     checks = list(snapshot.checks)
     checks.extend(
         (
@@ -133,6 +133,17 @@ def run_watchdog_unified(
     )
     unified_check, unified_counts = inspect_unified_states(unified_states_path)
     checks.append(unified_check)
+
+    manifest = crypto_manifest_path or source_dir / "crypto_manifest.csv"
+    checks.append(
+        inspect_crypto_streams(
+            manifest,
+            source_dir,
+            maximum_age=source_max_age_minutes,
+            now=now,
+        )
+    )
+
     counts = dict(snapshot.validation_counts)
     counts.update({f"UNIFIED_{name}": value for name, value in unified_counts.items()})
     overall = _overall(checks)
@@ -143,6 +154,7 @@ def run_watchdog_unified(
             "unified_signals": str(unified_signals_path),
             "unified_states": str(unified_states_path),
             "unified_dashboard": str(unified_dashboard_path),
+            "crypto_manifest": str(manifest),
         }
     )
     snapshot = replace(
@@ -158,7 +170,7 @@ def run_watchdog_unified(
     _atomic_text(
         report_path,
         _render_text(snapshot).replace(
-            "TradeMind AI v1.4.4 Watchdog", "TradeMind AI v1.6.0 Watchdog"
+            "TradeMind AI v1.4.4 Watchdog", "TradeMind AI v1.7.0 Watchdog"
         ),
     )
     _atomic_text(html_path, _render_html(snapshot))
@@ -166,7 +178,7 @@ def run_watchdog_unified(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Check the full TradeMind v1.6 pipeline")
+    parser = argparse.ArgumentParser(description="Check TradeMind Unified and crypto pipeline")
     appdata = Path(os.getenv("APPDATA", ""))
     parser.add_argument(
         "--source-dir",
@@ -212,6 +224,7 @@ def main() -> int:
         type=Path,
         default=Path("data/unified_signal_center_v1_6/dashboard/index.html"),
     )
+    parser.add_argument("--crypto-manifest", type=Path, default=None)
     parser.add_argument(
         "--task-snapshot", type=Path, default=Path("data/watchdog_v1_4_4/tasks.json")
     )
@@ -228,9 +241,13 @@ def main() -> int:
         parser.error("--symbols must contain at least one symbol")
     if args.source_max_age_minutes < 1 or args.derived_max_age_minutes < 1:
         parser.error("maximum ages must be positive")
+    source_dir = args.source_dir.expanduser().resolve()
+    crypto_manifest = (
+        args.crypto_manifest.expanduser().resolve() if args.crypto_manifest is not None else None
+    )
     try:
         snapshot = run_watchdog_unified(
-            source_dir=args.source_dir.expanduser().resolve(),
+            source_dir=source_dir,
             volume_path=args.volume.expanduser().resolve(),
             observations_path=args.observations.expanduser().resolve(),
             states_path=args.states.expanduser().resolve(),
@@ -245,6 +262,7 @@ def main() -> int:
             status_path=args.status.expanduser().resolve(),
             report_path=args.report.expanduser().resolve(),
             html_path=args.html.expanduser().resolve(),
+            crypto_manifest_path=crypto_manifest,
             expected_symbols=symbols,
             source_max_age_minutes=args.source_max_age_minutes,
             derived_max_age_minutes=args.derived_max_age_minutes,
@@ -253,7 +271,7 @@ def main() -> int:
         print(f"Watchdog failed: {exc}")
         return 2
 
-    print("TradeMind AI v1.6.0 Watchdog")
+    print("TradeMind AI v1.7.0 Watchdog")
     print(f"Overall status: {snapshot.overall_status}")
     for check in snapshot.checks:
         age = f" age={check.age_minutes:.1f}m" if check.age_minutes is not None else ""
