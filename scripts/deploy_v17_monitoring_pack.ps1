@@ -15,6 +15,18 @@ foreach ($path in @($marketSource, $cryptoSource)) {
 
 $marketContent = Get-Content -Path $marketSource -Raw -Encoding UTF8
 $cryptoContent = Get-Content -Path $cryptoSource -Raw -Encoding UTF8
+
+# MQL5 requires every array parameter to be passed explicitly by reference.
+# Keep the deployment safe even when an older v1.7 source is present locally.
+$badManifestSignature = 'void WriteManifest(const string requested[])'
+$fixedManifestSignature = 'void WriteManifest(const string &requested[])'
+if ($cryptoContent.Contains($badManifestSignature)) {
+    $cryptoContent = $cryptoContent.Replace($badManifestSignature, $fixedManifestSignature)
+}
+if (-not $cryptoContent.Contains($fixedManifestSignature)) {
+    throw "Crypto exporter manifest signature was not found or could not be repaired."
+}
+
 $fxPattern = 'input string\s+InpSymbols\s*=\s*"[^"]*";'
 if (-not [regex]::IsMatch($marketContent, $fxPattern)) {
     throw "InpSymbols declaration was not found in the market exporter."
@@ -51,6 +63,7 @@ Write-Host "Terminal targets: $($written.Count)"
 Write-Host "Market exporter: $MarketTarget"
 Write-Host "FX exporter: $FxTarget"
 Write-Host "Crypto exporter: $CryptoTarget"
+Write-Host "Crypto compile hotfix: array parameters passed by reference"
 Write-Host "Crypto catalog: BTCUSD, ETHUSD, SOLUSD, XRPUSD, LTCUSD, BCHUSD, ADAUSD, DOGEUSD"
 Write-Host "All exporters are read-only and write to Terminal Common Files."
 Write-Host "Do not run duplicate market/FX exporters in two terminals after migration verification."
