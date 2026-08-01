@@ -3,11 +3,13 @@ param(
     [string]$Volume = ".\data\volume_v1_4\volume_bars.csv",
     [string]$ResearchDir = ".\data\fx_research_v1_4_2",
     [string]$OteDir = ".\data\smc_ote_v1_5",
+    [string]$UnifiedDir = ".\data\unified_signal_center_v1_6",
     [string]$OutputDir = ".\data\watchdog_v1_4_4",
     [string[]]$TaskNames = @(
         "TradeMindAI-v1.4-VolumeCollector",
         "TradeMindAI-v1.4.2-FXResearch",
-        "TradeMindAI-v1.5-SMC-OTE"
+        "TradeMindAI-v1.5-SMC-OTE",
+        "TradeMindAI-v1.6-UnifiedCenter"
     ),
     [ValidateRange(5, 240)]
     [int]$SourceMaxAgeMinutes = 20,
@@ -65,8 +67,11 @@ $dashboard = Join-Path $ResearchDir "dashboard\index.html"
 $oteSignals = Join-Path $OteDir "signals.csv"
 $oteStates = Join-Path $OteDir "latest.csv"
 $oteDashboard = Join-Path $OteDir "dashboard\index.html"
+$unifiedSignals = Join-Path $UnifiedDir "signals.csv"
+$unifiedStates = Join-Path $UnifiedDir "latest.csv"
+$unifiedDashboard = Join-Path $UnifiedDir "dashboard\index.html"
 
-& ".\.venv\Scripts\trademind-watchdog-ote.exe" `
+& ".\.venv\Scripts\trademind-watchdog-unified.exe" `
     --source-dir $SourceDir `
     --volume $Volume `
     --observations $observations `
@@ -75,6 +80,9 @@ $oteDashboard = Join-Path $OteDir "dashboard\index.html"
     --ote-signals $oteSignals `
     --ote-states $oteStates `
     --ote-dashboard $oteDashboard `
+    --unified-signals $unifiedSignals `
+    --unified-states $unifiedStates `
+    --unified-dashboard $unifiedDashboard `
     --task-snapshot $taskSnapshot `
     --status $statusPath `
     --report $reportPath `
