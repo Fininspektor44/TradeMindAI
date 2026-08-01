@@ -53,6 +53,14 @@ def test_monitoring_pack_deploys_market_fx_and_crypto() -> None:
     assert "No order" not in text or "read-only" in text
 
 
+def test_monitoring_pack_repairs_mql_array_reference_signature() -> None:
+    text = DEPLOYER.read_text(encoding="utf-8")
+    assert "void WriteManifest(const string requested[])" in text
+    assert "void WriteManifest(const string &requested[])" in text
+    assert ".Replace($badManifestSignature, $fixedManifestSignature)" in text
+    assert "could not be repaired" in text
+
+
 def test_smc_ote_defaults_include_crypto_without_removing_existing_symbols() -> None:
     assert CRYPTO_SYMBOLS == (
         "BTCUSD",
