@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.5.1"
+version = "1.6.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,6 +35,7 @@ trademind-fx-dashboard = "trademind.fx_dashboard:main"
 trademind-watchdog = "trademind.watchdog:main"
 trademind-watchdog-ote = "trademind.watchdog_ote:main"
 trademind-smc-ote = "trademind.smc_ote:main"
+trademind-unified-center = "trademind.unified_center:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
