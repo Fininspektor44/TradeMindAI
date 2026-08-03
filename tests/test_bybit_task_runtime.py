@@ -6,15 +6,17 @@ INSTALLER = ROOT / "scripts" / "install_v190_bybit_task.ps1"
 CHECKER = ROOT / "scripts" / "check_v190_bybit.ps1"
 
 
-def test_installer_runs_python_directly() -> None:
+def test_installer_runs_hidden_python_directly() -> None:
     text = INSTALLER.read_text(encoding="utf-8")
 
-    assert 'Join-Path $projectRoot ".venv\\Scripts\\python.exe"' in text
-    assert "-Execute $python" in text
+    assert 'Join-Path $projectRoot ".venv\\Scripts\\pythonw.exe"' in text
+    assert "-Execute $pythonw" in text
     assert "-m trademind.bybit_fixed20" in text
+    assert "-Hidden" in text
     assert "-ExecutionTimeLimit (New-TimeSpan -Seconds 0)" in text
     assert "-RestartCount 999" in text
     assert '-Execute "powershell.exe"' not in text
+    assert 'Join-Path $projectRoot ".venv\\Scripts\\python.exe"' not in text
     assert "run_v190_bybit.ps1" not in text
 
 
@@ -28,6 +30,7 @@ def test_installer_keeps_fixed_20_universe() -> None:
 
     assert symbols in text
     assert "No API key, account access or order function is used." in text
+    assert "Task started in background." in text
 
 
 def test_checker_requires_live_process_and_fresh_status() -> None:
