@@ -33,14 +33,22 @@ def test_installer_keeps_fixed_20_universe() -> None:
     assert "Task started in background." in text
 
 
-def test_checker_requires_exactly_one_live_python_process_and_fresh_status() -> None:
+def test_checker_counts_one_parent_child_python_chain_as_one_instance() -> None:
     text = CHECKER.read_text(encoding="utf-8")
 
     assert "Get-CimInstance Win32_Process" in text
     assert '$_.Name -in @("python.exe", "pythonw.exe")' in text
     assert 'trademind\\.bybit_fixed20' in text
+    assert "$matchingPids" in text
+    assert "ParentProcessId" in text
+    assert "$collectorRoots" in text
+    assert "$collectorInstances = $collectorRoots.Count" in text
+    assert "$collectorInstances -eq 1" in text
+    assert "$processes.Count -ge 1" in text
+    assert "CollectorInstances" in text
+    assert "PythonProcessCount" in text
+    assert "Duplicate Bybit collector chains detected" in text
     assert "$statusAgeSeconds -le $FreshSeconds" in text
     assert '$task.State -eq "Running"' in text
-    assert "$processes.Count -eq 1" in text
-    assert "Duplicate Bybit collector processes detected" in text
     assert "OrdersEnabled" in text
+    assert "-not [bool]$status.orders_enabled" in text
