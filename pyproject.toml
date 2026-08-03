@@ -4,14 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.8.1"
+version = "1.9.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
   { name = "TradeMind AI" }
 ]
-dependencies = []
+dependencies = [
+  "websockets==16.1.1"
+]
 
 [project.optional-dependencies]
 dev = [
@@ -39,6 +41,7 @@ trademind-watchdog-paper = "trademind.watchdog_paper:main"
 trademind-smc-ote = "trademind.smc_ote:main"
 trademind-unified-center = "trademind.unified_center:main"
 trademind-paper-gate-v18 = "trademind.paper_gate_runtime:main"
+trademind-bybit = "trademind.bybit_intelligence:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
