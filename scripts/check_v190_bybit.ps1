@@ -20,16 +20,22 @@ if (-not (Test-Path $statusPath)) {
 $status = Get-Content $statusPath -Raw | ConvertFrom-Json
 $updatedAt = [DateTimeOffset]::Parse([string]$status.updated_at).ToUniversalTime()
 $statusAgeSeconds = [math]::Round(([DateTimeOffset]::UtcNow - $updatedAt).TotalSeconds, 1)
+
+# Count only the actual hidden Python collector. A PowerShell diagnostic command can
+# contain the same module text in its own command line and must not be counted.
 $processes = @(
     Get-CimInstance Win32_Process |
-        Where-Object { $_.CommandLine -match "trademind\.bybit_fixed20" }
+        Where-Object {
+            $_.Name -in @("python.exe", "pythonw.exe") -and
+            $_.CommandLine -match '(?i)(^|\s)-m\s+trademind\.bybit_fixed20(\s|$)'
+        }
 )
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $taskInfo = if ($task) { Get-ScheduledTaskInfo -TaskName $TaskName } else { $null }
 $healthy = (
     $task -and
     $task.State -eq "Running" -and
-    $processes.Count -ge 1 -and
+    $processes.Count -eq 1 -and
     [string]$status.state -eq "RUNNING" -and
     $statusAgeSeconds -le $FreshSeconds
 )
@@ -50,7 +56,7 @@ Write-Host "`n=== BYBIT RUNTIME ===" -ForegroundColor Cyan
 
 if ($processes.Count -gt 0) {
     Write-Host "=== BYBIT PROCESS ===" -ForegroundColor DarkCyan
-    $processes | Select-Object ProcessId,CreationDate,CommandLine | Format-List
+    $processes | Select-Object ProcessId,Name,CreationDate,CommandLine | Format-List
 }
 
 if (Test-Path $universePath) {
@@ -68,7 +74,11 @@ if (Test-Path $latestPath) {
 }
 
 if (-not $healthy) {
-    Write-Host "[WARN] Bybit collector is not confirmed alive. Reinstall/start the direct-Python task." -ForegroundColor Yellow
+    if ($processes.Count -gt 1) {
+        Write-Host "[WARN] Duplicate Bybit collector processes detected: $($processes.Count)." -ForegroundColor Yellow
+    } else {
+        Write-Host "[WARN] Bybit collector is not confirmed alive. Reinstall/start the hidden direct-Python task." -ForegroundColor Yellow
+    }
 }
 
 if ($OpenDashboard -and (Test-Path $dashboard)) {
