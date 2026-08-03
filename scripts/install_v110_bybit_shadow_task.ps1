@@ -12,6 +12,11 @@ $bars = Join-Path $projectRoot "data\bybit_v1_9\bybit_bars.csv"
 $outputDir = Join-Path $projectRoot "data\bybit_shadow_v1_10"
 $statusPath = Join-Path $outputDir "status.json"
 
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run PowerShell as Administrator to install the Bybit Shadow task."
+}
 if (-not (Test-Path $pythonw)) { throw "Background Python not found: $pythonw" }
 if (-not (Test-Path $bars)) { throw "Bybit M5 source not found: $bars" }
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
