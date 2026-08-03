@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from trademind.paper_gate_runtime import build_forward_decisions
 from trademind.paper_gate_v18 import (
     asset_class,
     build_decisions,
@@ -142,7 +143,7 @@ def test_forward_journal_never_backfills_and_is_idempotent() -> None:
     before = _signal(source_id="EURUSD:M5:old", signal_time=NOW - timedelta(minutes=1))
     after = _signal(source_id="EURUSD:M5:new", signal_time=NOW + timedelta(minutes=1))
     states = [_state()]
-    decisions = build_decisions([before, after], states, NOW)
+    decisions = build_forward_decisions([before, after], states, NOW, NOW)
     journal = build_paper_journal(decisions, [], NOW, NOW + timedelta(minutes=2))
     assert len(journal) == 1
     assert journal[0]["source_id"] == "EURUSD:M5:new"
@@ -163,6 +164,7 @@ def test_v18_files_are_read_only() -> None:
     root = Path(__file__).resolve().parents[1]
     paths = [
         root / "src" / "trademind" / "paper_gate_v18.py",
+        root / "src" / "trademind" / "paper_gate_runtime.py",
         root / "src" / "trademind" / "watchdog_paper.py",
         root / "scripts" / "run_v180_paper_gate.ps1",
         root / "scripts" / "install_v180_paper_gate_task.ps1",
