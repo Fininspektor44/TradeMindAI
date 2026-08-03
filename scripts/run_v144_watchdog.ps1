@@ -4,12 +4,14 @@ param(
     [string]$ResearchDir = ".\data\fx_research_v1_4_2",
     [string]$OteDir = ".\data\smc_ote_v1_5",
     [string]$UnifiedDir = ".\data\unified_signal_center_v1_6",
+    [string]$PaperDir = ".\data\paper_signal_gate_v1_8",
     [string]$OutputDir = ".\data\watchdog_v1_4_4",
     [string[]]$TaskNames = @(
         "TradeMindAI-v1.4-VolumeCollector",
         "TradeMindAI-v1.4.2-FXResearch",
         "TradeMindAI-v1.5-SMC-OTE",
-        "TradeMindAI-v1.6-UnifiedCenter"
+        "TradeMindAI-v1.6-UnifiedCenter",
+        "TradeMindAI-v1.8-PaperGate"
     ),
     [ValidateRange(5, 240)]
     [int]$SourceMaxAgeMinutes = 20,
@@ -70,8 +72,12 @@ $oteDashboard = Join-Path $OteDir "dashboard\index.html"
 $unifiedSignals = Join-Path $UnifiedDir "signals.csv"
 $unifiedStates = Join-Path $UnifiedDir "latest.csv"
 $unifiedDashboard = Join-Path $UnifiedDir "dashboard\index.html"
+$paperSignals = Join-Path $PaperDir "signals.csv"
+$paperStates = Join-Path $PaperDir "latest.csv"
+$paperDecisions = Join-Path $PaperDir "decisions.csv"
+$paperDashboard = Join-Path $PaperDir "dashboard\index.html"
 
-& ".\.venv\Scripts\trademind-watchdog-unified.exe" `
+& ".\.venv\Scripts\trademind-watchdog-paper.exe" `
     --source-dir $SourceDir `
     --volume $Volume `
     --observations $observations `
@@ -83,6 +89,10 @@ $unifiedDashboard = Join-Path $UnifiedDir "dashboard\index.html"
     --unified-signals $unifiedSignals `
     --unified-states $unifiedStates `
     --unified-dashboard $unifiedDashboard `
+    --paper-signals $paperSignals `
+    --paper-states $paperStates `
+    --paper-decisions $paperDecisions `
+    --paper-dashboard $paperDashboard `
     --task-snapshot $taskSnapshot `
     --status $statusPath `
     --report $reportPath `
