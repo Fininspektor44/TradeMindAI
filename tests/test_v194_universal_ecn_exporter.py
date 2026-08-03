@@ -82,13 +82,17 @@ def test_universal_exporter_is_read_only_and_mql_arrays_are_by_reference() -> No
     assert "Intentionally empty" in text
 
 
-def test_deployer_installs_only_the_universal_ecn_source() -> None:
+def test_deployer_targets_existing_ecn_advisors_and_installs_compiled_file() -> None:
     text = DEPLOYER.read_text(encoding="utf-8")
     assert "TradeMindAI_ECN_UniversalVolumeExporter_v1_9_4.mq5" in text
     assert "Cent is not included" in text
     assert "ROBO_CENT" in text
     assert "crypto_manifest_cent" in text
-    assert "MQL5\\Experts" in text
+    assert "MQL5\\Experts\\Advisors" in text
+    assert "TradeMind.*ECN.*Exporter" in text
+    assert "UniversalVolumeExporter" in text
+    assert "ChangeExtension($TargetName, \".ex5\")" in text
+    assert "Installed compiled ECN exporter" in text
     assert "Trading function detected" in text
     for symbol in EXPECTED_SYMBOLS:
         assert symbol in text
