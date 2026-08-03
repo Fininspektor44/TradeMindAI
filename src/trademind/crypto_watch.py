@@ -16,6 +16,22 @@ def _safe_symbol(symbol: str) -> str:
     return value
 
 
+def _resolve_manifest_path(manifest_path: Path) -> Path:
+    """Prefer the universal ECN manifest for the legacy default path.
+
+    An explicitly named manifest remains authoritative. The compatibility lookup never
+    selects a Cent manifest.
+    """
+    if manifest_path.name != "crypto_manifest.csv":
+        return manifest_path
+    candidates = (
+        manifest_path.parent / "ecn_manifest.csv",
+        manifest_path.parent / "crypto_manifest_ecn.csv",
+        manifest_path,
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), manifest_path)
+
+
 def inspect_crypto_streams(
     manifest_path: Path,
     source_dir: Path,
@@ -23,12 +39,13 @@ def inspect_crypto_streams(
     maximum_age: int,
     now: datetime,
 ) -> WatchdogCheck:
-    """Check only crypto symbols resolved by the MT5 exporter.
+    """Check crypto symbols resolved by either the legacy or universal ECN exporter.
 
     A missing manifest means crypto monitoring has not been installed yet and is a WARN,
-    not a failure of the existing market pipeline. Once at least one symbol is resolved,
-    its stream is expected to stay fresh seven days a week.
+    not a failure of the existing market pipeline. Universal ECN manifests also contain
+    non-crypto rows, which are ignored by their schema version.
     """
+    manifest_path = _resolve_manifest_path(manifest_path)
     if not manifest_path.is_file():
         return WatchdogCheck(
             "Crypto MT5 streams",
@@ -42,6 +59,9 @@ def inspect_crypto_streams(
     try:
         with manifest_path.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
+                schema_version = str(row.get("schema_version") or "").strip()
+                if schema_version and schema_version != "1.7":
+                    continue
                 canonical = str(row.get("canonical_symbol") or "").strip().upper()
                 broker = str(row.get("broker_symbol") or "").strip()
                 status = str(row.get("status") or "").strip().upper()
