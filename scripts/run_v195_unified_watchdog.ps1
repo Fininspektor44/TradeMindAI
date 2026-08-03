@@ -51,11 +51,7 @@ if (Test-Path $ecnManifestPath) {
         })
         $resolvedSymbols = @($resolvedRows | ForEach-Object { [string]$_.canonical_symbol })
         $missingManifestSymbols = @($expectedEcn | Where-Object { $_ -notin $resolvedSymbols })
-        Add-HealthCheck \
-            -Name "ECN manifest" \
-            -Ok ($missingManifestSymbols.Count -eq 0 -and $resolvedRows.Count -eq $expectedEcn.Count) \
-            -Message "resolved=$($resolvedRows.Count) expected=$($expectedEcn.Count)" \
-            -Details ([pscustomobject]@{ missing = $missingManifestSymbols; path = $ecnManifestPath })
+        Add-HealthCheck -Name "ECN manifest" -Ok ($missingManifestSymbols.Count -eq 0 -and $resolvedRows.Count -eq $expectedEcn.Count) -Message "resolved=$($resolvedRows.Count) expected=$($expectedEcn.Count)" -Details ([pscustomobject]@{ missing = $missingManifestSymbols; path = $ecnManifestPath })
     } catch {
         Add-HealthCheck -Name "ECN manifest" -Ok $false -Message $_.Exception.Message -Details $ecnManifestPath
     }
@@ -75,7 +71,7 @@ foreach ($symbol in $expectedEcn) {
         $size = [int64]$item.Length
         $ageSeconds = [math]::Round(($nowUtc - [DateTimeOffset]$item.LastWriteTimeUtc).TotalSeconds, 1)
     }
-    $fresh = $exists -and $size -gt 0 -and $ageSeconds -ge 0 -and $ageSeconds -le $EcnFreshSeconds
+    $fresh = $exists -and $size -gt 0 -and $ageSeconds -ne $null -and $ageSeconds -ge 0 -and $ageSeconds -le $EcnFreshSeconds
     $ecnFileDetails += [pscustomobject]@{
         symbol = $symbol
         exists = $exists
@@ -85,12 +81,9 @@ foreach ($symbol in $expectedEcn) {
     }
 }
 $staleEcn = @($ecnFileDetails | Where-Object { -not $_.fresh })
-$maxEcnAge = @($ecnFileDetails | Where-Object { $_.age_seconds -ne $null } | Measure-Object age_seconds -Maximum).Maximum
-Add-HealthCheck \
-    -Name "ECN M5 streams" \
-    -Ok ($staleEcn.Count -eq 0) \
-    -Message "fresh=$($expectedEcn.Count - $staleEcn.Count)/$($expectedEcn.Count) max_age_seconds=$maxEcnAge" \
-    -Details $ecnFileDetails
+$ages = @($ecnFileDetails | Where-Object { $_.age_seconds -ne $null } | ForEach-Object { [double]$_.age_seconds })
+$maxEcnAge = if ($ages.Count -gt 0) { [math]::Round(($ages | Measure-Object -Maximum).Maximum, 1) } else { $null }
+Add-HealthCheck -Name "ECN M5 streams" -Ok ($staleEcn.Count -eq 0) -Message "fresh=$($expectedEcn.Count - $staleEcn.Count)/$($expectedEcn.Count) max_age_seconds=$maxEcnAge" -Details $ecnFileDetails
 
 # Bybit status, scheduled task and one parent-child collector chain.
 $bybitStatus = $null
@@ -106,16 +99,13 @@ if (Test-Path $bybitStatusPath) {
             $bybitStatusAge -le $BybitFreshSeconds -and
             -not [bool]$bybitStatus.orders_enabled
         )
-        Add-HealthCheck \
-            -Name "Bybit status" \
-            -Ok $bybitStateOk \
-            -Message "state=$($bybitStatus.state) age_seconds=$bybitStatusAge orders_enabled=$($bybitStatus.orders_enabled)" \
-            -Details ([pscustomobject]@{
-                messages = $bybitStatus.messages
-                bars_written = $bybitStatus.bars_written
-                reconnects = $bybitStatus.reconnects
-                path = $bybitStatusPath
-            })
+        $bybitStatusDetails = [pscustomobject]@{
+            messages = $bybitStatus.messages
+            bars_written = $bybitStatus.bars_written
+            reconnects = $bybitStatus.reconnects
+            path = $bybitStatusPath
+        }
+        Add-HealthCheck -Name "Bybit status" -Ok $bybitStateOk -Message "state=$($bybitStatus.state) age_seconds=$bybitStatusAge orders_enabled=$($bybitStatus.orders_enabled)" -Details $bybitStatusDetails
     } catch {
         Add-HealthCheck -Name "Bybit status" -Ok $false -Message $_.Exception.Message -Details $bybitStatusPath
     }
@@ -141,26 +131,21 @@ $collectorInstances = $collectorRoots.Count
 $task = Get-ScheduledTask -TaskName $BybitTaskName -ErrorAction SilentlyContinue
 $taskInfo = if ($task) { Get-ScheduledTaskInfo -TaskName $BybitTaskName } else { $null }
 $runtimeOk = $task -and $task.State -eq "Running" -and $collectorInstances -eq 1 -and $processes.Count -ge 1
-Add-HealthCheck \
-    -Name "Bybit runtime" \
-    -Ok $runtimeOk \
-    -Message "task=$(if($task){$task.State}else{'MISSING'}) instances=$collectorInstances python_processes=$($processes.Count)" \
-    -Details ([pscustomobject]@{
-        last_task_result = if ($taskInfo) { $taskInfo.LastTaskResult } else { $null }
-        roots = @($collectorRoots | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath)
-        processes = @($processes | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath)
-    })
+$runtimeDetails = [pscustomobject]@{
+    last_task_result = if ($taskInfo) { $taskInfo.LastTaskResult } else { $null }
+    roots = @($collectorRoots | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath)
+    processes = @($processes | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath)
+}
+$taskState = if ($task) { [string]$task.State } else { "MISSING" }
+Add-HealthCheck -Name "Bybit runtime" -Ok $runtimeOk -Message "task=$taskState instances=$collectorInstances python_processes=$($processes.Count)" -Details $runtimeDetails
 
 $bybitRows = @()
+$uniqueBybitSymbols = @()
 if (Test-Path $bybitLatestPath) {
     try {
         $bybitRows = @(Import-Csv $bybitLatestPath)
-        $uniqueSymbols = @($bybitRows | ForEach-Object { [string]$_.symbol } | Sort-Object -Unique)
-        Add-HealthCheck \
-            -Name "Bybit M5 universe" \
-            -Ok ($uniqueSymbols.Count -eq $expectedBybitCount) \
-            -Message "symbols=$($uniqueSymbols.Count) expected=$expectedBybitCount" \
-            -Details ([pscustomobject]@{ symbols = $uniqueSymbols; path = $bybitLatestPath })
+        $uniqueBybitSymbols = @($bybitRows | ForEach-Object { [string]$_.symbol } | Sort-Object -Unique)
+        Add-HealthCheck -Name "Bybit M5 universe" -Ok ($uniqueBybitSymbols.Count -eq $expectedBybitCount) -Message "symbols=$($uniqueBybitSymbols.Count) expected=$expectedBybitCount" -Details ([pscustomobject]@{ symbols = $uniqueBybitSymbols; path = $bybitLatestPath })
     } catch {
         Add-HealthCheck -Name "Bybit M5 universe" -Ok $false -Message $_.Exception.Message -Details $bybitLatestPath
     }
@@ -182,7 +167,7 @@ $snapshot = [ordered]@{
     }
     bybit = [ordered]@{
         expected_symbols = $expectedBybitCount
-        observed_symbols = @($bybitRows | ForEach-Object { [string]$_.symbol } | Sort-Object -Unique).Count
+        observed_symbols = $uniqueBybitSymbols.Count
         collector_instances = $collectorInstances
         python_processes = $processes.Count
         status_age_seconds = $bybitStatusAge
