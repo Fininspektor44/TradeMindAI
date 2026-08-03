@@ -38,7 +38,7 @@ trademind-watchdog-unified = "trademind.watchdog_unified:main"
 trademind-watchdog-paper = "trademind.watchdog_paper:main"
 trademind-smc-ote = "trademind.smc_ote:main"
 trademind-unified-center = "trademind.unified_center:main"
-trademind-paper-gate-v18 = "trademind.paper_gate_v18:main"
+trademind-paper-gate-v18 = "trademind.paper_gate_runtime:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
