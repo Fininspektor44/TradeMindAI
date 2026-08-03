@@ -36,21 +36,61 @@ if (-not (Test-Path $terminalRoot)) {
     throw "MetaTrader terminal data root not found: $terminalRoot"
 }
 
-$expertDirs = Get-ChildItem -Path $terminalRoot -Directory -ErrorAction Stop |
-    ForEach-Object { Join-Path $_.FullName "MQL5\Experts" } |
-    Where-Object { Test-Path $_ } |
-    Sort-Object -Unique
-if (-not $expertDirs) {
-    throw "No MetaTrader MQL5\Experts directories were found."
+# Prefer the Advisors folder that already contains the old ECN exporter.
+# This identifies the ECN terminal instead of writing only to an arbitrary Experts root.
+$oldEcnMarkers = @(
+    Get-ChildItem -Path $terminalRoot -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Extension -in @(".mq5", ".ex5") -and
+            $_.BaseName -match '(?i)TradeMind.*ECN.*Exporter' -and
+            $_.BaseName -notmatch '(?i)UniversalVolumeExporter'
+        }
+)
+$targetDirs = @(
+    $oldEcnMarkers |
+        ForEach-Object { $_.Directory.FullName } |
+        Where-Object { $_ -match '\\MQL5\\Experts(\\Advisors)?$' } |
+        Sort-Object -Unique
+)
+
+if (-not $targetDirs) {
+    $targetDirs = @(
+        Get-ChildItem -Path $terminalRoot -Directory -ErrorAction Stop |
+            ForEach-Object { Join-Path $_.FullName "MQL5\Experts\Advisors" } |
+            Where-Object { Test-Path $_ } |
+            Sort-Object -Unique
+    )
+}
+if (-not $targetDirs) {
+    throw "No MetaTrader MQL5\Experts\Advisors directories were found."
 }
 
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 $written = @()
-foreach ($expertsDir in $expertDirs) {
-    $targetPath = Join-Path $expertsDir $TargetName
+foreach ($targetDir in $targetDirs) {
+    New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    $targetPath = Join-Path $targetDir $TargetName
     [System.IO.File]::WriteAllText($targetPath, $content, $utf8)
     $written += $targetPath
-    Write-Host "Deployed universal ECN exporter: $targetPath"
+    Write-Host "Deployed universal ECN source: $targetPath"
+}
+
+# The user has already compiled the file once. Find that EX5 and copy it next to
+# the existing ECN advisor so Navigator can see it immediately.
+$compiledName = [System.IO.Path]::ChangeExtension($TargetName, ".ex5")
+$compiledSource = Get-ChildItem -Path $terminalRoot -Recurse -File -Filter $compiledName -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+$compiledTargets = @()
+if ($compiledSource) {
+    foreach ($targetDir in $targetDirs) {
+        $targetEx5 = Join-Path $targetDir $compiledName
+        if ($compiledSource.FullName -ne $targetEx5) {
+            Copy-Item -Path $compiledSource.FullName -Destination $targetEx5 -Force
+        }
+        $compiledTargets += $targetEx5
+        Write-Host "Installed compiled ECN exporter: $targetEx5"
+    }
 }
 
 Write-Host ""
@@ -61,8 +101,14 @@ Write-Host "Output folder: Terminal Common Files\TradeMindAI_Volume_v1_4"
 Write-Host "Manifest: ecn_manifest.csv"
 Write-Host "Cent is not included."
 Write-Host "No order functions are present."
-Write-Host "Targets written: $($written.Count)"
+Write-Host "ECN target folders: $($targetDirs.Count)"
+Write-Host "Compiled files installed: $($compiledTargets.Count)"
 
 if ($Open -and $written.Count -gt 0) {
-    Start-Process $written[0]
+    if (-not $compiledSource) {
+        Start-Process $written[0]
+        Write-Host "Compiled EX5 was not found, so the ECN source was opened for compilation."
+    } else {
+        Start-Process explorer.exe -ArgumentList "/select,`"$($compiledTargets[0])`""
+    }
 }
