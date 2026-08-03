@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.7.0"
+version = "1.8.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,8 +35,10 @@ trademind-fx-dashboard = "trademind.fx_dashboard:main"
 trademind-watchdog = "trademind.watchdog:main"
 trademind-watchdog-ote = "trademind.watchdog_ote:main"
 trademind-watchdog-unified = "trademind.watchdog_unified:main"
+trademind-watchdog-paper = "trademind.watchdog_paper:main"
 trademind-smc-ote = "trademind.smc_ote:main"
 trademind-unified-center = "trademind.unified_center:main"
+trademind-paper-gate-v18 = "trademind.paper_gate_runtime:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -49,3 +51,6 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint.per-file-ignores]
+"src/trademind/paper_gate_v18.py" = ["F401"]
