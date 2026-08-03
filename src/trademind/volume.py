@@ -1,4 +1,4 @@
-"""Canonical collector for TradeMind AI v1.4 volume intelligence files."""
+"""Canonical collector for TradeMind AI volume intelligence files."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA_VERSION = "1.4"
+SOURCE_SCHEMA_VERSIONS = {"1.4", "1.7"}
 FIELDNAMES = (
     "schema_version",
     "time",
@@ -106,9 +107,14 @@ def _normalize_row(row: dict[str, str]) -> dict[str, str]:
         raise ValueError(f"missing columns: {','.join(sorted(missing))}")
 
     normalized = {name: str(row.get(name, "")).strip() for name in FIELDNAMES}
-    if normalized["schema_version"] != SCHEMA_VERSION:
-        raise ValueError(f"unsupported schema version: {normalized['schema_version']!r}")
+    source_schema = normalized["schema_version"]
+    if source_schema not in SOURCE_SCHEMA_VERSIONS:
+        raise ValueError(f"unsupported schema version: {source_schema!r}")
 
+    # The v1.7 crypto exporter kept the exact v1.4 column contract but stamped
+    # rows with its exporter release number. Normalize compatible source rows
+    # to the stable canonical schema instead of discarding the crypto archive.
+    normalized["schema_version"] = SCHEMA_VERSION
     normalized["symbol"] = normalized["symbol"].upper()
     normalized["timeframe"] = normalized["timeframe"].upper()
     normalized["tick_copy_status"] = normalized["tick_copy_status"].upper()
@@ -221,7 +227,7 @@ def collect_volume_files(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Collect and deduplicate TradeMind v1.4 volume intelligence CSV files"
+        description="Collect and deduplicate TradeMind volume intelligence CSV files"
     )
     default_source = (
         Path(os.getenv("APPDATA", ""))
@@ -241,7 +247,7 @@ def main() -> int:
     args = parser.parse_args()
 
     summary = collect_volume_files(args.source_dir, args.output, pattern=args.pattern)
-    print("TradeMind v1.4 volume collector")
+    print("TradeMind volume collector")
     print(f"Source directory: {args.source_dir.expanduser().resolve()}")
     print(f"Source files: {summary.source_files}")
     print(f"Rows read: {summary.rows_read}")

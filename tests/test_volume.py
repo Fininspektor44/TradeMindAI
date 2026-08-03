@@ -12,11 +12,12 @@ def _row(
     status: str = "OK",
     tick_count: int = 100,
     symbol: str = ".US30Cash",
+    schema_version: str = "1.4",
 ) -> dict[str, str]:
     values = {name: "0" for name in FIELDNAMES}
     values.update(
         {
-            "schema_version": "1.4",
+            "schema_version": schema_version,
             "time": str(time),
             "symbol": symbol,
             "timeframe": "M5",
@@ -98,3 +99,37 @@ def test_collector_keeps_existing_history_and_rejects_bad_rows(tmp_path: Path) -
         (".US30CASH", "1000"),
         ("XAUUSD", "1600"),
     }
+
+
+def test_collector_accepts_crypto_schema_17_and_normalizes_to_canonical(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "data" / "volume.csv"
+    _write(
+        source / "volume_BTCUSD_M5.csv",
+        [
+            _row(time=1000, symbol="BTCUSD", schema_version="1.7", tick_count=250),
+            _row(time=1300, symbol="ETHUSD", schema_version="1.7", tick_count=180),
+        ],
+    )
+
+    summary = collect_volume_files(source, output)
+
+    assert summary.rows_read == 2
+    assert summary.invalid_rows == 0
+    assert summary.canonical_rows == 2
+    with output.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["symbol"] for row in rows} == {"BTCUSD", "ETHUSD"}
+    assert {row["schema_version"] for row in rows} == {"1.4"}
+
+
+def test_collector_still_rejects_unknown_schema(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    output = tmp_path / "data" / "volume.csv"
+    _write(source / "volume_unknown.csv", [_row(time=1000, schema_version="9.9")])
+
+    summary = collect_volume_files(source, output)
+
+    assert summary.rows_read == 0
+    assert summary.invalid_rows == 1
+    assert summary.canonical_rows == 0
