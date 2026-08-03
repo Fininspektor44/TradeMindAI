@@ -21,8 +21,9 @@ $status = Get-Content $statusPath -Raw | ConvertFrom-Json
 $updatedAt = [DateTimeOffset]::Parse([string]$status.updated_at).ToUniversalTime()
 $statusAgeSeconds = [math]::Round(([DateTimeOffset]::UtcNow - $updatedAt).TotalSeconds, 1)
 
-# Count only the actual hidden Python collector. A PowerShell diagnostic command can
-# contain the same module text in its own command line and must not be counted.
+# A Windows venv pythonw.exe launcher can start the base Python interpreter as a
+# child process. Both command lines contain the module name, but together they are
+# one collector instance. Count roots of matching parent-child chains, not raw PIDs.
 $processes = @(
     Get-CimInstance Win32_Process |
         Where-Object {
@@ -30,14 +31,26 @@ $processes = @(
             $_.CommandLine -match '(?i)(^|\s)-m\s+trademind\.bybit_fixed20(\s|$)'
         }
 )
+$matchingPids = @{}
+foreach ($process in $processes) {
+    $matchingPids[[int]$process.ProcessId] = $true
+}
+$collectorRoots = @(
+    $processes |
+        Where-Object { -not $matchingPids.ContainsKey([int]$_.ParentProcessId) }
+)
+$collectorInstances = $collectorRoots.Count
+
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $taskInfo = if ($task) { Get-ScheduledTaskInfo -TaskName $TaskName } else { $null }
 $healthy = (
     $task -and
     $task.State -eq "Running" -and
-    $processes.Count -eq 1 -and
+    $collectorInstances -eq 1 -and
+    $processes.Count -ge 1 -and
     [string]$status.state -eq "RUNNING" -and
-    $statusAgeSeconds -le $FreshSeconds
+    $statusAgeSeconds -le $FreshSeconds -and
+    -not [bool]$status.orders_enabled
 )
 
 Write-Host "`n=== BYBIT RUNTIME ===" -ForegroundColor Cyan
@@ -47,7 +60,8 @@ Write-Host "`n=== BYBIT RUNTIME ===" -ForegroundColor Cyan
     LastTaskResult = if ($taskInfo) { $taskInfo.LastTaskResult } else { "" }
     CollectorState = [string]$status.state
     StatusAgeSeconds = $statusAgeSeconds
-    ProcessCount = $processes.Count
+    CollectorInstances = $collectorInstances
+    PythonProcessCount = $processes.Count
     Messages = $status.messages
     BarsWritten = $status.bars_written
     Reconnects = $status.reconnects
@@ -55,8 +69,11 @@ Write-Host "`n=== BYBIT RUNTIME ===" -ForegroundColor Cyan
 } | Format-List
 
 if ($processes.Count -gt 0) {
-    Write-Host "=== BYBIT PROCESS ===" -ForegroundColor DarkCyan
-    $processes | Select-Object ProcessId,Name,CreationDate,CommandLine | Format-List
+    Write-Host "=== BYBIT PROCESS CHAIN ===" -ForegroundColor DarkCyan
+    $processes |
+        Sort-Object ParentProcessId,ProcessId |
+        Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CreationDate,CommandLine |
+        Format-List
 }
 
 if (Test-Path $universePath) {
@@ -74,8 +91,10 @@ if (Test-Path $latestPath) {
 }
 
 if (-not $healthy) {
-    if ($processes.Count -gt 1) {
-        Write-Host "[WARN] Duplicate Bybit collector processes detected: $($processes.Count)." -ForegroundColor Yellow
+    if ($collectorInstances -gt 1) {
+        Write-Host "[WARN] Duplicate Bybit collector chains detected: $collectorInstances." -ForegroundColor Yellow
+    } elseif ([bool]$status.orders_enabled) {
+        Write-Host "[WARN] Bybit collector is not in read-only mode." -ForegroundColor Yellow
     } else {
         Write-Host "[WARN] Bybit collector is not confirmed alive. Reinstall/start the hidden direct-Python task." -ForegroundColor Yellow
     }
