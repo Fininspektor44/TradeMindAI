@@ -1,8 +1,6 @@
 param(
     [string]$TaskName = "TradeMindAI-v1.9-Bybit",
-    [ValidateRange(2, 50)]
-    [int]$TopN = 10,
-    [double]$MinTurnover = 5000000,
+    [string]$Symbols = "BTCUSDT,ETHUSDT,UNIUSDT,JTOUSDT,SOLUSDT,BZUSDT,NEARUSDT,AKEUSDT,ONDOUSDT,POPCATUSDT,XMRUSDT,MYXUSDT,AAVEUSDT,ZECUSDT,HYPEUSDT,LDOUSDT,PUMPFUNUSDT,GRASSUSDT,XAUTUSDT,1000PEPEUSDT",
     [ValidateRange(0.25, 24)]
     [double]$RefreshHours = 6,
     [switch]$RunNow
@@ -15,7 +13,7 @@ if (-not (Test-Path $runner)) {
     throw "Runner not found: $runner"
 }
 
-$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runner`" -TopN $TopN -MinTurnover $MinTurnover -RefreshHours $RefreshHours"
+$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runner`" -Symbols `"$Symbols`" -RefreshHours $RefreshHours"
 $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
     -Argument $arguments `
@@ -36,13 +34,15 @@ Register-ScheduledTask `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
-    -Description "TradeMind v1.9 public read-only Bybit top-10 market intelligence" `
+    -Description "TradeMind v1.9.1 public read-only Bybit fixed 20-symbol intelligence" `
     -Force | Out-Null
 
+$symbolCount = @($Symbols.Split(",") | Where-Object { $_.Trim() }).Count
 Write-Host "Installed task: $TaskName"
 Write-Host "Trigger: user logon"
 Write-Host "Restart on failure: every 1 minute"
-Write-Host "Universe size: $TopN"
+Write-Host "Universe size: $symbolCount"
+Write-Host "Symbols: $Symbols"
 Write-Host "Project: $projectRoot"
 Write-Host "No API key, account access or order function is used."
 if ($RunNow) {

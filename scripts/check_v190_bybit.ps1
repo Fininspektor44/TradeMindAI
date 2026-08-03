@@ -20,7 +20,7 @@ Write-Host "`n=== BYBIT STATUS ===" -ForegroundColor Cyan
 $status | Select-Object state,updated_at,last_event_at,messages,bars_written,reconnects,orders_enabled | Format-List
 
 if (Test-Path $universePath) {
-    Write-Host "=== DYNAMIC TOP UNIVERSE ===" -ForegroundColor Yellow
+    Write-Host "=== FIXED BYBIT UNIVERSE ===" -ForegroundColor Yellow
     Import-Csv $universePath | Select-Object rank,symbol,turnover24h,lastPrice,price24hPcnt | Format-Table -AutoSize
 }
 
