@@ -8,14 +8,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$runner = Join-Path $projectRoot "scripts\run_v190_bybit.ps1"
-if (-not (Test-Path $runner)) {
-    throw "Runner not found: $runner"
-}
+$python = Join-Path $projectRoot ".venv\Scripts\python.exe"
+$outputDir = Join-Path $projectRoot "data\bybit_v1_9"
 
-$arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$runner`" -Symbols `"$Symbols`" -RefreshHours $RefreshHours"
+if (-not (Test-Path $python)) {
+    throw "Python environment not found: $python"
+}
+New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+# Run Python directly. The previous nested PowerShell runner could inherit a console
+# control event and terminate with 0xC000013A even while status.json still said RUNNING.
+$arguments = "-m trademind.bybit_fixed20 --output-dir `"$outputDir`" --symbols `"$Symbols`" --refresh-hours $RefreshHours"
 $action = New-ScheduledTaskAction `
-    -Execute "powershell.exe" `
+    -Execute $python `
     -Argument $arguments `
     -WorkingDirectory $projectRoot
 
@@ -29,16 +34,23 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existing -and $existing.State -eq "Running") {
+    Stop-ScheduledTask -TaskName $TaskName
+    Start-Sleep -Seconds 2
+}
+
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
     -Trigger $trigger `
     -Settings $settings `
-    -Description "TradeMind v1.9.1 public read-only Bybit fixed 20-symbol intelligence" `
+    -Description "TradeMind v1.9.2 public read-only Bybit fixed 20-symbol intelligence" `
     -Force | Out-Null
 
 $symbolCount = @($Symbols.Split(",") | Where-Object { $_.Trim() }).Count
 Write-Host "Installed task: $TaskName"
+Write-Host "Action: direct Python process"
 Write-Host "Trigger: user logon"
 Write-Host "Restart on failure: every 1 minute"
 Write-Host "Universe size: $symbolCount"
