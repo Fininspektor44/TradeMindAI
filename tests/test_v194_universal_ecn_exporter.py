@@ -57,7 +57,7 @@ def test_universal_exporter_keeps_complete_ecn_universe_in_order() -> None:
 def test_universal_exporter_preserves_existing_file_and_schema_contracts() -> None:
     text = EXPORTER.read_text(encoding="utf-8")
     assert 'InpOutputFolder     = "TradeMindAI_Volume_v1_4"' in text
-    assert '"volume_"+SafeSymbolName(canonical)' in text
+    assert '"\\\\volume_"+SafeSymbolName(canonical)' in text
     assert 'normalized=="BTCUSD" || normalized=="ETHUSD"' in text
     assert 'return (IsCryptoCanonical(canonical) ? "1.7" : "1.4")' in text
     assert "FILE_COMMON" in text
