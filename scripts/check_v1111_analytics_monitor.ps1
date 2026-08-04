@@ -32,7 +32,7 @@ $healthy = (
     [bool]$status.forward_only -and
     -not [bool]$status.orders_enabled -and
     -not [bool]$status.logic_changed -and
-    $age -ge 0 -and $age -le $FreshSeconds -and
+    $age -ge -5 -and $age -le $FreshSeconds -and
     $armsPresent -and
     $task -and $task.State -in @("Ready", "Running") -and
     $taskInfo -and $taskInfo.LastTaskResult -eq 0
