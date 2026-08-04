@@ -5,10 +5,12 @@ on:
     branches:
       - main
       - feature/v1.13-risk-plan-experiments
+      - feature/v1.14-position-management-experiments
   pull_request:
     branches:
       - main
       - feature/v1.12-live-signal-console
+      - feature/v1.13-risk-plan-experiments
 
 jobs:
   test:
