@@ -32,6 +32,11 @@ def _build_server_arguments(
 
     _append_if_exists(
         arguments,
+        "--fx-observations",
+        project_root / "data" / "fx_research_v1_4_2" / "observations.csv",
+    )
+    _append_if_exists(
+        arguments,
         "--mt5-status",
         project_root / "data" / "watchdog_v1_10_1" / "status.json",
     )
