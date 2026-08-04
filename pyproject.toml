@@ -44,6 +44,7 @@ trademind-paper-gate-v18 = "trademind.paper_gate_runtime:main"
 trademind-bybit = "trademind.bybit_fixed20:main"
 trademind-bybit-shadow = "trademind.bybit_shadow:main"
 trademind-bybit-shadow-experiments = "trademind.bybit_shadow_experiments:main"
+trademind-bybit-shadow-monitor = "trademind.bybit_shadow_monitor:main"
 trademind-live-signals = "trademind.live_signal_server:main"
 
 [tool.setuptools]
@@ -61,3 +62,4 @@ target-version = "py311"
 [tool.ruff.lint.per-file-ignores]
 "src/trademind/paper_gate_v18.py" = ["F401"]
 "src/trademind/bybit_shadow_experiments.py" = ["F401"]
+"src/trademind/bybit_shadow_monitor.py" = ["F401"]
