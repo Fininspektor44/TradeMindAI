@@ -130,6 +130,14 @@ def handler_factory(service: LiveSignalService) -> type[BaseHTTPRequestHandler]:
     class LiveSignalHandler(BaseHTTPRequestHandler):
         server_version = "TradeMindLiveSignal/1.12"
 
+        def _write_body(self, body: bytes) -> None:
+            if self.command == "HEAD":
+                return
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                return
+
         def _send_json(self, status: HTTPStatus, payload: object) -> None:
             body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
@@ -137,8 +145,7 @@ def handler_factory(service: LiveSignalService) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body)
+            self._write_body(body)
 
         def _send_html(self, status: HTTPStatus, content: str) -> None:
             body = content.encode("utf-8")
@@ -147,8 +154,7 @@ def handler_factory(service: LiveSignalService) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            if self.command != "HEAD":
-                self.wfile.write(body)
+            self._write_body(body)
 
         def _method_not_allowed(self) -> None:
             self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
