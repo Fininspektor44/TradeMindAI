@@ -8,9 +8,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$runner = Join-Path $projectRoot "scripts\run_v112_live_signal_console.ps1"
-if (-not (Test-Path $runner)) {
-    throw "Live console runner not found: $runner"
+$hiddenRunner = Join-Path $projectRoot "scripts\run_v112_live_signal_console_hidden.pyw"
+$pythonwExe = Join-Path $projectRoot ".venv\Scripts\pythonw.exe"
+$logPath = Join-Path $projectRoot "logs\live_signal_console_v1_12.log"
+
+if (-not (Test-Path $hiddenRunner)) {
+    throw "Windowless Live Signal Console runner not found: $hiddenRunner"
+}
+if (-not (Test-Path $pythonwExe)) {
+    throw "pythonw.exe not found in the project virtual environment: $pythonwExe"
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -19,10 +25,9 @@ if (-not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
     throw "Run PowerShell as Administrator to install the Live Signal Console task."
 }
 
-$powerShellExe = Join-Path $PSHOME "powershell.exe"
-$arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -HostAddress `"$HostAddress`" -Port $Port"
+$arguments = "`"$hiddenRunner`" --host `"$HostAddress`" --port $Port"
 $action = New-ScheduledTaskAction `
-    -Execute $powerShellExe `
+    -Execute $pythonwExe `
     -Argument $arguments `
     -WorkingDirectory $projectRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
@@ -53,8 +58,10 @@ Register-ScheduledTask `
 Write-Host "Installed task: $TaskName"
 Write-Host "Account: $($identity.Name)"
 Write-Host "Logon type: Interactive"
+Write-Host "Engine: pythonw.exe (no console window)"
 Write-Host "Address: http://${HostAddress}:$Port"
-Write-Host "Starts at user logon and runs hidden."
+Write-Host "Log: $logPath"
+Write-Host "Starts at user logon and runs without a visible terminal."
 Write-Host "Read-only. OrdersEnabled=False."
 
 if ($RunNow) {
@@ -64,13 +71,17 @@ if ($RunNow) {
     }
     Start-Sleep -Seconds 2
     Start-ScheduledTask -TaskName $TaskName
-    Start-Sleep -Seconds 5
+    Start-Sleep -Seconds 8
     $info = Get-ScheduledTaskInfo -TaskName $TaskName
     $task = Get-ScheduledTask -TaskName $TaskName
     Write-Host "TaskState: $($task.State)"
     Write-Host "LastTaskResult: $($info.LastTaskResult)"
     Write-Host "Open: http://${HostAddress}:$Port"
     if ($task.State -ne "Running") {
+        if (Test-Path $logPath) {
+            Write-Host "Last log lines:"
+            Get-Content $logPath -Tail 20
+        }
         throw "Live Signal Console task did not enter Running state."
     }
 }
