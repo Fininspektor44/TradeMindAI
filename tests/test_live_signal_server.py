@@ -86,6 +86,11 @@ def test_http_api_is_live_read_only_and_reflects_file_updates(tmp_path: Path) ->
     thread.start()
     base = f"http://127.0.0.1:{server.server_port}"
     try:
+        with urlopen(f"{base}/", timeout=3) as response:
+            page = response.read().decode("utf-8")
+            assert response.headers["Content-Type"] == "text/html; charset=utf-8"
+            assert "TradeMind Live Signal Console" in page
+
         status, payload = _json_get(f"{base}/api/signals?action=BUY&min_score=80")
         assert status == 200
         assert payload["count"] == 1
