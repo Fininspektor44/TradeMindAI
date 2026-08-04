@@ -15,7 +15,7 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $projectRoot
 $executable = Join-Path $projectRoot ".venv\Scripts\trademind-live-signals.exe"
 if (-not (Test-Path $executable)) {
-    throw "TradeMind v1.12 executable not found: $executable. Reinstall the project in .venv."
+    throw "TradeMind live signal executable not found: $executable. Reinstall the project in .venv."
 }
 
 $arguments = @(
@@ -36,14 +36,21 @@ if (Test-Path $BybitStatus) {
 foreach ($path in @(
     ".\data\bybit_shadow_v1_11\control\signals.csv",
     ".\data\bybit_shadow_v1_11\buy_only\signals.csv",
-    ".\data\bybit_shadow_v1_11\strict_sell\signals.csv"
+    ".\data\bybit_shadow_v1_11\strict_sell\signals.csv",
+    ".\data\bybit_risk_plans_v1_13\base_strict\signals.csv",
+    ".\data\bybit_risk_plans_v1_13\wide15_r15\signals.csv",
+    ".\data\bybit_risk_plans_v1_13\wide15_r20\signals.csv",
+    ".\data\bybit_risk_plans_v1_13\wide20_r15\signals.csv",
+    ".\data\bybit_risk_plans_v1_13\wide20_r20\signals.csv",
+    ".\data\bybit_risk_plans_v1_13\structure_r15\signals.csv",
+    ".\data\bybit_risk_plans_v1_13\structure_liq\signals.csv"
 )) {
     if (Test-Path $path) {
         $arguments += @("--bybit-signals", $path)
     }
 }
 
-Write-Host "TradeMind v1.12 Live Signal Console"
+Write-Host "TradeMind Live Signal Console"
 Write-Host "Address: http://${HostAddress}:$Port"
 Write-Host "Mode: read-only, OrdersEnabled=False"
 & $executable @arguments
