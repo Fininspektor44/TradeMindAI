@@ -21,9 +21,16 @@ if (-not (Test-Path $legacyRunner)) {
     throw "Base unified watchdog runner not found: $legacyRunner"
 }
 
-# Run the complete ECN + Bybit + Shadow audit first. Its console output is held
-# back so a verified short websocket reconnect does not print a false red alarm.
-$legacyOutput = @(& $legacyRunner 2>&1)
+# Run the complete ECN + Bybit + Shadow audit in an isolated PowerShell process.
+# The v1.10.1 runner uses exit codes, so isolation guarantees this wrapper can
+# inspect a failed snapshot and distinguish a short reconnect from a real fault.
+$legacyOutput = @(
+    & powershell.exe `
+        -NoProfile `
+        -NonInteractive `
+        -ExecutionPolicy Bypass `
+        -File $legacyRunner 2>&1
+)
 $legacyExitCode = $LASTEXITCODE
 if (-not (Test-Path $statusPath)) {
     $legacyOutput | ForEach-Object { Write-Host $_ }
