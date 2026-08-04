@@ -25,10 +25,16 @@ def test_installer_starts_hidden_single_instance_task_at_logon() -> None:
     text = INSTALLER.read_text(encoding="utf-8")
 
     assert '"TradeMindAI-v1.12-LiveSignalConsole"' in text
-    assert "New-ScheduledTaskTrigger -AtLogOn" in text
+    assert "New-ScheduledTaskTrigger -AtLogOn -User $identity.Name" in text
+    assert "New-ScheduledTaskPrincipal" in text
+    assert "-LogonType Interactive" in text
+    assert "-RunLevel Limited" in text
+    assert "-Principal $taskPrincipal" in text
     assert "-WindowStyle Hidden" in text
     assert "-MultipleInstances IgnoreNew" in text
     assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in text
+    assert "Get-NetTCPConnection -LocalPort $Port -State Listen" in text
+    assert "TaskState:" in text
     assert "Read-only. OrdersEnabled=False." in text
 
 
