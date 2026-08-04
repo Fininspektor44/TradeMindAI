@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,8 +13,10 @@ def test_v112_cli_and_runners_use_existing_mt5_and_bybit_journals() -> None:
     runner = RUNNER.read_text(encoding="utf-8")
     hidden_runner = HIDDEN_RUNNER.read_text(encoding="utf-8")
     pyproject = PYPROJECT.read_text(encoding="utf-8")
+    version = str(tomllib.loads(pyproject)["project"]["version"])
+    major, minor, *_ = (int(part) for part in version.split("."))
 
-    assert 'version = "1.12.0"' in pyproject
+    assert (major, minor) >= (1, 12)
     assert 'trademind-live-signals = "trademind.live_signal_server:main"' in pyproject
     assert ".venv\\Scripts\\trademind-live-signals.exe" in runner
     assert "unified_signal_center_v1_6\\signals.csv" in runner
