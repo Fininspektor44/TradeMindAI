@@ -3,6 +3,7 @@ param(
     [ValidateRange(1024, 65535)]
     [int]$Port = 8765,
     [string]$UnifiedSignals = ".\data\unified_signal_center_v1_6\signals.csv",
+    [string]$FxObservations = ".\data\fx_research_v1_4_2\observations.csv",
     [string]$Mt5Status = ".\data\watchdog_v1_10_1\status.json",
     [string]$BybitStatus = ".\data\bybit_shadow_v1_11\status.json",
     [ValidateRange(60, 86400)]
@@ -23,6 +24,9 @@ $arguments = @(
     "--unified-signals", $UnifiedSignals,
     "--stale-after-seconds", [string]$StaleAfterSeconds
 )
+if (Test-Path $FxObservations) {
+    $arguments += @("--fx-observations", $FxObservations)
+}
 if (Test-Path $Mt5Status) {
     $arguments += @("--mt5-status", $Mt5Status)
 }
