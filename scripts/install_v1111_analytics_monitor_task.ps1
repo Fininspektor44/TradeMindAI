@@ -20,8 +20,10 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Run PowerShell as Administrator to install the analytics task."
 }
+$feeInvariant = $FeeBpsPerSide.ToString([Globalization.CultureInfo]::InvariantCulture)
+$slippageInvariant = $SlippageBpsPerSide.ToString([Globalization.CultureInfo]::InvariantCulture)
 
-$arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -ProjectRoot `"$projectRoot`" -FeeBpsPerSide $FeeBpsPerSide -SlippageBpsPerSide $SlippageBpsPerSide"
+$arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -ProjectRoot `"$projectRoot`" -FeeBpsPerSide $feeInvariant -SlippageBpsPerSide $slippageInvariant"
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments -WorkingDirectory $projectRoot
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
 $settings = New-ScheduledTaskSettingsSet `
@@ -42,7 +44,7 @@ Register-ScheduledTask `
 
 Write-Host "Installed task: $TaskName"
 Write-Host "Interval: every $IntervalMinutes minutes"
-Write-Host "Cost model: fee=$FeeBpsPerSide bps/side, slippage=$SlippageBpsPerSide bps/side, observed entry spread included"
+Write-Host "Cost model: fee=$feeInvariant bps/side, slippage=$slippageInvariant bps/side, observed entry spread included"
 Write-Host "The CONTROL, BUY_ONLY and STRICT_SELL logic is not changed."
 Write-Host "Read-only analytics. No orders."
 
