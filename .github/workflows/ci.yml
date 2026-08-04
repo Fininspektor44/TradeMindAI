@@ -2,9 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - feature/v1.13-risk-plan-experiments
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - feature/v1.12-live-signal-console
 
 jobs:
   test:
