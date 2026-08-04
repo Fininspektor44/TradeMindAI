@@ -27,6 +27,7 @@ class SignalQuery:
     actions: tuple[str, ...] = ()
     scenarios: tuple[str, ...] = ()
     statuses: tuple[str, ...] = ()
+    plan_statuses: tuple[str, ...] = ()
     min_score: int = 0
     limit: int = 200
 
@@ -49,6 +50,7 @@ class SignalQuery:
             actions=values("action"),
             scenarios=values("scenario"),
             statuses=values("status"),
+            plan_statuses=values("plan_status"),
             min_score=min_score,
             limit=limit,
         )
@@ -66,6 +68,7 @@ class LiveSignalService:
     def health(self, snapshot: RepositorySnapshot | None = None) -> dict[str, object]:
         current = snapshot or self.snapshot()
         stale = sum(record.stale for record in current.records)
+        ready_plans = sum(record.plan_status == "READY" for record in current.records)
         state = "WARN" if current.errors or stale else "OK"
         if not current.records and not current.errors:
             state = "EMPTY"
@@ -75,6 +78,7 @@ class LiveSignalService:
             "orders_enabled": False,
             "loaded_at": current.loaded_at.isoformat(),
             "signals": len(current.records),
+            "ready_plans": ready_plans,
             "stale_signals": stale,
             "errors": list(current.errors),
         }
@@ -92,6 +96,7 @@ class LiveSignalService:
             actions=query.actions,
             scenarios=query.scenarios,
             statuses=query.statuses,
+            plan_statuses=query.plan_statuses,
             min_score=query.min_score,
             limit=query.limit,
         )
@@ -120,6 +125,12 @@ class LiveSignalService:
             "total": len(current.records),
             "by_source": dict(Counter(record.source for record in current.records)),
             "by_status": dict(Counter(record.status for record in current.records)),
+            "by_plan_status": dict(
+                Counter(record.plan_status for record in current.records)
+            ),
+            "by_level_source": dict(
+                Counter(record.level_source for record in current.records)
+            ),
             "by_symbol": dict(Counter(record.symbol for record in current.records)),
             "stale": sum(record.stale for record in current.records),
             "errors": list(current.errors),
@@ -139,7 +150,9 @@ def handler_factory(service: LiveSignalService) -> type[BaseHTTPRequestHandler]:
                 return
 
         def _send_json(self, status: HTTPStatus, payload: object) -> None:
-            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -217,6 +230,7 @@ def build_repository(args: argparse.Namespace) -> LiveSignalRepository:
         status_paths["BYBIT"] = args.bybit_status
     return LiveSignalRepository(
         unified_path=args.unified_signals,
+        fx_observations_path=args.fx_observations,
         bybit_paths=args.bybit_signals,
         status_paths=status_paths,
         stale_after_seconds=args.stale_after_seconds,
@@ -230,6 +244,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--unified-signals",
         type=Path,
         default=Path(os.getenv("TRADEMIND_UNIFIED_SIGNALS", "data/unified/signals.csv")),
+    )
+    parser.add_argument(
+        "--fx-observations",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "TRADEMIND_FX_OBSERVATIONS",
+                "data/fx_research_v1_4_2/observations.csv",
+            )
+        ),
+        help="Optional FX observation journal used only to build transparent ATR plans.",
     )
     parser.add_argument(
         "--bybit-signals",
