@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.13.0"
+version = "1.13.1"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,6 +46,7 @@ trademind-bybit-shadow = "trademind.bybit_shadow:main"
 trademind-bybit-shadow-experiments = "trademind.bybit_shadow_experiments:main"
 trademind-bybit-shadow-monitor = "trademind.bybit_shadow_monitor:main"
 trademind-bybit-risk-plans = "trademind.bybit_risk_plan_experiments:main"
+trademind-bybit-risk-backfill = "trademind.bybit_risk_plan_backfill:main"
 trademind-live-signals = "trademind.live_signal_server:main"
 
 [tool.setuptools]
@@ -65,3 +66,4 @@ target-version = "py311"
 "src/trademind/bybit_shadow_experiments.py" = ["F401"]
 "src/trademind/bybit_shadow_monitor.py" = ["F401"]
 "src/trademind/bybit_risk_plan_experiments.py" = ["F401"]
+"src/trademind/bybit_risk_plan_backfill.py" = ["F401"]
