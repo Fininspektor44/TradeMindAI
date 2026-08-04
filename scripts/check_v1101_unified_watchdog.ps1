@@ -24,23 +24,23 @@ if (-not (Test-Path $statusPath)) {
 $status = Get-Content $statusPath -Raw | ConvertFrom-Json
 $generatedAt = [DateTimeOffset]::Parse([string]$status.generated_at).ToUniversalTime()
 $statusAgeSeconds = [math]::Round(([DateTimeOffset]::UtcNow - $generatedAt).TotalSeconds, 1)
-$taskOk = $task -and $task.State -in @("Ready", "Running")
-$resultOk = $taskInfo -and $taskInfo.LastTaskResult -eq 0
-$healthy = (
+$currentSnapshotHealthy = (
     [string]$status.overall -eq "OK" -and
     [bool]$status.read_only -and
     $statusAgeSeconds -ge 0 -and
-    $statusAgeSeconds -le $FreshSeconds -and
-    $taskOk -and
-    $resultOk
+    $statusAgeSeconds -le $FreshSeconds
 )
+$taskRegisteredAndReady = $task -and $task.State -in @("Ready", "Running")
+$lastScheduledRunOk = $taskInfo -and $taskInfo.LastTaskResult -eq 0
+$scheduledTaskHealthy = $taskRegisteredAndReady -and $lastScheduledRunOk
 
 Write-Host "`n=== TRADEMIND v1.10.1 UNIFIED WATCHDOG STATUS ===" -ForegroundColor Cyan
 [pscustomobject]@{
-    Overall = if ($healthy) { "OK" } else { "WARN" }
+    Overall = if ($currentSnapshotHealthy) { "OK" } else { "WARN" }
     SnapshotOverall = [string]$status.overall
     ReadOnly = [bool]$status.read_only
     StatusAgeSeconds = $statusAgeSeconds
+    ScheduledTaskHealth = if ($scheduledTaskHealthy) { "OK" } else { "WARN" }
     TaskState = if ($task) { [string]$task.State } else { "MISSING" }
     LastTaskResult = if ($taskInfo) { $taskInfo.LastTaskResult } else { $null }
     EcnFreshStreams = "$($status.ecn.fresh_streams)/$($status.ecn.expected_symbols)"
@@ -62,8 +62,11 @@ Write-Host "`n=== TRADEMIND v1.10.1 UNIFIED WATCHDOG STATUS ===" -ForegroundColo
 } | Format-List
 
 @($status.checks) | Select-Object status,name,message | Format-Table -AutoSize
-if (-not $healthy) {
-    Write-Host "[WARN] Unified watchdog is stale, its task failed, or a component check failed." -ForegroundColor Yellow
+if (-not $currentSnapshotHealthy) {
+    Write-Host "[WARN] The current unified snapshot is stale or a component check failed." -ForegroundColor Yellow
+} elseif (-not $scheduledTaskHealthy) {
+    Write-Host "[OK] Current ECN, Bybit collector and Bybit Shadow checks are healthy and read-only." -ForegroundColor Green
+    Write-Host "[WARN] The previous scheduled watchdog run returned $($taskInfo.LastTaskResult). The fresh manual snapshot above is OK." -ForegroundColor Yellow
 } else {
     Write-Host "[OK] ECN, Bybit collector and Bybit Shadow are healthy and read-only." -ForegroundColor Green
 }
