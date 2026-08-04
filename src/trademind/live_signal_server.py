@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
 
+from trademind.live_signal_ideas import collapse_signal_ideas
 from trademind.live_signal_page import render_page
 from trademind.live_signal_repository import LiveSignalRepository, RepositorySnapshot
 
@@ -60,7 +61,7 @@ class LiveSignalService:
         self.repository = repository
 
     def snapshot(self) -> RepositorySnapshot:
-        return self.repository.load()
+        return collapse_signal_ideas(self.repository.load())
 
     def health(self, snapshot: RepositorySnapshot | None = None) -> dict[str, object]:
         current = snapshot or self.snapshot()
