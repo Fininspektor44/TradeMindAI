@@ -17,6 +17,8 @@ def test_v112_cli_and_runners_use_existing_mt5_and_bybit_journals() -> None:
     assert 'trademind-live-signals = "trademind.live_signal_server:main"' in pyproject
     assert ".venv\\Scripts\\trademind-live-signals.exe" in runner
     assert "unified_signal_center_v1_6\\signals.csv" in runner
+    assert "fx_research_v1_4_2\\observations.csv" in runner
+    assert '"--fx-observations"' in runner
     assert "bybit_shadow_v1_11\\control\\signals.csv" in runner
     assert "bybit_shadow_v1_11\\buy_only\\signals.csv" in runner
     assert "bybit_shadow_v1_11\\strict_sell\\signals.csv" in runner
@@ -24,6 +26,8 @@ def test_v112_cli_and_runners_use_existing_mt5_and_bybit_journals() -> None:
 
     assert "trademind.live_signal_server" in hidden_runner
     assert "unified_signal_center_v1_6" in hidden_runner
+    assert "fx_research_v1_4_2" in hidden_runner
+    assert '"--fx-observations"' in hidden_runner
     assert "bybit_shadow_v1_11/control/signals.csv" in hidden_runner
     assert "bybit_shadow_v1_11/buy_only/signals.csv" in hidden_runner
     assert "bybit_shadow_v1_11/strict_sell/signals.csv" in hidden_runner
