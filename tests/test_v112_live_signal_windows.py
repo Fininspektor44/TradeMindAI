@@ -48,6 +48,9 @@ def test_checker_verifies_page_api_task_and_read_only_contract() -> None:
     assert "Get-ScheduledTask" in text
     assert "StaleSignals" in text
     assert "Start-Process $baseUrl" in text
+    assert "[int]$TimeoutSeconds = 60" in text
+    assert "-TimeoutSec $TimeoutSeconds" in text
+    assert "TimeoutSeconds = $TimeoutSeconds" in text
 
 
 def test_windows_scripts_do_not_contain_trading_functions() -> None:
