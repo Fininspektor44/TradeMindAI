@@ -1,0 +1,29 @@
+param(
+    [string]$ProjectRoot = "",
+    [ValidateRange(0, 100)]
+    [double]$FeeBpsPerSide = 5.5,
+    [ValidateRange(0, 100)]
+    [double]$SlippageBpsPerSide = 1.0
+)
+
+$ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+$python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $python)) {
+    throw "Project Python not found: $python"
+}
+
+Push-Location $ProjectRoot
+try {
+    & $python -m trademind.bybit_shadow_monitor `
+        --experiment-dir (Join-Path $ProjectRoot "data\bybit_shadow_v1_11") `
+        --output-dir (Join-Path $ProjectRoot "data\bybit_shadow_monitor_v1_11_1") `
+        --fee-bps-per-side $FeeBpsPerSide `
+        --slippage-bps-per-side $SlippageBpsPerSide
+    exit $LASTEXITCODE
+}
+finally {
+    Pop-Location
+}
