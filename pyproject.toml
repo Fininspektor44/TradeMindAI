@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.10.2"
+version = "1.11.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -43,6 +43,7 @@ trademind-unified-center = "trademind.unified_center:main"
 trademind-paper-gate-v18 = "trademind.paper_gate_runtime:main"
 trademind-bybit = "trademind.bybit_fixed20:main"
 trademind-bybit-shadow = "trademind.bybit_shadow:main"
+trademind-bybit-shadow-experiments = "trademind.bybit_shadow_experiments:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -58,3 +59,4 @@ target-version = "py311"
 
 [tool.ruff.lint.per-file-ignores]
 "src/trademind/paper_gate_v18.py" = ["F401"]
+"src/trademind/bybit_shadow_experiments.py" = ["F401"]
