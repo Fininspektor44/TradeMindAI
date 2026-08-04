@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
 
+from trademind.live_signal_page import render_page
 from trademind.live_signal_repository import LiveSignalRepository, RepositorySnapshot
 
 READ_ONLY_METHODS = {"GET", "HEAD"}
@@ -138,6 +139,16 @@ def handler_factory(service: LiveSignalService) -> type[BaseHTTPRequestHandler]:
             if self.command != "HEAD":
                 self.wfile.write(body)
 
+        def _send_html(self, status: HTTPStatus, content: str) -> None:
+            body = content.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
         def _method_not_allowed(self) -> None:
             self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
             self.send_header("Allow", ", ".join(sorted(READ_ONLY_METHODS)))
@@ -147,6 +158,9 @@ def handler_factory(service: LiveSignalService) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             try:
+                if parsed.path == "/":
+                    self._send_html(HTTPStatus.OK, render_page())
+                    return
                 if parsed.path == "/api/health":
                     self._send_json(HTTPStatus.OK, service.health())
                     return
