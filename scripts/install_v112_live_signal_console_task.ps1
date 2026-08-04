@@ -14,17 +14,22 @@ if (-not (Test-Path $runner)) {
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = [Security.Principal.WindowsPrincipal]::new($identity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+$windowsPrincipal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $windowsPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Run PowerShell as Administrator to install the Live Signal Console task."
 }
 
+$powerShellExe = Join-Path $PSHOME "powershell.exe"
 $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`" -HostAddress `"$HostAddress`" -Port $Port"
 $action = New-ScheduledTaskAction `
-    -Execute "powershell.exe" `
+    -Execute $powerShellExe `
     -Argument $arguments `
     -WorkingDirectory $projectRoot
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
+$taskPrincipal = New-ScheduledTaskPrincipal `
+    -UserId $identity.Name `
+    -LogonType Interactive `
+    -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet `
     -Hidden `
     -StartWhenAvailable `
@@ -33,28 +38,39 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit ([TimeSpan]::Zero)
 
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+}
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `
     -Trigger $trigger `
+    -Principal $taskPrincipal `
     -Settings $settings `
     -Description "TradeMind v1.12 local read-only MT5 and Bybit live signal console" `
     -Force | Out-Null
 
 Write-Host "Installed task: $TaskName"
+Write-Host "Account: $($identity.Name)"
+Write-Host "Logon type: Interactive"
 Write-Host "Address: http://${HostAddress}:$Port"
 Write-Host "Starts at user logon and runs hidden."
 Write-Host "Read-only. OrdersEnabled=False."
 
 if ($RunNow) {
-    $existing = Get-ScheduledTask -TaskName $TaskName
-    if ($existing.State -eq "Running") {
-        Stop-ScheduledTask -TaskName $TaskName
-        Start-Sleep -Seconds 2
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    foreach ($connection in $listener) {
+        Stop-Process -Id $connection.OwningProcess -Force -ErrorAction SilentlyContinue
     }
+    Start-Sleep -Seconds 2
     Start-ScheduledTask -TaskName $TaskName
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 5
     $info = Get-ScheduledTaskInfo -TaskName $TaskName
+    $task = Get-ScheduledTask -TaskName $TaskName
+    Write-Host "TaskState: $($task.State)"
     Write-Host "LastTaskResult: $($info.LastTaskResult)"
     Write-Host "Open: http://${HostAddress}:$Port"
+    if ($task.State -ne "Running") {
+        throw "Live Signal Console task did not enter Running state."
+    }
 }
