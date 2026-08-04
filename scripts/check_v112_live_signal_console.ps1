@@ -3,6 +3,8 @@ param(
     [string]$HostAddress = "127.0.0.1",
     [ValidateRange(1024, 65535)]
     [int]$Port = 8765,
+    [ValidateRange(5, 300)]
+    [int]$TimeoutSeconds = 60,
     [switch]$Open
 )
 
@@ -12,10 +14,17 @@ $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $taskInfo = if ($task) { Get-ScheduledTaskInfo -TaskName $TaskName } else { $null }
 
 try {
-    $health = Invoke-RestMethod -Method Get -Uri "$baseUrl/api/health" -TimeoutSec 5
-    $page = Invoke-WebRequest -Method Get -Uri "$baseUrl/" -TimeoutSec 5 -UseBasicParsing
+    $health = Invoke-RestMethod `
+        -Method Get `
+        -Uri "$baseUrl/api/health" `
+        -TimeoutSec $TimeoutSeconds
+    $page = Invoke-WebRequest `
+        -Method Get `
+        -Uri "$baseUrl/" `
+        -TimeoutSec $TimeoutSeconds `
+        -UseBasicParsing
 } catch {
-    Write-Host "[ERROR] Live Signal Console is not reachable: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "[ERROR] Live Signal Console is not reachable within $TimeoutSeconds seconds: $($_.Exception.Message)" -ForegroundColor Red
     exit 2
 }
 
@@ -45,6 +54,7 @@ Write-Host "`n=== TRADEMIND v1.12 LIVE SIGNAL CONSOLE ===" -ForegroundColor Cyan
     TaskState = if ($task) { [string]$task.State } else { "MISSING" }
     LastTaskResult = if ($taskInfo) { $taskInfo.LastTaskResult } else { $null }
     LoadedAt = $health.loaded_at
+    TimeoutSeconds = $TimeoutSeconds
 } | Format-List
 
 if ($Open -and $pageOk) {
