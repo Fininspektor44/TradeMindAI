@@ -9,7 +9,6 @@ INSTALLER = ROOT / "scripts" / "install_v1102_unified_watchdog_task.ps1"
 def test_reconnect_grace_requires_all_independent_health_evidence() -> None:
     text = RUNNER.read_text(encoding="utf-8")
 
-    assert 'schema_version = "1.10.2"' not in text  # JSON property is assigned dynamically
     assert '$status.schema_version = "1.10.2"' in text
     assert '$bybitState -eq "RECONNECTING"' in text
     assert "$failedChecks.Count -eq 1" in text
