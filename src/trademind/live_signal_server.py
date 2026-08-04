@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -57,13 +58,48 @@ class SignalQuery:
 
 
 class LiveSignalService:
-    """Build API payloads from a fresh repository snapshot on every request."""
+    """Build API payloads and reuse them until an input file changes."""
 
     def __init__(self, repository: LiveSignalRepository) -> None:
         self.repository = repository
+        self._snapshot_lock = threading.Lock()
+        self._cached_fingerprint: tuple[tuple[str, int, int], ...] | None = None
+        self._cached_snapshot: RepositorySnapshot | None = None
+
+    def _source_paths(self) -> tuple[Path, ...]:
+        paths: list[Path] = []
+        for path in (
+            self.repository.unified_path,
+            self.repository.fx_observations_path,
+            *self.repository.bybit_paths,
+            *self.repository.status_paths.values(),
+        ):
+            if path is not None:
+                paths.append(Path(path))
+        return tuple(dict.fromkeys(paths))
+
+    def _fingerprint(self) -> tuple[tuple[str, int, int], ...]:
+        fingerprint: list[tuple[str, int, int]] = []
+        for path in self._source_paths():
+            try:
+                stat = path.stat()
+                fingerprint.append((str(path), stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                fingerprint.append((str(path), -1, -1))
+        return tuple(fingerprint)
 
     def snapshot(self) -> RepositorySnapshot:
-        return collapse_signal_ideas(self.repository.load())
+        fingerprint = self._fingerprint()
+        with self._snapshot_lock:
+            if (
+                self._cached_snapshot is not None
+                and self._cached_fingerprint == fingerprint
+            ):
+                return self._cached_snapshot
+            snapshot = collapse_signal_ideas(self.repository.load())
+            self._cached_fingerprint = fingerprint
+            self._cached_snapshot = snapshot
+            return snapshot
 
     def health(self, snapshot: RepositorySnapshot | None = None) -> dict[str, object]:
         current = snapshot or self.snapshot()
