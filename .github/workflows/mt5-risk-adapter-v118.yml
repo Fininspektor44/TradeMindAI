@@ -1,0 +1,77 @@
+name: Test TradeMind v1.18 MT5 risk adapter
+
+on:
+  push:
+    branches:
+      - feature/v1.18-mt5-readonly-adapter
+    paths:
+      - "src/trademind/mt5_risk_adapter.py"
+      - "mt5/TradeMind_MT5_Risk_Snapshot_Exporter.mq5"
+      - "tests/test_mt5_risk_adapter.py"
+      - "scripts/install_v118_mt5_risk_exporter.ps1"
+      - "scripts/run_v118_mt5_risk_adapter.ps1"
+      - "config/mt5/correlation_groups_v1.json"
+      - "pyproject.toml"
+      - ".github/workflows/mt5-risk-adapter-v118.yml"
+  pull_request:
+    paths:
+      - "src/trademind/mt5_risk_adapter.py"
+      - "mt5/TradeMind_MT5_Risk_Snapshot_Exporter.mq5"
+      - "tests/test_mt5_risk_adapter.py"
+      - "scripts/install_v118_mt5_risk_exporter.ps1"
+      - "scripts/run_v118_mt5_risk_adapter.ps1"
+      - "config/mt5/correlation_groups_v1.json"
+      - "pyproject.toml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check src/trademind/mt5_risk_adapter.py tests/test_mt5_risk_adapter.py
+      - name: Tests
+        run: pytest -q tests/test_mt5_risk_adapter.py tests/test_risk_manager.py tests/test_signal_intelligence.py
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $files = @(
+            "scripts/install_v118_mt5_risk_exporter.ps1",
+            "scripts/run_v118_mt5_risk_adapter.ps1"
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file),
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$file: $($_.Message)" }
+              exit 1
+            }
+          }
+      - name: Verify MQL read-only boundary
+        shell: pwsh
+        run: |
+          $source = Get-Content "mt5/TradeMind_MT5_Risk_Snapshot_Exporter.mq5" -Raw
+          $forbidden = @(
+            "OrderSend(",
+            "OrderSendAsync(",
+            "PositionModify(",
+            "PositionClose(",
+            "CTrade ",
+            ".Buy(",
+            ".Sell("
+          )
+          foreach ($token in $forbidden) {
+            if ($source.Contains($token)) {
+              throw "Forbidden trading token found: $token"
+            }
+          }
