@@ -47,6 +47,7 @@ Write-Host "`n=== TRADEMIND v1.15 GRID BASKET ANALYTICS ===" -ForegroundColor Cy
     ProfitFactor = [math]::Round([double]$status.profit_factor, 3)
     WorstDDMoney = [math]::Round([double]$status.worst_drawdown_money, 2)
     WorstDDPercent = [math]::Round([double]$status.worst_drawdown_pct, 2)
+    DrawdownCoverage = if ($null -ne $status.drawdown_coverage) { [math]::Round(100 * [double]$status.drawdown_coverage, 1) } else { 0 }
     MaxLegs = $status.max_legs
     MaxConcurrent = $status.max_concurrent_baskets
     OrdersEnabled = [bool]$status.orders_enabled
