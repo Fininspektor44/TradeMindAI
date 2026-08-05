@@ -56,7 +56,7 @@ trademind-signal-evidence = "trademind.signal_evidence:main"
 trademind-signal-gate = "trademind.signal_intelligence:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"]
+package-dir = {"" = "src"}
 packages = ["trademind", "trademind.market", "trademind.signals", "trademind.structure"]
 
 [tool.pytest.ini_options]
