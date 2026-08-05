@@ -51,6 +51,7 @@ trademind-bybit-position-management = "trademind.bybit_position_management:main"
 trademind-grid-reconstruct = "trademind.grid_deal_reconstruction:main"
 trademind-grid-analytics = "trademind.grid_basket_audit:main"
 trademind-live-signals = "trademind.live_signal_server:main"
+trademind-signal-evidence = "trademind.signal_evidence:main"
 trademind-signal-gate = "trademind.signal_intelligence:main"
 
 [tool.setuptools]
