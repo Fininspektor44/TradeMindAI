@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.15.0"
+version = "1.16.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -51,6 +51,11 @@ trademind-bybit-position-management = "trademind.bybit_position_management:main"
 trademind-grid-reconstruct = "trademind.grid_deal_reconstruction:main"
 trademind-grid-analytics = "trademind.grid_basket_audit:main"
 trademind-live-signals = "trademind.live_signal_server:main"
+trademind-fx-signal-adapter = "trademind.fx_signal_adapter:main"
+trademind-signal-shadow = "trademind.signal_shadow:main"
+trademind-signal-evidence = "trademind.signal_evidence:main"
+trademind-signal-report = "trademind.signal_research_report:main"
+trademind-signal-gate = "trademind.signal_intelligence:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
