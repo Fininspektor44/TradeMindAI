@@ -68,9 +68,10 @@ if ($Journal) {
     $arguments += @("--journal", $Journal)
 }
 if ($RequestedRiskPct -gt 0) {
-    $arguments += @("--requested-risk-pct", $RequestedRiskPct.ToString(
+    $riskText = $RequestedRiskPct.ToString(
         [System.Globalization.CultureInfo]::InvariantCulture
-    ))
+    )
+    $arguments += @("--requested-risk-pct", $riskText)
 }
 
 & $python @arguments
