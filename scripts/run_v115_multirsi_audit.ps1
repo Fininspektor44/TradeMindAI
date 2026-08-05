@@ -13,7 +13,11 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
-$source = Join-Path $env:APPDATA "MetaQuotes\Terminal\Common\Files\TradeMindAI\grid_deals_$AccountLogin.csv"
+$common = Join-Path $env:APPDATA "MetaQuotes\Terminal\Common\Files\TradeMindAI"
+$source = Join-Path $common "grid_deals_$AccountLogin.csv"
+$positions = Join-Path $common "grid_positions_$AccountLogin.csv"
+$account = Join-Path $common "grid_account_$AccountLogin.csv"
+
 if (!(Test-Path $source)) {
     throw "Source file not found: $source"
 }
@@ -44,19 +48,55 @@ function Invoke-Audit {
     )
 
     $deals = Join-Path $dealsDir "$Name.csv"
-    $legs = Join-Path $legsDir "$Name.csv"
+    $rawLegs = Join-Path $legsDir "$Name.raw.csv"
+    $measuredLegs = Join-Path $legsDir "$Name.csv"
     $report = Join-Path $reportsDir $Name
-    New-Item -ItemType Directory -Force -Path $report | Out-Null
+    $snapshotReport = Join-Path $report "snapshots"
+    New-Item -ItemType Directory -Force -Path $report, $snapshotReport | Out-Null
 
     $Data | Export-Csv $deals -NoTypeInformation -Encoding UTF8
 
-    & ".\.venv\Scripts\python.exe" -m trademind.grid_deal_reconstruction --deals $deals --output $legs
-    if ($LASTEXITCODE -ne 0) { throw "Reconstruction failed for $Name" }
+    & ".\.venv\Scripts\python.exe" -m trademind.grid_deal_reconstruction `
+        --deals $deals `
+        --output $rawLegs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Reconstruction failed for $Name"
+    }
 
-    $args = @("-m", "trademind.grid_basket_audit", "--legs", $legs, "--output-dir", $report)
-    if ($Open) { $args += "--open-dashboard" }
-    & ".\.venv\Scripts\python.exe" @args
-    if ($LASTEXITCODE -ne 0) { throw "Audit failed for $Name" }
+    if (Test-Path $positions) {
+        $snapshotArgs = @(
+            "-m", "trademind.grid_snapshot_drawdown",
+            "--legs", $rawLegs,
+            "--positions", $positions,
+            "--output", $measuredLegs,
+            "--summary-dir", $snapshotReport
+        )
+        if (Test-Path $account) {
+            $snapshotArgs += @("--account-snapshots", $account)
+        }
+        & ".\.venv\Scripts\python.exe" @snapshotArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "Snapshot drawdown enrichment failed for $Name"
+        }
+    }
+    else {
+        Copy-Item $rawLegs $measuredLegs -Force
+        Write-Host "[WARN] Position snapshots not found; drawdown remains unmeasured: $positions" `
+            -ForegroundColor Yellow
+    }
+
+    $auditArgs = @(
+        "-m", "trademind.grid_basket_audit",
+        "--legs", $measuredLegs,
+        "--output-dir", $report
+    )
+    if ($Open) {
+        $auditArgs += "--open-dashboard"
+    }
+    & ".\.venv\Scripts\python.exe" @auditArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Audit failed for $Name"
+    }
 }
 
 $ordered = @($selected | Sort-Object {[long]$_.time_msc})
@@ -70,6 +110,8 @@ Write-Host "Deals: $($selected.Count)"
 Write-Host "First deal: $($first.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Host "Last deal:  $($last.ToString('yyyy-MM-dd HH:mm:ss'))"
 Write-Host "Unexpected rows excluded: $($unexpected.Count)"
+Write-Host "Position snapshots: $(if (Test-Path $positions) { $positions } else { 'MISSING' })"
+Write-Host "Account snapshots:  $(if (Test-Path $account) { $account } else { 'MISSING' })"
 
 Invoke-Audit -Name "combined_magic_$($Magic -join '_')" -Data $selected -Open:$OpenDashboard
 
@@ -82,3 +124,7 @@ foreach ($m in $Magic) {
 
 Write-Host "`nReports:" -ForegroundColor Green
 Write-Host $reportsDir
+Write-Host "The basket dashboard now uses measured online floating drawdown where snapshots exist." `
+    -ForegroundColor Green
+Write-Host "Historical floating drawdown before the collector started remains unavailable." `
+    -ForegroundColor Yellow
