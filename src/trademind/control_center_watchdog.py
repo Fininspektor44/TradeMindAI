@@ -56,6 +56,13 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _from_millis(value: Any) -> datetime | None:
+    milliseconds = _int(value)
+    if milliseconds <= 0:
+        return None
+    return datetime.fromtimestamp(milliseconds / 1000.0, tz=timezone.utc)
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
@@ -120,6 +127,30 @@ def _snapshot_lookup(rows: Sequence[dict[str, str]]) -> dict[str, dict[str, str]
     }
 
 
+def _latest_position_snapshot(
+    snapshot_status: dict[str, Any],
+) -> tuple[datetime | None, set[tuple[str, str, str]]]:
+    source = _text(snapshot_status.get("position_snapshots_path"))
+    if not source:
+        return None, set()
+    rows = _read_csv(Path(source).expanduser())
+    if not rows:
+        return None, set()
+    latest_msc = max((_int(row.get("time_msc")) for row in rows), default=0)
+    if latest_msc <= 0:
+        return None, set()
+    latest_rows = [row for row in rows if _int(row.get("time_msc")) == latest_msc]
+    keys = {
+        (
+            _text(row.get("magic")),
+            _text(row.get("symbol")),
+            _text(row.get("side")).upper(),
+        )
+        for row in latest_rows
+    }
+    return _from_millis(latest_msc), keys
+
+
 def evaluate_watchdog(
     control_status: dict[str, Any],
     previous_state: dict[str, Any],
@@ -129,6 +160,7 @@ def evaluate_watchdog(
     leg_warning: int = 6,
     age_warning_hours: int = 72,
     age_critical_hours: int = 168,
+    position_lag_minutes: int = 3,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     active: list[dict[str, str]] = []
     events: list[dict[str, str]] = list(previous_state.get("recent_events", []))[-50:]
@@ -203,10 +235,41 @@ def evaluate_watchdog(
                 )
             )
 
+        live_position_at, live_keys = _latest_position_snapshot(snapshot_status)
+        live_snapshot_current = True
+        if open_count > 0:
+            if live_position_at is None:
+                live_snapshot_current = False
+                active.append(
+                    _alert(
+                        now,
+                        "critical",
+                        robot,
+                        account,
+                        "LIVE_POSITION_SNAPSHOT_MISSING",
+                        "Открытые корзины есть, но живой файл позиций пуст или отсутствует.",
+                    )
+                )
+            elif latest_at is not None:
+                lag = max(0.0, (latest_at - live_position_at).total_seconds() / 60.0)
+                if lag > position_lag_minutes:
+                    live_snapshot_current = False
+                    active.append(
+                        _alert(
+                            now,
+                            "critical",
+                            robot,
+                            account,
+                            "LIVE_POSITION_SNAPSHOT_STALE",
+                            f"Живые позиции отстают от счёта на {lag:.0f} мин. Порог: {position_lag_minutes} мин.",
+                        )
+                    )
+
         for row in open_rows:
             basket_id = _text(row.get("basket_id"))
             symbol = _text(row.get("symbol")) or "?"
             side = _text(row.get("side")).upper() or "?"
+            magic = _text(row.get("magic"))
             snapshot = by_basket.get(basket_id)
             if snapshot is None:
                 active.append(
@@ -216,10 +279,22 @@ def evaluate_watchdog(
                         robot,
                         account,
                         "OPEN_BASKET_SNAPSHOT_MISSING",
-                        f"{symbol} {side}: открытая корзина потеряла снимок.",
+                        f"{symbol} {side}: открытая корзина потеряла накопленный снимок.",
                     )
                 )
                 snapshot = {}
+
+            if live_snapshot_current and (magic, symbol, side) not in live_keys:
+                active.append(
+                    _alert(
+                        now,
+                        "critical",
+                        robot,
+                        account,
+                        "OPEN_BASKET_NOT_IN_LIVE_POSITIONS",
+                        f"{symbol} {side}: корзина числится открытой, но отсутствует в последнем живом снимке.",
+                    )
+                )
 
             legs = max(_int(row.get("max_legs")), _int(snapshot.get("latest_positions")))
             if legs >= leg_warning:
@@ -294,6 +369,7 @@ def evaluate_watchdog(
         "source_modified": False,
         "thresholds": {
             "stale_minutes": stale_minutes,
+            "position_lag_minutes": position_lag_minutes,
             "leg_warning": leg_warning,
             "age_warning_hours": age_warning_hours,
             "age_critical_hours": age_critical_hours,
@@ -394,6 +470,7 @@ def run_watchdog(
     leg_warning: int = 6,
     age_warning_hours: int = 72,
     age_critical_hours: int = 168,
+    position_lag_minutes: int = 3,
 ) -> dict[str, Any]:
     captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     control_status = _read_json(control_status_path)
@@ -408,6 +485,7 @@ def run_watchdog(
         leg_warning=leg_warning,
         age_warning_hours=age_warning_hours,
         age_critical_hours=age_critical_hours,
+        position_lag_minutes=position_lag_minutes,
     )
     _atomic_json(output_path, watch_status)
     _atomic_json(state_path, next_state)
@@ -432,6 +510,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alerts-csv", type=Path)
     parser.add_argument("--dashboard", type=Path)
     parser.add_argument("--stale-minutes", type=int, default=15)
+    parser.add_argument("--position-lag-minutes", type=int, default=3)
     parser.add_argument("--leg-warning", type=int, default=6)
     parser.add_argument("--age-warning-hours", type=int, default=72)
     parser.add_argument("--age-critical-hours", type=int, default=168)
@@ -446,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
             alerts_csv_path=(args.alerts_csv or root / "alerts.csv").expanduser().resolve(),
             dashboard_path=args.dashboard.expanduser().resolve() if args.dashboard else None,
             stale_minutes=max(1, args.stale_minutes),
+            position_lag_minutes=max(1, args.position_lag_minutes),
             leg_warning=max(1, args.leg_warning),
             age_warning_hours=max(1, args.age_warning_hours),
             age_critical_hours=max(args.age_warning_hours, args.age_critical_hours),
