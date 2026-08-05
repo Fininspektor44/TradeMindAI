@@ -9,10 +9,12 @@ on:
       - "src/trademind/signal_evidence.py"
       - "src/trademind/fx_signal_adapter.py"
       - "src/trademind/signal_shadow.py"
+      - "src/trademind/signal_research_report.py"
       - "tests/test_signal_intelligence.py"
       - "tests/test_signal_evidence.py"
       - "tests/test_fx_signal_adapter.py"
       - "tests/test_signal_shadow.py"
+      - "tests/test_signal_research_report.py"
       - "pyproject.toml"
       - ".github/workflows/signal-intelligence-v116.yml"
   pull_request:
@@ -21,10 +23,12 @@ on:
       - "src/trademind/signal_evidence.py"
       - "src/trademind/fx_signal_adapter.py"
       - "src/trademind/signal_shadow.py"
+      - "src/trademind/signal_research_report.py"
       - "tests/test_signal_intelligence.py"
       - "tests/test_signal_evidence.py"
       - "tests/test_fx_signal_adapter.py"
       - "tests/test_signal_shadow.py"
+      - "tests/test_signal_research_report.py"
       - "pyproject.toml"
 
 jobs:
@@ -44,10 +48,12 @@ jobs:
           src/trademind/signal_evidence.py
           src/trademind/fx_signal_adapter.py
           src/trademind/signal_shadow.py
+          src/trademind/signal_research_report.py
           tests/test_signal_intelligence.py
           tests/test_signal_evidence.py
           tests/test_fx_signal_adapter.py
           tests/test_signal_shadow.py
+          tests/test_signal_research_report.py
       - name: Tests
         run: >-
           pytest -q
@@ -55,3 +61,4 @@ jobs:
           tests/test_signal_evidence.py
           tests/test_fx_signal_adapter.py
           tests/test_signal_shadow.py
+          tests/test_signal_research_report.py
