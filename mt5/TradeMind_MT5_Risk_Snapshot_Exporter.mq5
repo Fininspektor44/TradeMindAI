@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.180"
+#property version   "1.181"
 #property description "Read-only account, position and symbol snapshots for TradeMind Risk Manager"
 
 input int      InpRefreshSeconds = 30;
@@ -42,19 +42,24 @@ string LoginText()
    return IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
 }
 
+long UtcNowMsc()
+{
+   return (long)TimeGMT()*1000;
+}
+
 string AccountFilename()
 {
-   return InpOutputFolder+"\\mt5_risk_account_"+LoginText()+".csv";
+   return InpOutputFolder+"\\mt5_risk_account_utc_"+LoginText()+".csv";
 }
 
 string PositionsFilename()
 {
-   return InpOutputFolder+"\\mt5_risk_positions_"+LoginText()+".csv";
+   return InpOutputFolder+"\\mt5_risk_positions_utc_"+LoginText()+".csv";
 }
 
 string SymbolsFilename()
 {
-   return InpOutputFolder+"\\mt5_risk_symbols_"+LoginText()+".csv";
+   return InpOutputFolder+"\\mt5_risk_symbols_utc_"+LoginText()+".csv";
 }
 
 bool AppendAccountSnapshot()
@@ -85,7 +90,7 @@ bool AppendAccountSnapshot()
 
    FileWrite(
       handle,
-      (long)TimeCurrent()*1000,
+      UtcNowMsc(),
       AccountInfoInteger(ACCOUNT_LOGIN),
       AccountInfoString(ACCOUNT_SERVER),
       AccountInfoString(ACCOUNT_CURRENCY),
@@ -125,7 +130,7 @@ bool ExportPositionSnapshot()
       "symbol","magic","side","volume","open_price","current_price","sl","tp","profit","swap","comment"
    );
 
-   long captured_msc=(long)TimeCurrent()*1000;
+   long captured_msc=UtcNowMsc();
    int written=0;
    int total=PositionsTotal();
    for(int index=0;index<total;index++)
@@ -193,7 +198,7 @@ bool ExportSymbolSnapshot()
       "contract_size","margin_initial","margin_maintenance","margin_buy_per_volume","margin_sell_per_volume","leverage"
    );
 
-   long captured_msc=(long)TimeCurrent()*1000;
+   long captured_msc=UtcNowMsc();
    int total=SymbolsTotal(true);
    int written=0;
    for(int index=0;index<total;index++)
@@ -269,7 +274,7 @@ int OnInit()
    }
    EventSetTimer(InpRefreshSeconds);
    Collect();
-   Print("TradeMind MT5 Risk Snapshot Exporter v1.180 started. Read-only. No orders.");
+   Print("TradeMind MT5 Risk Snapshot Exporter v1.181 started. UTC timestamps. Read-only. No orders.");
    return INIT_SUCCEEDED;
 }
 
