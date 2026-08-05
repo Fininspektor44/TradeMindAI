@@ -131,23 +131,24 @@ def _codes(decision) -> set[str]:
     return {item.code for item in decision.reasons}
 
 
-def test_single_fx_entry_sizes_from_equity_and_stop_distance() -> None:
+def test_single_fx_entry_never_exceeds_budget_after_strict_floor() -> None:
     decision = _decision()
 
     assert decision.state == "ALLOW"
     assert decision.allowed is True
     assert decision.risk_budget_money == pytest.approx(50.0)
-    assert decision.actual_risk_money == pytest.approx(50.0)
-    assert decision.actual_risk_pct == pytest.approx(0.5)
+    assert decision.actual_risk_money == pytest.approx(45.0)
+    assert decision.actual_risk_money <= decision.risk_budget_money
+    assert decision.actual_risk_pct == pytest.approx(0.45)
     assert len(decision.orders) == 1
-    assert decision.orders[0].volume == pytest.approx(0.10)
-    assert decision.margin_required == pytest.approx(110.0)
-    assert decision.free_margin_after == pytest.approx(9890.0)
+    assert decision.orders[0].volume == pytest.approx(0.09)
+    assert decision.margin_required == pytest.approx(99.0)
+    assert decision.free_margin_after == pytest.approx(9901.0)
     assert decision.as_dict()["safety"]["orders_enabled"] is False
     assert decision.as_dict()["safety"]["broker_api_called"] is False
 
 
-def test_staged_ote_entries_allocate_one_total_risk_budget() -> None:
+def test_staged_ote_entries_share_one_conservative_risk_budget() -> None:
     candidate = _candidate(
         entries=(
             EntryOrder(1.1000, 0.50, "confirmation", "MARKET"),
@@ -159,12 +160,13 @@ def test_staged_ote_entries_allocate_one_total_risk_budget() -> None:
 
     assert decision.state == "ALLOW"
     assert [order.volume for order in decision.orders] == pytest.approx(
-        [0.05, 0.05, 0.10]
+        [0.04, 0.04, 0.09]
     )
     assert [order.risk_money for order in decision.orders] == pytest.approx(
-        [25.0, 15.0, 10.0]
+        [20.0, 12.0, 9.0]
     )
-    assert decision.actual_risk_money == pytest.approx(50.0)
+    assert decision.actual_risk_money == pytest.approx(41.0)
+    assert decision.actual_risk_money <= decision.risk_budget_money
 
 
 def test_minimum_broker_volume_blocks_oversized_risk() -> None:
@@ -217,7 +219,7 @@ def test_portfolio_risk_cap_blocks_new_trade() -> None:
     decision = _decision(portfolio=portfolio)
 
     assert decision.state == "BLOCK"
-    assert decision.portfolio_risk_after_pct == pytest.approx(3.3)
+    assert decision.portfolio_risk_after_pct == pytest.approx(3.25)
     assert "PORTFOLIO_RISK_LIMIT" in _codes(decision)
 
 
@@ -269,7 +271,7 @@ def test_daily_loss_and_account_drawdown_locks() -> None:
 
 
 def test_margin_and_free_margin_can_block_an_otherwise_valid_signal() -> None:
-    account = _account(free_margin=100.0)
+    account = _account(free_margin=90.0)
     decision = _decision(account=account)
 
     assert decision.state == "BLOCK"
@@ -359,7 +361,8 @@ def test_min_balance_equity_is_default_risk_basis() -> None:
 
     assert decision.risk_basis_money == pytest.approx(8_000.0)
     assert decision.risk_budget_money == pytest.approx(40.0)
-    assert decision.orders[0].volume == pytest.approx(0.08)
+    assert decision.orders[0].volume == pytest.approx(0.07)
+    assert decision.actual_risk_money == pytest.approx(35.0)
 
 
 def test_stale_account_and_signal_are_blocked() -> None:
