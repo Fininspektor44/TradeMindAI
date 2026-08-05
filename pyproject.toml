@@ -54,6 +54,7 @@ trademind-live-signals = "trademind.live_signal_server:main"
 trademind-fx-signal-adapter = "trademind.fx_signal_adapter:main"
 trademind-signal-shadow = "trademind.signal_shadow:main"
 trademind-signal-evidence = "trademind.signal_evidence:main"
+trademind-signal-report = "trademind.signal_research_report:main"
 trademind-signal-gate = "trademind.signal_intelligence:main"
 
 [tool.setuptools]
