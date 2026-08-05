@@ -7,16 +7,20 @@ on:
     paths:
       - "src/trademind/signal_intelligence.py"
       - "src/trademind/signal_evidence.py"
+      - "src/trademind/fx_signal_adapter.py"
       - "tests/test_signal_intelligence.py"
       - "tests/test_signal_evidence.py"
+      - "tests/test_fx_signal_adapter.py"
       - "pyproject.toml"
       - ".github/workflows/signal-intelligence-v116.yml"
   pull_request:
     paths:
       - "src/trademind/signal_intelligence.py"
       - "src/trademind/signal_evidence.py"
+      - "src/trademind/fx_signal_adapter.py"
       - "tests/test_signal_intelligence.py"
       - "tests/test_signal_evidence.py"
+      - "tests/test_fx_signal_adapter.py"
       - "pyproject.toml"
 
 jobs:
@@ -34,10 +38,13 @@ jobs:
           ruff check
           src/trademind/signal_intelligence.py
           src/trademind/signal_evidence.py
+          src/trademind/fx_signal_adapter.py
           tests/test_signal_intelligence.py
           tests/test_signal_evidence.py
+          tests/test_fx_signal_adapter.py
       - name: Tests
         run: >-
           pytest -q
           tests/test_signal_intelligence.py
           tests/test_signal_evidence.py
+          tests/test_fx_signal_adapter.py
