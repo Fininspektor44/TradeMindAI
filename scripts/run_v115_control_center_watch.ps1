@@ -25,6 +25,10 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
+if ($MultiMagic.Count -eq 1 -and $MultiMagic[0].Contains(",")) {
+    $MultiMagic = @($MultiMagic[0].Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
 $logDir = Join-Path $repo "data\control_center_v1_15\logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $logFile = Join-Path $logDir "control_center_watch.log"
