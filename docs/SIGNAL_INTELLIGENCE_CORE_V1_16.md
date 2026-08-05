@@ -1,115 +1,139 @@
 # TradeMind v1.16: Signal Intelligence Core
 
-## Product goal
+## Цель продукта
 
-TradeMind is not a grid-signal copier and not a high-volume RSI alert bot.
-The product scans market data continuously, rejects weak opportunities, and
-surfaces only a small number of evidence-backed trade plans.
+TradeMind не копирует сигналы сеточных советников и не штампует уведомления по
+одному индикатору. Платформа непрерывно просеивает рынок, формирует объяснимые
+торговые сценарии и оставляет пользователю только те кандидаты, которые прошли
+проверку рыночными данными и историческими исходами.
 
-The user-facing result is a complete scenario:
+Пользовательский результат должен содержать:
 
-- direction
-- staged entries
-- stop and invalidation
-- targets
-- the market reasons behind every level
-- historical sample size
-- raw and conservative reliability
-- expected value after estimated costs
+- направление сделки;
+- вход по подтверждению и возможную лесенку добора;
+- стоп и точное условие отмены сценария;
+- одну или несколько целей;
+- объяснение происхождения каждого уровня;
+- размер сопоставимой исторической выборки;
+- обычную и консервативную надёжность;
+- математическое ожидание после расходов.
 
-All complexity stays inside the platform. The customer receives a filtered,
-explainable action plan rather than a pile of charts.
+## Зачем собирается статистика
 
-## Why the statistics exist
+Статистика является фильтром публикации. В базу попадают все кандидаты и все
+исходы: прибыль, убыток, ноль, тайм-аут и отбраковка. Её задача не украсить
+карточку сигнала, а ответить до публикации:
 
-Statistics are a publication filter, not decoration. Every candidate is stored,
-including rejected, losing, flat, and timed-out candidates. The database exists
-to answer one question before publication:
+> Давали ли действительно похожие рыночные ситуации устойчивый положительный
+> результат после спреда, комиссии и проскальзывания?
 
-> Did sufficiently similar setups produce a durable positive result after costs?
+Нельзя удалять убытки, менять вход после движения или незаметно менять правила
+сопоставимости ради красивого процента.
 
-The system must never improve a public win rate by deleting losses, changing a
-signal after movement starts, or silently changing what counts as a similar
-setup.
+## Реализованный контур
 
-## Three separate layers
+### 1. Рыночный паспорт кандидата
 
-### 1. Market observation
+`signal_intelligence.py` хранит неизменяемый паспорт:
 
-The observation layer gathers every useful feature available at the decision
-time. The current schema supports:
+- время обнаружения и фиксации;
+- символ, таймфрейм, направление и семейство сетапа;
+- рыночный вход и до четырёх дополнительных ступеней;
+- стоп, цели и условие инвалидации;
+- полный снимок признаков;
+- оценки факторов и текстовые причины;
+- источники данных;
+- стабильный хешированный ID.
 
-- market structure and protected highs/lows
-- BOS and CHoCH events
-- buy-side and sell-side liquidity sweeps
-- FVG direction and size
-- Fibonacci retracement and OTE location
-- volume, relative volume, tick activity, imbalance, and absorption
-- momentum and displacement
-- ATR, spread, volatility regime, and execution cost
-- session and time context
-- correlation and portfolio load
-- macro, sentiment, and future custom features
+Поддерживаются группы признаков:
 
-Robot and grid monitoring may be recorded as separate context, but it has zero
-weight in the default signal score and cannot be the primary trigger.
+- структура, защищённые максимумы и минимумы, BOS/CHoCH;
+- снятие buy-side и sell-side liquidity;
+- FVG;
+- Fibonacci и OTE;
+- объём, RVOL, тиковая активность, дисбаланс и absorption;
+- импульс и momentum;
+- ATR, режим волатильности, spread и стоимость исполнения;
+- сессия;
+- корреляционная и портфельная нагрузка;
+- macro, sentiment и пользовательские признаки.
 
-### 2. Research and evidence
+Данные роботов разрешены только в отдельном контексте. Их вес в сигнале равен
+нулю, и они не могут быть первичным триггером.
 
-Every market candidate receives a stable setup family and is evaluated after the
-fact. The evidence record stores:
+### 2. Адаптер текущего FX Research
 
-- wins, losses, flats, and total completed observations
-- gross winning and losing R
-- average win and average loss in R
-- profit factor
-- maximum drawdown in R
-- recent and baseline win rate
-- raw win rate
-- Bayesian-smoothed win rate
-- the lower 95% Wilson confidence bound
+`fx_signal_adapter.py` уже преобразует существующие наблюдения
+`data/fx_research_v1_4_2/observations.csv` в кандидатов v1.16.
 
-The raw number is not presented as certainty. For example, 35 wins from 43
-observations may show about 81% raw reliability, while the conservative 95%
-lower bound is only about 67%.
+Он использует собранные ранее SMC, liquidity, FVG, объёмы, delta proxy, EMA,
+импульс, ATR, spread и сессию. План строится до будущего движения:
 
-### 3. Publication gate
+- первый вход по подтверждению;
+- доборы в областях OTE 70.5% и 79%, когда они находятся в выгодной стороне;
+- стоп за защищённой структурой с ATR-буфером;
+- первая цель по структуре или не хуже 1.5R;
+- следующая цель по внешней ликвидности или 2R.
 
-The publication gate never creates the setup. It decides whether an already
-created market setup has enough support to leave shadow mode.
+Все такие кандидаты пока имеют только статус shadow.
 
-Default v1.16 requirements:
+### 3. Версионированное понятие похожего сетапа
 
-- market-data-generated candidate
-- quality score at least 75/100
-- at least 30 completed similar observations
-- lower 95% Wilson bound at least 60%
-- R-based profit factor at least 1.20
-- expected value at least +0.05R after costs
-- first target RR at least 1.20
-- at least four contributing market-factor groups
-- evidence not older than 24 hours
-- no severe recent edge degradation
+`signal_evidence.py` создаёт ключ `SIM_V1`. В него входят:
 
-Failing sample, quality, or confidence keeps the candidate in `SHADOW_ONLY`.
-Negative expected value, invalid source, stale evidence, weak RR, or severe edge
-decay produces `REJECTED`. Only candidates passing every check become
-`PUBLISHABLE`.
+- symbol, timeframe, BUY/SELL и семейство сетапа;
+- swing/internal bias;
+- тип снятой ликвидности;
+- зона Fibonacci/OTE;
+- направление FVG;
+- режимы объёма, импульса, волатильности и стоимости исполнения;
+- торговая сессия.
 
-`PUBLISHABLE` still does not send anything. A later Telegram adapter must read
-the decision and enforce its own delivery controls.
+Версия обязательна: изменение правил группировки создаст `SIM_V2`, а не
+перепишет старую статистику задним числом.
 
-## Quality score
+### 4. Консервативный теневой исход
 
-The quality score is a weighted description of the current market situation,
-not a probability. Default weights are:
+`signal_shadow.py` проверяет зафиксированный план на будущих OHLC-свечах без
+ордеров. Он учитывает касание ступеней входа, MFE, MAE, результат в R и тайм-аут.
 
-| Group | Weight |
+Если на одной свече одновременно затронуты стоп и тейк, действует правило
+`STOP_FIRST_CONSERVATIVE`. Это специально убирает оптимистичную фантазию о
+порядке движения внутри свечи.
+
+Исходы дописываются в append-only журнал. Изменить уже зафиксированный исход для
+того же signal ID нельзя.
+
+### 5. Накопление доказательств
+
+Для каждой группы считаются:
+
+- wins, losses, flats и общее N;
+- Net R;
+- средний выигрыш и средний убыток в R;
+- Profit Factor;
+- максимальная просадка в R;
+- recent и baseline win rate;
+- обычная частота побед;
+- сглаженная частота `(wins + 1) / (N + 2)`;
+- нижняя граница 95% интервала Уилсона.
+
+Например, 35 побед из 43 дают около 81% обычной частоты, но только около 67%
+консервативной нижней границы.
+
+### 6. Publication gate
+
+Качество текущей ситуации и статистическая надёжность разделены. Балл 82/100
+не означает вероятность 82%.
+
+Начальные веса качества:
+
+| Фактор | Вес |
 |---|---:|
 | Structure | 18% |
 | Liquidity | 14% |
-| Fibonacci / OTE | 10% |
 | Volume | 12% |
+| Fibonacci / OTE | 10% |
 | Momentum | 10% |
 | Volatility | 10% |
 | Confirmation | 10% |
@@ -117,100 +141,92 @@ not a probability. Default weights are:
 | Execution | 6% |
 | Portfolio load | 4% |
 
-The weights are policy configuration, not eternal truth. Research can replace
-them when out-of-sample evidence proves that another weighting is stronger.
-Unknown future feature groups can be added through versioned policy changes.
+Стандартный допуск v1.16 требует одновременно:
 
-## Reliability and expected value
+- кандидат сформирован рынком, а не роботом;
+- quality не ниже 75;
+- минимум 30 завершённых похожих случаев;
+- Wilson lower 95% не ниже 60%;
+- Profit Factor в R не ниже 1.20;
+- ожидаемый результат после расходов не ниже +0.05R;
+- RR первой цели не ниже 1.20;
+- минимум четыре независимые рыночные группы признаков;
+- свежая статистика;
+- отсутствие сильного ухудшения edge.
 
-Raw reliability:
-
-```text
-wins / completed observations
-```
-
-Smoothed reliability:
-
-```text
-(wins + 1) / (completed + 2)
-```
-
-The publication gate uses the lower 95% Wilson bound, not the raw percentage.
-Expected value is calculated in R:
+Формула ожидания:
 
 ```text
 EV = p_low × average_win_R - (1 - p_low) × abs(average_loss_R) - costs_R
 ```
 
-A high win rate with tiny winners and large losses is rejected when expected
-value is negative.
+Результаты gate:
 
-## Immutable signal identity
+- `PUBLISHABLE` — все условия выполнены;
+- `SHADOW_ONLY` — идея может изучаться, но доказательств недостаточно;
+- `REJECTED` — плохое ожидание, слабый RR, устаревшие данные или деградация.
 
-The signal ID is generated from a canonical hash of everything known before the
-move:
+Даже `PUBLISHABLE` сейчас ничего не отправляет пользователю. Telegram-адаптер
+намеренно отсутствует.
 
-- observation and creation times
-- symbol, timeframe, direction, and setup family
-- all entries, stop, targets, and rationales
-- market features
-- factor scores and reasons
-- provenance
+## Неизменяемость и аудит
 
-Historical evidence is attached separately, so later database growth does not
-change the original candidate ID.
+ID вычисляется из всего, что было известно до движения: времени, уровней,
+признаков, оценок, причин и источников. Позднее накопление статистики ID не
+меняет.
 
-Example:
+События candidate, gate decision, publication, update и outcome образуют
+хешированную цепочку. Редактирование старой строки ломает проверку. Повторная
+попытка записать изменённый candidate под тем же ID отклоняется.
 
-```text
-TM-20260805T133000Z-EURUSD-BUY-0f27c7f2b388e6a1
-```
+## Исследовательский дашборд
 
-## Tamper-evident journal
+`signal_research_report.py` создаёт:
 
-Candidate, gate decision, publication, update, and outcome are separate append-
-only events. Every event contains the previous event hash. Editing an old event
-breaks the chain. A second candidate payload with the same signal ID but changed
-content is rejected as an immutable-candidate mutation.
+- `setup_evidence.csv`;
+- `status.json`;
+- `dashboard/index.html`.
 
-Losses are never deleted. A publication adapter may add an explanatory update,
-but it cannot rewrite the original entry, stop, target, or timestamp.
+Панель показывает N, win rate, Wilson lower, Net R, PF, Max DD, средний quality,
+EV и статус каждой группы. `ELIGIBLE_FOR_CANDIDATE_GATE` означает только, что
+историческая группа достаточно сильна для проверки свежего кандидата. Это ещё
+не публичный сигнал.
 
-## Current CLI
+## Запуск на Windows
 
-The v1.16 core accepts one candidate JSON and one evidence JSON:
+Один конвейер:
 
 ```powershell
-.\.venv\Scripts\python.exe -m trademind.signal_intelligence `
-  --candidate .\data\signal_intelligence\candidate.json `
-  --evidence .\data\signal_intelligence\evidence.json `
-  --output .\data\signal_intelligence\passport.json `
-  --journal .\data\signal_intelligence\events.jsonl `
-  --cost-r 0.04
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File ".\scripts\run_v116_signal_research.ps1" `
+  -RunTests -OpenDashboard
 ```
 
-Output states:
+Он выполняет:
 
-- `PUBLISHABLE`
-- `SHADOW_ONLY`
-- `REJECTED`
+1. FX observations → неизменяемые shadow candidates;
+2. candidates + будущие M5 bars → outcomes;
+3. outcomes → статистика похожих сетапов;
+4. статистика → исследовательский dashboard.
 
-## Safety contract
+## Контракт безопасности
 
-The v1.16 core:
+Контур v1.16:
 
-- imports no broker API
-- places no orders
-- changes no robot settings
-- sends no Telegram messages
-- does not use grid signals as market triggers
-- does not delete or rewrite outcomes
-- evaluates candidates only from information available before publication
+- не импортирует broker API;
+- не отправляет ордера;
+- не меняет настройки советников;
+- не публикует сообщения в Telegram;
+- не использует сеточники как источник сигнала;
+- не удаляет убытки;
+- не переписывает вход, стоп, цель или время после движения.
 
-## Next implementation blocks
+## Следующие блоки
 
-1. Convert current FX research observations into v1.16 candidate passports.
-2. Build a versioned similarity key and evidence aggregator.
-3. Run every candidate in shadow mode and record stop/target outcomes.
-4. Add walk-forward and regime-separated validation.
-5. Add a publication adapter only after the gate has a sufficient live sample.
+1. Запустить конвейер на фактической базе SER8 и проверить качество геометрии
+   входов/стопов на реальных строках.
+2. Убрать первые эвристические веса и провести walk-forward отбор факторов.
+3. Добавить отдельные режимы рынка и проверку устойчивости между ними.
+4. Расширить входные источники macro, sentiment и корреляционной нагрузкой.
+5. Перевести подтверждённые группы в непрерывный forward shadow-monitor.
+6. Разрабатывать Telegram-публикацию только после достаточной живой выборки.
