@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -139,8 +140,6 @@ def test_outcome_file_is_append_only(tmp_path: Path) -> None:
     assert append_outcomes(path, [outcome]) == 1
     assert append_outcomes(path, [outcome]) == 0
 
-    changed = type(outcome)(
-        **{**outcome.as_dict(), "net_r": outcome.net_r + 1.0}
-    )
-    with pytest.raises((TypeError, ValueError)):
+    changed = replace(outcome, net_r=outcome.net_r + 1.0)
+    with pytest.raises(ValueError, match="immutable outcome mutation"):
         append_outcomes(path, [changed])
