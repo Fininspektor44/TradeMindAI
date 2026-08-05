@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.20.0"
+version = "1.21.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -60,6 +60,7 @@ trademind-risk-manager = "trademind.risk_manager:main"
 trademind-mt5-risk-adapter = "trademind.mt5_risk_adapter:main"
 trademind-signal-to-risk = "trademind.signal_to_risk_bridge:main"
 trademind-passport-factory = "trademind.signal_passport_factory:main"
+trademind-live-runtime = "trademind.live_signal_runtime:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
