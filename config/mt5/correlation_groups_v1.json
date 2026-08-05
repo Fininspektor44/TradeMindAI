@@ -1,0 +1,5 @@
+{
+  "schema_version": "1.0",
+  "description": "Optional directional exposure groups. Unlisted symbols fall back to exact-symbol isolation.",
+  "symbols": {}
+}
