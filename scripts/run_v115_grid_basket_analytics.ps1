@@ -23,7 +23,7 @@ $output = Join-Path $ProjectRoot "data\grid_basket_analytics_v1_15"
 Push-Location $ProjectRoot
 try {
     $arguments = @(
-        "-m", "trademind.grid_basket_analytics",
+        "-m", "trademind.grid_basket_audit",
         "--legs", $LegsPath,
         "--output-dir", $output
     )
