@@ -177,7 +177,8 @@ def test_runtime_processes_watermark_once(monkeypatch: pytest.MonkeyPatch, tmp_p
         "trademind.live_signal_runtime.load_volume_rows",
         lambda _path: ([volume_row], 1),
     )
-    raw = _observation("EURUSD:M5:1785934800", "2026-08-05T15:00:00+00:00")
+    raw = _observation(f"EURUSD:M5:{server_epoch}", "2026-08-05T15:00:00+00:00")
+    raw["source_bar_time"] = str(server_epoch)
     monkeypatch.setattr(
         "trademind.live_signal_runtime.build_fx_observations",
         lambda *_args, **_kwargs: [raw],
