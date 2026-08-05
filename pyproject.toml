@@ -77,3 +77,4 @@ target-version = "py311"
 "src/trademind/bybit_risk_plan_experiments.py" = ["F401"]
 "src/trademind/bybit_risk_plan_backfill.py" = ["F401"]
 "src/trademind/bybit_position_management.py" = ["F401"]
+"src/trademind/risk_manager.py" = ["F401"]
