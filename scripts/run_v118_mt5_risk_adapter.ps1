@@ -43,12 +43,12 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $repo "data\mt5_risk_adapter_v1\$Login"
 }
 
-$accountCsv = Join-Path $CommonFilesRoot "mt5_risk_account_$Login.csv"
-$positionsCsv = Join-Path $CommonFilesRoot "mt5_risk_positions_$Login.csv"
-$symbolsCsv = Join-Path $CommonFilesRoot "mt5_risk_symbols_$Login.csv"
+$accountCsv = Join-Path $CommonFilesRoot "mt5_risk_account_utc_$Login.csv"
+$positionsCsv = Join-Path $CommonFilesRoot "mt5_risk_positions_utc_$Login.csv"
+$symbolsCsv = Join-Path $CommonFilesRoot "mt5_risk_symbols_utc_$Login.csv"
 foreach ($path in @($accountCsv, $positionsCsv, $symbolsCsv)) {
     if (-not (Test-Path $path)) {
-        throw "Required MT5 risk snapshot not found: $path"
+        throw "Required MT5 UTC risk snapshot not found: $path"
     }
 }
 if ($Correlations -and -not (Test-Path $Correlations)) {
@@ -95,4 +95,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "`nMT5 risk adapter output: $OutputDir" -ForegroundColor Cyan
-Write-Host "Read-only. Orders OFF. Broker API not called." -ForegroundColor Green
+Write-Host "UTC snapshots. Read-only. Orders OFF. Broker API not called." -ForegroundColor Green
