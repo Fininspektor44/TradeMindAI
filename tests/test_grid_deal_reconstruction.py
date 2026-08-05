@@ -65,7 +65,11 @@ def test_reconstructs_closed_and_open_baskets(tmp_path: Path) -> None:
     assert opened[0]["closed_at"] == ""
     assert opened[0]["net_profit"] == ""
 
-    analytics = run_grid_audit(output, tmp_path / "analytics")
+    analytics_dir = tmp_path / "analytics"
+    analytics = run_grid_audit(output, analytics_dir)
     assert analytics.status["drawdown_coverage"] == 0.0
     assert analytics.status["worst_drawdown_money"] == 0.0
     assert analytics.status["drawdown_missing_is_zero"] is False
+    dashboard = (analytics_dir / "dashboard" / "index.html").read_text(encoding="utf-8")
+    assert "НЕ ИЗМЕРЕНА" in dashboard
+    assert "Покрытие DD" in dashboard
