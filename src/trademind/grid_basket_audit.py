@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import os
 from collections import defaultdict
@@ -21,7 +22,6 @@ from trademind.grid_basket_analytics import (
     _atomic_text,
     _float,
     _int,
-    _render_dashboard,
     _text,
     run_grid_analytics,
 )
@@ -39,6 +39,10 @@ def _optional_max(rows: Sequence[dict[str, Any]], field: str) -> float | str:
 
 def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def _optional_number(value: Any, digits: int = 2) -> str:
+    return f"{_float(value):.{digits}f}" if _text(value) else "—"
 
 
 def _drawdown_map(legs_path: Path) -> dict[str, dict[str, Any]]:
@@ -59,6 +63,68 @@ def _drawdown_map(legs_path: Path) -> dict[str, dict[str, Any]]:
             "adverse": _optional_max(rows, "max_adverse_points"),
         }
     return result
+
+
+def _render_audit_dashboard(
+    status: dict[str, Any],
+    risk: Sequence[dict[str, Any]],
+    symbols: Sequence[dict[str, Any]],
+) -> str:
+    coverage = 100.0 * _float(status.get("drawdown_coverage"))
+    if coverage > 0:
+        drawdown_value = f"{_float(status.get('worst_drawdown_money')):.2f}"
+        drawdown_note = f"измерено для {coverage:.1f}% корзин"
+    else:
+        drawdown_value = "НЕ ИЗМЕРЕНА"
+        drawdown_note = "нужен сбор плавающей просадки"
+
+    risk_rows = "".join(
+        "<tr>"
+        f"<td>{_int(row.get('leg_no'))}</td>"
+        f"<td>{_int(row.get('baskets_reaching_leg'))}</td>"
+        f"<td>{100 * _float(row.get('next_leg_rate')):.1f}%</td>"
+        f"<td>{100 * _float(row.get('stop_exit_rate')):.1f}%</td>"
+        f"<td>{_optional_number(row.get('average_max_drawdown_money'))}</td>"
+        f"<td>{_optional_number(row.get('worst_max_drawdown_money'))}</td>"
+        f"<td>{_float(row.get('average_net_profit')):.2f}</td>"
+        "</tr>"
+        for row in risk
+    )
+    symbol_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(_text(row.get('robot')))}</td>"
+        f"<td>{html.escape(_text(row.get('symbol')))} {html.escape(_text(row.get('side')))}</td>"
+        f"<td>{_int(row.get('completed'))}</td>"
+        f"<td>{100 * _float(row.get('win_rate')):.1f}%</td>"
+        f"<td>{_float(row.get('net_profit')):.2f}</td>"
+        f"<td>{_float(row.get('profit_factor')):.2f}</td>"
+        f"<td>{_optional_number(row.get('worst_max_drawdown_money'))}</td>"
+        f"<td>{_int(row.get('max_legs'))}</td>"
+        "</tr>"
+        for row in sorted(symbols, key=lambda item: _float(item.get("net_profit")), reverse=True)
+    )
+    return f"""<!doctype html><html lang='ru'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>TradeMind Grid Basket Analytics v1.15</title><style>
+body{{background:#07131e;color:#e8f5ff;font-family:Arial;margin:28px}}h1{{font-size:38px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}}
+.card{{background:#0c293d;border:1px solid #1d5878;border-radius:15px;padding:18px}}
+.card b{{font-size:28px}}.card small{{color:#a9c5d8}}table{{width:100%;border-collapse:collapse;margin:18px 0 34px}}
+th,td{{padding:9px;border-bottom:1px solid #183f56;text-align:left}}.ok{{color:#31e4a5}}.warn{{color:#ffd36d}}
+</style></head><body><h1>Grid Basket Analytics v1.15</h1>
+<p class='ok'>Только чтение. Ордера выключены. Исходные файлы не изменяются.</p>
+<p class='warn'>Это аудит риска сетки, а не генератор торговых сигналов.</p>
+<section class='cards'>
+<div class='card'><span>Корзин</span><br><b>{_int(status.get('baskets'))}</b></div>
+<div class='card'><span>Закрыто</span><br><b>{_int(status.get('completed_baskets'))}</b></div>
+<div class='card'><span>Чистый результат</span><br><b>{_float(status.get('net_profit')):.2f}</b></div>
+<div class='card'><span>Худшая DD</span><br><b>{drawdown_value}</b><br><small>{drawdown_note}</small></div>
+<div class='card'><span>Покрытие DD</span><br><b>{coverage:.1f}%</b></div>
+<div class='card'><span>Макс. одновременно</span><br><b>{_int(status.get('max_concurrent_baskets'))}</b></div>
+</section>
+<h2>Риск по коленям</h2><table><thead><tr><th>Колено</th><th>Дошли</th><th>Пошли дальше</th><th>Стоп</th><th>Средняя DD</th><th>Худшая DD</th><th>Средний net</th></tr></thead><tbody>{risk_rows}</tbody></table>
+<h2>Роботы и пары</h2><table><thead><tr><th>Робот</th><th>Инструмент</th><th>N</th><th>Win rate</th><th>Net</th><th>PF</th><th>Худшая DD</th><th>Макс. колен</th></tr></thead><tbody>{symbol_rows}</tbody></table>
+</body></html>"""
 
 
 def _patch_outputs(
@@ -126,7 +192,10 @@ def _patch_outputs(
     _atomic_csv(risk_path, LEG_RISK_FIELDS, risk)
     _atomic_csv(symbol_path, SYMBOL_FIELDS, symbols)
     _atomic_json(output_dir / "status.json", status)
-    _atomic_text(output_dir / "dashboard" / "index.html", _render_dashboard(status, risk, symbols))
+    _atomic_text(
+        output_dir / "dashboard" / "index.html",
+        _render_audit_dashboard(status, risk, symbols),
+    )
     return status
 
 
