@@ -65,7 +65,7 @@ string RobotLabel(long magic)
 {
    string mappings=TrimCopy(InpMagicLabels);
    if(mappings=="")
-      return "MAGIC_"+LongToString(magic);
+      return "MAGIC_"+IntegerToString(magic);
 
    string items[];
    ushort separator=StringGetCharacter(";",0);
@@ -81,7 +81,7 @@ string RobotLabel(long magic)
       if((long)StringToInteger(left)==magic && right!="")
          return right;
    }
-   return "MAGIC_"+LongToString(magic);
+   return "MAGIC_"+IntegerToString(magic);
 }
 
 string EnumTail(string value,string prefix)
