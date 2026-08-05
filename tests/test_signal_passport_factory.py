@@ -307,7 +307,7 @@ def test_bridge_rejects_factory_passport_when_cost_model_differs(tmp_path: Path)
         now=NOW,
     )
 
-    with pytest.raises(ValueError, match="factory cost model"):
+    with pytest.raises(ValueError, match="stored expected value differs"):
         validate_publishable_passport(
             result.passport_paths[0],
             now=NOW,
