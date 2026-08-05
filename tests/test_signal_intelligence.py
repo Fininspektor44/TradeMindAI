@@ -25,7 +25,7 @@ NOW = datetime(2026, 8, 5, 13, 30, tzinfo=timezone.utc)
 def _candidate(
     *,
     generated_from_market_data: bool = True,
-    first_target: float = 1.1060,
+    first_target: float = 1.1070,
 ) -> SignalCandidate:
     plan = TradePlan(
         action="BUY",
