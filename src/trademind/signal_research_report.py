@@ -13,8 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from trademind.signal_evidence import OutcomeObservation, aggregate_evidence, load_outcomes, similarity_key
-from trademind.signal_intelligence import PublicationPolicy, SignalCandidate, candidate_from_dict, quality_score
+from trademind.signal_evidence import (
+    OutcomeObservation,
+    aggregate_evidence,
+    load_outcomes,
+    similarity_key,
+)
+from trademind.signal_intelligence import PublicationPolicy, SignalCandidate, quality_score
 from trademind.signal_shadow import load_candidates
 
 REPORT_VERSION = "1.16.0"
@@ -124,9 +129,7 @@ def build_report_rows(
             captured_at=now,
         )
         scores = [quality_score(candidate, rules) for candidate in group]
-        net_r = sum(
-            outcome.net_r for outcome in outcomes if outcome.setup_key == key
-        )
+        net_r = sum(outcome.net_r for outcome in outcomes if outcome.setup_key == key)
         pf = evidence.profit_factor_r
         rows.append(
             {
