@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.151"
+#property version   "1.152"
 #property description "Read-only forward monitor for TradeMind grid basket analytics"
 
 input bool     InpForwardOnly       = true;
@@ -8,7 +8,7 @@ input int      InpHistoryDays       = 365; // Used only when InpForwardOnly=fals
 input int      InpRefreshSeconds    = 60;
 input string   InpOutputFolder      = "TradeMindAI";
 input string   InpMagicFilter       = ""; // Comma-separated; blank = every non-zero magic.
-input bool     InpIncludeManual     = false;
+input bool     InpIncludeManual     = false; // Manual entries. Manual exits of tracked robot positions are always retained.
 input string   InpSymbols           = ""; // Comma-separated; blank = every symbol.
 input string   InpMagicLabels       = ""; // Example: 445501=AOExtremum;992211=GridSafe
 
@@ -60,6 +60,29 @@ bool MagicAllowed(long magic)
    if(magic==0 && !InpIncludeManual)
       return false;
    return ListContainsLong(InpMagicFilter,magic);
+}
+
+int FindTrackedPosition(const ulong &position_ids[],ulong position_id)
+{
+   int count=ArraySize(position_ids);
+   for(int index=0;index<count;index++)
+   {
+      if(position_ids[index]==position_id)
+         return index;
+   }
+   return -1;
+}
+
+void RegisterTrackedPosition(ulong &position_ids[],long &owner_magics[],ulong position_id,long owner_magic)
+{
+   if(position_id==0 || FindTrackedPosition(position_ids,position_id)>=0)
+      return;
+
+   int size=ArraySize(position_ids);
+   ArrayResize(position_ids,size+1);
+   ArrayResize(owner_magics,size+1);
+   position_ids[size]=position_id;
+   owner_magics[size]=owner_magic;
 }
 
 string RobotLabel(long magic)
@@ -157,7 +180,7 @@ bool ExportDeals(datetime start,datetime finish)
    FileWrite(
       handle,
       "account_login","server","currency","monitor_start","ticket","order","position_id","time_msc",
-      "symbol","magic","robot","deal_type","entry","volume","price","profit","commission","swap","fee",
+      "symbol","magic","deal_magic","robot","deal_type","entry","volume","price","profit","commission","swap","fee",
       "comment","reason"
    );
 
@@ -166,7 +189,41 @@ bool ExportDeals(datetime start,datetime finish)
    string currency=AccountInfoString(ACCOUNT_CURRENCY);
    int total=HistoryDealsTotal();
    int exported=0;
+   int related_exits=0;
+   ulong tracked_positions[];
+   long tracked_magics[];
 
+   // First pass: remember positions opened by the selected robot/manual scope.
+   // This lets the second pass retain a later manual or cross-magic close.
+   for(int index=0;index<total;index++)
+   {
+      ulong ticket=HistoryDealGetTicket(index);
+      if(ticket==0)
+         continue;
+
+      ENUM_DEAL_TYPE type=(ENUM_DEAL_TYPE)HistoryDealGetInteger(ticket,DEAL_TYPE);
+      if(type!=DEAL_TYPE_BUY && type!=DEAL_TYPE_SELL)
+         continue;
+
+      ENUM_DEAL_ENTRY entry=(ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket,DEAL_ENTRY);
+      if(entry!=DEAL_ENTRY_IN && entry!=DEAL_ENTRY_INOUT)
+         continue;
+
+      string symbol=HistoryDealGetString(ticket,DEAL_SYMBOL);
+      long magic=HistoryDealGetInteger(ticket,DEAL_MAGIC);
+      if(symbol=="" || !MagicAllowed(magic) || !ListContainsString(InpSymbols,symbol))
+         continue;
+
+      RegisterTrackedPosition(
+         tracked_positions,
+         tracked_magics,
+         (ulong)HistoryDealGetInteger(ticket,DEAL_POSITION_ID),
+         magic
+      );
+   }
+
+   // Second pass: export selected entries and every exit that belongs to a
+   // tracked position, even when that exit was manual or sent by another EA.
    for(int index=0;index<total;index++)
    {
       ulong ticket=HistoryDealGetTicket(index);
@@ -182,9 +239,23 @@ bool ExportDeals(datetime start,datetime finish)
          continue;
 
       string symbol=HistoryDealGetString(ticket,DEAL_SYMBOL);
-      long magic=HistoryDealGetInteger(ticket,DEAL_MAGIC);
-      if(symbol=="" || !MagicAllowed(magic) || !ListContainsString(InpSymbols,symbol))
+      if(symbol=="" || !ListContainsString(InpSymbols,symbol))
          continue;
+
+      long deal_magic=HistoryDealGetInteger(ticket,DEAL_MAGIC);
+      ulong position_id=(ulong)HistoryDealGetInteger(ticket,DEAL_POSITION_ID);
+      int owner_index=FindTrackedPosition(tracked_positions,position_id);
+      bool is_exit=(entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY || entry==DEAL_ENTRY_INOUT);
+      bool selected_magic=MagicAllowed(deal_magic);
+      bool related_exit=(is_exit && owner_index>=0);
+      if(!selected_magic && !related_exit)
+         continue;
+
+      long strategy_magic=deal_magic;
+      if(owner_index>=0)
+         strategy_magic=tracked_magics[owner_index];
+      if(related_exit && deal_magic!=strategy_magic)
+         related_exits++;
 
       int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
       string type_name=EnumTail(EnumToString(type),"DEAL_TYPE_");
@@ -196,9 +267,9 @@ bool ExportDeals(datetime start,datetime finish)
          handle,
          login,server,currency,(long)start,ticket,
          (ulong)HistoryDealGetInteger(ticket,DEAL_ORDER),
-         (ulong)HistoryDealGetInteger(ticket,DEAL_POSITION_ID),
+         position_id,
          (long)HistoryDealGetInteger(ticket,DEAL_TIME_MSC),
-         symbol,magic,RobotLabel(magic),type_name,entry_name,
+         symbol,strategy_magic,deal_magic,RobotLabel(strategy_magic),type_name,entry_name,
          DoubleToString(HistoryDealGetDouble(ticket,DEAL_VOLUME),2),
          DoubleToString(HistoryDealGetDouble(ticket,DEAL_PRICE),digits),
          DoubleToString(HistoryDealGetDouble(ticket,DEAL_PROFIT),2),
@@ -213,8 +284,8 @@ bool ExportDeals(datetime start,datetime finish)
    FileFlush(handle);
    FileClose(handle);
    PrintFormat(
-      "TradeMind grid monitor: account=%s start=%s exported=%d deals -> Common\\Files\\%s",
-      LoginText(),TimeToString(start,TIME_DATE|TIME_MINUTES),exported,filename
+      "TradeMind grid monitor: account=%s start=%s exported=%d deals related_exits=%d -> Common\\Files\\%s",
+      LoginText(),TimeToString(start,TIME_DATE|TIME_MINUTES),exported,related_exits,filename
    );
    return true;
 }
