@@ -47,6 +47,12 @@ param(
     [Parameter(Mandatory=$false)]
     [int]$DashboardCandidateLimit = 60,
 
+    [Parameter(Mandatory=$false)]
+    [int]$ProductSignalLimit = 24,
+
+    [Parameter(Mandatory=$false)]
+    [int]$ProductCandleLimit = 48,
+
     [switch]$RunTests,
 
     [switch]$OpenDashboard
@@ -71,7 +77,8 @@ $accountCsv = Join-Path $CommonFilesRoot "mt5_risk_account_utc_$Login.csv"
 $positionsCsv = Join-Path $CommonFilesRoot "mt5_risk_positions_utc_$Login.csv"
 $symbolsCsv = Join-Path $CommonFilesRoot "mt5_risk_symbols_utc_$Login.csv"
 $journal = Join-Path $RuntimeRoot "events.jsonl"
-$dashboard = Join-Path $RuntimeRoot "dashboard\index.html"
+$technicalDashboard = Join-Path $RuntimeRoot "dashboard\index.html"
+$productUi = Join-Path $RuntimeRoot "product\index.html"
 
 foreach ($path in @($HistoricalOutcomes, $Profile, $accountCsv, $positionsCsv, $symbolsCsv)) {
     if (-not (Test-Path $path)) {
@@ -90,9 +97,16 @@ if ($ServerUTCOffsetHours -lt -14 -or $ServerUTCOffsetHours -gt 14) {
 if ($DashboardCandidateLimit -lt 1) {
     throw "DashboardCandidateLimit must be positive"
 }
+if ($ProductSignalLimit -lt 1) {
+    throw "ProductSignalLimit must be positive"
+}
+if ($ProductCandleLimit -lt 1) {
+    throw "ProductCandleLimit must be positive"
+}
 
 if ($RunTests) {
     & $python -m pytest -q `
+        ".\tests\test_product_ui.py" `
         ".\tests\test_live_signal_runtime_v122.py" `
         ".\tests\test_live_signal_dashboard.py" `
         ".\tests\test_live_signal_runtime.py" `
@@ -102,7 +116,7 @@ if ($RunTests) {
         ".\tests\test_risk_manager.py" `
         ".\tests\test_signal_intelligence.py"
     if ($LASTEXITCODE -ne 0) {
-        throw "Live Signal Runtime and Dashboard tests failed"
+        throw "Live Signal Runtime, Dashboard and Product UI tests failed"
     }
 }
 
@@ -143,10 +157,19 @@ if ($LASTEXITCODE -ne 0) {
     throw "Live Signal Dashboard execution failed"
 }
 
+& $python -m trademind.product_ui `
+    --runtime-root $RuntimeRoot `
+    --limit $ProductSignalLimit `
+    --candle-limit $ProductCandleLimit
+if ($LASTEXITCODE -ne 0) {
+    throw "TradeMind Product UI execution failed"
+}
+
 Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
-Write-Host "Dashboard: $dashboard" -ForegroundColor Cyan
+Write-Host "Product UI: $productUi" -ForegroundColor Cyan
+Write-Host "Technical dashboard: $technicalDashboard" -ForegroundColor DarkGray
 Write-Host "Read-only. Orders OFF. Publication OFF. Historical archive unchanged." -ForegroundColor Green
 
-if ($OpenDashboard -and (Test-Path $dashboard)) {
-    Start-Process $dashboard
+if ($OpenDashboard -and (Test-Path $productUi)) {
+    Start-Process $productUi
 }
