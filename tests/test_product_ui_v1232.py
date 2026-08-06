@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from trademind.product_ui_v1232 import (
+from trademind.product_ui_v1232_entry import (
     _localize_candidate,
     render,
     translate_explanation,
