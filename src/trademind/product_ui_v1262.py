@@ -30,25 +30,52 @@ def _spread_centers(
     top: float = TAG_TOP,
     bottom: float = TAG_BOTTOM,
 ) -> dict[str, float]:
-    """Spread label centres while preserving their vertical price order."""
+    """Spread labels symmetrically while preserving vertical price order."""
     if not centers:
         return {}
+
     ordered = sorted(centers, key=lambda item: item[1])
-    adjusted = [value for _, value in ordered]
+    transformed = [
+        value - index * minimum_gap
+        for index, (_, value) in enumerate(ordered)
+    ]
 
-    for index in range(1, len(adjusted)):
-        adjusted[index] = max(adjusted[index], adjusted[index - 1] + minimum_gap)
+    blocks: list[list[float]] = []
+    for index, value in enumerate(transformed):
+        blocks.append([float(index), float(index), value, 1.0])
+        while len(blocks) >= 2:
+            left_average = blocks[-2][2] / blocks[-2][3]
+            right_average = blocks[-1][2] / blocks[-1][3]
+            if left_average <= right_average:
+                break
+            right = blocks.pop()
+            left = blocks.pop()
+            blocks.append(
+                [
+                    left[0],
+                    right[1],
+                    left[2] + right[2],
+                    left[3] + right[3],
+                ]
+            )
 
-    overflow = adjusted[-1] - bottom
-    if overflow > 0:
-        adjusted = [value - overflow for value in adjusted]
+    normalized = [0.0] * len(ordered)
+    for start, end, total, count in blocks:
+        average = total / count
+        for index in range(int(start), int(end) + 1):
+            normalized[index] = average
 
-    for index in range(len(adjusted) - 2, -1, -1):
-        adjusted[index] = min(adjusted[index], adjusted[index + 1] - minimum_gap)
+    adjusted = [
+        normalized[index] + index * minimum_gap
+        for index in range(len(ordered))
+    ]
 
-    underflow = top - adjusted[0]
-    if underflow > 0:
-        adjusted = [value + underflow for value in adjusted]
+    if adjusted[0] < top:
+        shift = top - adjusted[0]
+        adjusted = [value + shift for value in adjusted]
+    if adjusted[-1] > bottom:
+        shift = adjusted[-1] - bottom
+        adjusted = [value - shift for value in adjusted]
 
     return {
         css: max(top, min(bottom, value))
