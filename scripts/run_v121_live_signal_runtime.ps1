@@ -159,7 +159,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Live Signal Dashboard execution failed"
 }
 
-& $python -m trademind.product_ui_v1232 `
+& $python -m trademind.product_ui_v1232_entry `
     --runtime-root $RuntimeRoot `
     --limit $ProductSignalLimit `
     --candle-limit $ProductCandleLimit
