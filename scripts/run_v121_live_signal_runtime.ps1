@@ -30,7 +30,7 @@ param(
     [string]$BybitShadowDir = ".\data\bybit_shadow_v1_10",
 
     [Parameter(Mandatory=$false)]
-    [string]$CryptoRoot = ".\data\crypto_signal_intelligence_v1_24",
+    [string]$CryptoRoot = ".\data\crypto_signal_intelligence_v1_25",
 
     [Parameter(Mandatory=$false)]
     [int]$ServerUTCOffsetHours = 3,
@@ -127,6 +127,9 @@ if ($ProductCandleLimit -lt 1) {
 
 if ($RunTests) {
     & $python -m pytest -q `
+        ".\tests\test_crypto_market_structure.py" `
+        ".\tests\test_crypto_signal_adapter_v125.py" `
+        ".\tests\test_product_ui_v125.py" `
         ".\tests\test_crypto_signal_adapter.py" `
         ".\tests\test_product_ui_v124.py" `
         ".\tests\test_product_ui_v1235.py" `
@@ -144,7 +147,7 @@ if ($RunTests) {
         ".\tests\test_risk_manager.py" `
         ".\tests\test_signal_intelligence.py"
     if ($LASTEXITCODE -ne 0) {
-        throw "Live Signal Runtime, Crypto Adapter and Product UI tests failed"
+        throw "Live Signal Runtime, Crypto Structure Core and Product UI tests failed"
     }
 }
 
@@ -191,14 +194,14 @@ $cryptoSourceReady = (
     (Test-Path $bybitSignals)
 )
 if ($cryptoSourceReady) {
-    & $python -m trademind.crypto_signal_adapter `
+    & $python -m trademind.crypto_signal_adapter_v125 `
         --decisions $bybitDecisions `
         --signals $bybitSignals `
         --bars $BybitBars `
         --output-dir $CryptoRoot `
         --cost-r $CostR.ToString([System.Globalization.CultureInfo]::InvariantCulture)
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Crypto Signal Adapter failed. Forex runtime remains available."
+        Write-Warning "Crypto Market Structure Core failed. Forex runtime remains available."
     }
     elseif ((Test-Path $cryptoCandidates) -and (Test-Path $cryptoOutcomes)) {
         & $python -m trademind.signal_passport_factory `
@@ -218,7 +221,7 @@ else {
     Write-Warning "Bybit shadow sources not found. Product UI will show Forex only until crypto files appear."
 }
 
-& $python -m trademind.product_ui_v124 `
+& $python -m trademind.product_ui_v125 `
     --runtime-root $RuntimeRoot `
     --crypto-root $CryptoRoot `
     --bybit-bars $BybitBars `
@@ -226,14 +229,14 @@ else {
     --crypto-limit $CryptoSignalLimit `
     --candle-limit $ProductCandleLimit
 if ($LASTEXITCODE -ne 0) {
-    throw "TradeMind Product UI v1.24 execution failed"
+    throw "TradeMind Product UI v1.25 execution failed"
 }
 
 Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
-Write-Host "Crypto Intelligence: $CryptoRoot" -ForegroundColor Cyan
+Write-Host "Crypto Structure Intelligence: $CryptoRoot" -ForegroundColor Cyan
 Write-Host "Product UI: $productUi" -ForegroundColor Cyan
 Write-Host "Technical dashboard: $technicalDashboard" -ForegroundColor DarkGray
-Write-Host "Read-only. Forex + Crypto. Orders OFF. Publication OFF. Source archives unchanged." -ForegroundColor Green
+Write-Host "Read-only. Forex + native Crypto structure. Orders OFF. Publication OFF. Source archives unchanged." -ForegroundColor Green
 
 if ($OpenDashboard -and (Test-Path $productUi)) {
     Start-Process $productUi
