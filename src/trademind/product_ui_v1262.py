@@ -17,6 +17,8 @@ VERSION = "1.26.2"
 MIN_TAG_GAP = 24.0
 TAG_TOP = 23.0
 TAG_BOTTOM = 179.0
+_BASE_RENDER = previous.render
+_BASE_PRICE_SCALE = previous._price_scale_svg
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -84,7 +86,10 @@ def _spread_centers(
 
 
 def _price_scale_svg(candidate: Mapping[str, Any]) -> str:
-    svg = previous._price_scale_svg(candidate)
+    source_scale = previous._price_scale_svg
+    if source_scale is _price_scale_svg:
+        source_scale = _BASE_PRICE_SCALE
+    svg = source_scale(candidate)
     if "price-scale-chart" not in svg:
         return svg
 
@@ -148,7 +153,7 @@ def render(data: Mapping[str, Any]) -> str:
     original_scale = previous._price_scale_svg
     try:
         previous._price_scale_svg = _price_scale_svg
-        page = previous.render(data)
+        page = _BASE_RENDER(data)
     finally:
         previous._price_scale_svg = original_scale
 
