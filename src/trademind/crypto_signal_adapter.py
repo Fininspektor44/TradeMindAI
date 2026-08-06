@@ -145,9 +145,10 @@ def _factor_scores(
         action, m5_book, 0.03
     )
     volume = (
-        0.40 * _aligned(action, m15_delta)
-        + 0.45 * _aligned(action, m5_delta)
-        + 0.15 * (trade_count > 0)
+        0.20 * _aligned(action, h1_delta)
+        + 0.30 * _aligned(action, m15_delta)
+        + 0.40 * _aligned(action, m5_delta)
+        + 0.10 * (trade_count > 0)
     )
     momentum = (
         0.40 * _aligned(action, h1_return)
@@ -182,8 +183,8 @@ def _factor_scores(
         ),
         "fibonacci": ("Крипто-источник пока не передаёт независимую OTE-геометрию",),
         "volume": (
-            f"Delta M15: {m15_delta:.2f}",
-            f"Delta M5: {m5_delta:.2f}",
+            f"Delta H1: {h1_delta:.2f}",
+            f"Delta M15/M5: {m15_delta:.2f}/{m5_delta:.2f}",
         ),
         "momentum": (
             f"Доходность H1: {100.0 * h1_return:.3f}%",
