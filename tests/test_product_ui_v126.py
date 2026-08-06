@@ -36,6 +36,11 @@ def crypto_candidate():
     }
 
 
+def test_base_formatter_route_is_valid() -> None:
+    assert ui.base is ui.previous.previous.base
+    assert ui.base.integer("2") == 2
+
+
 def test_crypto_market_panel_shows_only_core_opportunity_metrics() -> None:
     rendered = ui._crypto_market_html(crypto_candidate())
 
