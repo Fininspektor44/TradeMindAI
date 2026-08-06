@@ -57,7 +57,7 @@ def test_zero_placeholder_entry_weights_are_hidden() -> None:
         }
     )
 
-    assert "0%" not in html
+    assert "0% ·" not in html
     assert "70,5%" in html
     assert "79,0%" in html
 
