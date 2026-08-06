@@ -1,0 +1,63 @@
+name: Test TradeMind v1.23.2 Russian Explanations
+
+on:
+  pull_request:
+    paths:
+      - "src/trademind/product_ui_v1232.py"
+      - "tests/test_product_ui_v1232.py"
+      - "scripts/run_v121_live_signal_runtime.ps1"
+      - "pyproject.toml"
+      - ".github/workflows/test-v1232-russian-explanations.yml"
+  push:
+    branches:
+      - "feature/v1.23.2-russian-explanations"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check src/trademind/product_ui_v1232.py tests/test_product_ui_v1232.py
+      - name: Tests
+        run: >-
+          pytest -q
+          tests/test_product_ui_v1232.py
+          tests/test_product_ui_v1231.py
+          tests/test_product_ui.py
+          tests/test_live_signal_runtime_v122.py
+          tests/test_live_signal_dashboard.py
+          tests/test_live_signal_runtime.py
+          tests/test_signal_passport_factory.py
+          tests/test_signal_to_risk_bridge.py
+          tests/test_mt5_risk_adapter.py
+          tests/test_risk_manager.py
+          tests/test_signal_intelligence.py
+      - name: Parse PowerShell runner
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "scripts/run_v121_live_signal_runtime.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+      - name: Verify read-only boundary
+        shell: pwsh
+        run: |
+          $source = Get-Content "src/trademind/product_ui_v1232.py" -Raw
+          foreach ($token in @("OrderSend(", "PositionClose(", "PositionModify(", "import MetaTrader5", "import requests")) {
+            if ($source.Contains($token)) {
+              throw "Forbidden execution or broker-client token found: $token"
+            }
+          }
