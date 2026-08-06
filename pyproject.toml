@@ -62,7 +62,7 @@ trademind-signal-to-risk = "trademind.signal_to_risk_bridge:main"
 trademind-passport-factory = "trademind.signal_passport_factory:main"
 trademind-live-runtime = "trademind.live_signal_runtime:main"
 trademind-live-dashboard = "trademind.live_signal_dashboard:main"
-trademind-product-ui = "trademind.product_ui_v1232:main"
+trademind-product-ui = "trademind.product_ui_v1232_entry:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
