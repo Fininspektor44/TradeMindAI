@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.24.0"
+version = "1.25.1"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -52,7 +52,8 @@ trademind-grid-reconstruct = "trademind.grid_deal_reconstruction:main"
 trademind-grid-analytics = "trademind.grid_basket_audit:main"
 trademind-live-signals = "trademind.live_signal_server:main"
 trademind-fx-signal-adapter = "trademind.fx_signal_adapter:main"
-trademind-crypto-signal-adapter = "trademind.crypto_signal_adapter:main"
+trademind-crypto-signal-adapter = "trademind.crypto_signal_adapter_v125:main"
+trademind-crypto-structure-incremental = "trademind.crypto_structure_incremental:main"
 trademind-signal-shadow = "trademind.signal_shadow:main"
 trademind-signal-evidence = "trademind.signal_evidence:main"
 trademind-signal-report = "trademind.signal_research_report:main"
@@ -63,7 +64,7 @@ trademind-signal-to-risk = "trademind.signal_to_risk_bridge:main"
 trademind-passport-factory = "trademind.signal_passport_factory:main"
 trademind-live-runtime = "trademind.live_signal_runtime:main"
 trademind-live-dashboard = "trademind.live_signal_dashboard:main"
-trademind-product-ui = "trademind.product_ui_v124:main"
+trademind-product-ui = "trademind.product_ui_v125:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
