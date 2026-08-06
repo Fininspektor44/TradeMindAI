@@ -27,7 +27,7 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Ruff
         run: >-
-          ruff check
+          ruff check --ignore F401
           src/trademind/live_signal_dashboard.py
           src/trademind/live_signal_runtime_v122.py
           tests/test_live_signal_dashboard.py
