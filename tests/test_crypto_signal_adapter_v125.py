@@ -5,6 +5,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from trademind.crypto_signal_adapter_v125 import (
     STRUCTURE_SETUP_FAMILY,
     build_candidate,
@@ -145,7 +147,7 @@ def test_build_candidate_merges_native_structure_without_changing_source_plan() 
         snapshot(),
     )
     assert candidate.setup_family == STRUCTURE_SETUP_FAMILY
-    assert candidate.plan.first_target_rr == 1.5
+    assert candidate.plan.first_target_rr == pytest.approx(1.5)
     assert candidate.market_features["structure"]["swing_break"] == "BULLISH_BOS"
     assert candidate.market_features["liquidity"]["fvg"] == "BULLISH_FVG"
     assert candidate.market_features["fibonacci"]["ote_hit"] is True
