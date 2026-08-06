@@ -26,6 +26,9 @@ from trademind.crypto_h1_swing_filter import (
 from trademind.crypto_market_structure import MarketStructureEngine
 from trademind.signal_evidence import similarity_dimensions, similarity_key
 
+LEGACY_ACTION_ERROR = "action must be BUY or SELL"
+SUPPORTED_ACTIONS = frozenset({"BUY", "SELL"})
+
 
 def _read_json(path: Path) -> Mapping[str, Any]:
     if not path.is_file():
@@ -92,6 +95,10 @@ def _error_key(row: Mapping[str, Any]) -> str:
     )
 
 
+def _is_legacy_action_error(row: Mapping[str, Any]) -> bool:
+    return str(row.get("reason") or "").strip().casefold() == LEGACY_ACTION_ERROR.casefold()
+
+
 def _attempted_ids(
     candidates: Sequence[Mapping[str, Any]],
     rejections: Sequence[Mapping[str, Any]],
@@ -102,6 +109,57 @@ def _attempted_ids(
         for row in [*candidates, *rejections, *errors]
         if str(row.get("source_decision_id") or "")
     }
+
+
+def _unsupported_action_records(
+    row: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    source_id = source._text(row, "decision_id")
+    action = source._text(row, "action").upper()
+    symbol = source._text(row, "symbol").upper()
+    as_of = source._text(row, "signal_time")
+    opportunity = {
+        "eligible": False,
+        "action": action,
+        "reasons": ["ACTION_NOT_BUY_SELL"],
+        "entry": None,
+        "stop": None,
+        "target": None,
+        "breakout_level": None,
+        "breakout_pivot_ms": None,
+        "volume_ratio": 0.0,
+        "current_volume": 0.0,
+        "median_volume_20": 0.0,
+        "delta_turnover": 0.0,
+        "target_rr": 0.0,
+        "target_atr_h1": 0.0,
+    }
+    audit = {
+        "schema_version": VERSION,
+        "source_decision_id": source_id,
+        "symbol": symbol,
+        "action": action,
+        "as_of": as_of,
+        "opportunity": opportunity,
+        "snapshot_state": "SKIPPED_UNSUPPORTED_ACTION",
+        "bar_counts": {},
+        "safety": {
+            "read_only": True,
+            "orders_enabled": False,
+            "publication_enabled": False,
+            "exchange_api_called": False,
+            "future_bars_used": False,
+        },
+    }
+    rejection = {
+        "schema_version": VERSION,
+        "source_decision_id": source_id,
+        "symbol": symbol,
+        "action": action,
+        "as_of": as_of,
+        "reasons": ["ACTION_NOT_BUY_SELL"],
+    }
+    return audit, rejection
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,10 +189,16 @@ def run_incremental(
     existing_rejections = _read_jsonl(root / "rejections.jsonl")
     existing_audit = _read_jsonl(root / "opportunity_audit.jsonl")
     error_payload = _read_json(root / "errors.json")
-    existing_errors = [
+    raw_existing_errors = [
         dict(row)
         for row in error_payload.get("errors", [])
         if isinstance(row, Mapping)
+    ]
+    recovered_legacy_action_errors = sum(
+        _is_legacy_action_error(row) for row in raw_existing_errors
+    )
+    existing_errors = [
+        row for row in raw_existing_errors if not _is_legacy_action_error(row)
     ]
 
     attempted = _attempted_ids(
@@ -153,11 +217,21 @@ def run_incremental(
     incoming_rejections: list[dict[str, Any]] = []
     incoming_audit: list[dict[str, Any]] = []
     incoming_errors: list[dict[str, Any]] = []
+    tradable_rows: list[Mapping[str, Any]] = []
 
-    if batch:
+    for row in batch:
+        action = source._text(row, "action").upper()
+        if action in SUPPORTED_ACTIONS:
+            tradable_rows.append(row)
+            continue
+        audit, rejection = _unsupported_action_records(row)
+        incoming_audit.append(audit)
+        incoming_rejections.append(rejection)
+
+    if tradable_rows:
         engine = MarketStructureEngine.from_csv(bars_path)
         flow = FlowHistory.from_csv(bars_path)
-        for row in batch:
+        for row in tradable_rows:
             source_id = source._text(row, "decision_id")
             try:
                 candidate, audit, rejection = evaluate_row(row, engine, flow)
@@ -242,6 +316,7 @@ def run_incremental(
             "eligible_candidates": len(candidates),
             "rejected_decisions": len(rejections),
             "errors": len(errors),
+            "recovered_legacy_action_errors": recovered_legacy_action_errors,
             "outcomes": 0,
             "evidence_state": "FORWARD_ONLY_JOURNAL_NOT_STARTED",
             "decision_chain": (
