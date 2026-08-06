@@ -6,9 +6,11 @@ on:
       - "src/trademind/crypto_h1_swing_filter.py"
       - "src/trademind/crypto_h1_swing_incremental.py"
       - "src/trademind/product_ui_v126.py"
+      - "src/trademind/product_ui_v1262.py"
       - "tests/test_crypto_h1_swing_filter.py"
       - "tests/test_crypto_h1_swing_incremental.py"
       - "tests/test_product_ui_v126.py"
+      - "tests/test_product_ui_v1262.py"
       - "scripts/run_v121_live_signal_runtime.ps1"
       - "pyproject.toml"
       - ".github/workflows/test-v126-h1-swing-opportunity.yml"
@@ -29,11 +31,13 @@ jobs:
           ruff check src/trademind/crypto_h1_swing_filter.py tests/test_crypto_h1_swing_filter.py
           ruff check src/trademind/crypto_h1_swing_incremental.py tests/test_crypto_h1_swing_incremental.py
           ruff check src/trademind/product_ui_v126.py tests/test_product_ui_v126.py
+          ruff check src/trademind/product_ui_v1262.py tests/test_product_ui_v1262.py
       - name: Tests
         run: >-
           pytest -q
           tests/test_crypto_h1_swing_filter.py
           tests/test_crypto_h1_swing_incremental.py
+          tests/test_product_ui_v1262.py
           tests/test_product_ui_v126.py
           tests/test_crypto_market_structure.py
           tests/test_crypto_signal_adapter_v125.py
@@ -77,6 +81,7 @@ jobs:
             Get-Content "src/trademind/crypto_h1_swing_filter.py" -Raw
             Get-Content "src/trademind/crypto_h1_swing_incremental.py" -Raw
             Get-Content "src/trademind/product_ui_v126.py" -Raw
+            Get-Content "src/trademind/product_ui_v1262.py" -Raw
           ) -join "`n"
           foreach ($token in @(
             "OrderSend(",
