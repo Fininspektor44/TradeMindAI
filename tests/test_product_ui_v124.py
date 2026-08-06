@@ -187,10 +187,10 @@ def test_render_adds_market_filter_crypto_badge_and_derivatives() -> None:
             },
         }
     )
-    assert "TradeMind Product UI v1.24" in page
     assert "data-market-filter='CRYPTO'" in page
     assert "data-market='CRYPTO'" in page
     assert "M5 · CRYPTO" in page
+    assert "CRYPTO · BYBIT" in page
     assert "Funding, basis и OI" in page
     assert "Forex и Crypto" in page
     assert "OrderSend" not in page
