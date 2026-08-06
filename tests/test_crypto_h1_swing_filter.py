@@ -97,6 +97,7 @@ def snapshot(
 def test_accepts_only_clean_h1_aligned_m5_volume_breakout() -> None:
     result = evaluate_opportunity("BUY", bullish_bars(), snapshot())
 
+    assert isinstance(result, Opportunity)
     assert result.eligible is True
     assert result.breakout_level == pytest.approx(108.5)
     assert result.volume_ratio == pytest.approx(1.3)
