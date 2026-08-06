@@ -63,6 +63,9 @@ param(
     [int]$CryptoSignalLimit = 24,
 
     [Parameter(Mandatory=$false)]
+    [int]$CryptoStructureBatchSize = 400,
+
+    [Parameter(Mandatory=$false)]
     [int]$ProductCandleLimit = 48,
 
     [switch]$RunTests,
@@ -121,6 +124,9 @@ if ($ProductSignalLimit -lt 1) {
 if ($CryptoSignalLimit -lt 1) {
     throw "CryptoSignalLimit must be positive"
 }
+if ($CryptoStructureBatchSize -lt 1) {
+    throw "CryptoStructureBatchSize must be positive"
+}
 if ($ProductCandleLimit -lt 1) {
     throw "ProductCandleLimit must be positive"
 }
@@ -129,6 +135,7 @@ if ($RunTests) {
     & $python -m pytest -q `
         ".\tests\test_crypto_market_structure.py" `
         ".\tests\test_crypto_signal_adapter_v125.py" `
+        ".\tests\test_crypto_structure_incremental.py" `
         ".\tests\test_product_ui_v125.py" `
         ".\tests\test_crypto_signal_adapter.py" `
         ".\tests\test_product_ui_v124.py" `
@@ -147,7 +154,7 @@ if ($RunTests) {
         ".\tests\test_risk_manager.py" `
         ".\tests\test_signal_intelligence.py"
     if ($LASTEXITCODE -ne 0) {
-        throw "Live Signal Runtime, Crypto Structure Core and Product UI tests failed"
+        throw "Live Signal Runtime, incremental Crypto Structure and Product UI tests failed"
     }
 }
 
@@ -194,14 +201,15 @@ $cryptoSourceReady = (
     (Test-Path $bybitSignals)
 )
 if ($cryptoSourceReady) {
-    & $python -m trademind.crypto_signal_adapter_v125 `
+    & $python -m trademind.crypto_structure_incremental `
         --decisions $bybitDecisions `
         --signals $bybitSignals `
         --bars $BybitBars `
         --output-dir $CryptoRoot `
-        --cost-r $CostR.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+        --cost-r $CostR.ToString([System.Globalization.CultureInfo]::InvariantCulture) `
+        --batch-size $CryptoStructureBatchSize
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Crypto Market Structure Core failed. Forex runtime remains available."
+        Write-Warning "Incremental Crypto Market Structure failed. Forex runtime remains available."
     }
     elseif ((Test-Path $cryptoCandidates) -and (Test-Path $cryptoOutcomes)) {
         & $python -m trademind.signal_passport_factory `
@@ -236,7 +244,7 @@ Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
 Write-Host "Crypto Structure Intelligence: $CryptoRoot" -ForegroundColor Cyan
 Write-Host "Product UI: $productUi" -ForegroundColor Cyan
 Write-Host "Technical dashboard: $technicalDashboard" -ForegroundColor DarkGray
-Write-Host "Read-only. Forex + native Crypto structure. Orders OFF. Publication OFF. Source archives unchanged." -ForegroundColor Green
+Write-Host "Read-only. Incremental Crypto structure. Orders OFF. Publication OFF. Source archives unchanged." -ForegroundColor Green
 
 if ($OpenDashboard -and (Test-Path $productUi)) {
     Start-Process $productUi
