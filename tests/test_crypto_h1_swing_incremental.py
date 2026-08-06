@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -106,6 +107,74 @@ def test_incremental_archives_candidates_and_rejections_without_repeating(
     assert third.eligible_total == 1
     assert third.rejected_total == 2
     assert (output / "outcomes.jsonl").read_text(encoding="utf-8") == ""
+
+
+def test_unsupported_action_is_rejected_and_legacy_error_is_recovered(
+    tmp_path, monkeypatch
+) -> None:
+    decisions = tmp_path / "decisions.csv"
+    bars = tmp_path / "bars.csv"
+    output = tmp_path / "output"
+    output.mkdir()
+    row = {
+        "decision_id": "d-wait",
+        "signal_time": datetime(2026, 8, 6, 12, tzinfo=timezone.utc).isoformat(),
+        "symbol": "BTCUSDT",
+        "action": "WAIT",
+    }
+    with decisions.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=row.keys())
+        writer.writeheader()
+        writer.writerow(row)
+    bars.write_text("unused\n", encoding="utf-8")
+    (output / "errors.json").write_text(
+        json.dumps(
+            {
+                "errors": [
+                    {
+                        "schema_version": "1.26.0",
+                        "source_decision_id": "d-wait",
+                        "reason": "action must be BUY or SELL",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class ForbiddenEngine:
+        @classmethod
+        def from_csv(cls, path):
+            raise AssertionError("unsupported actions must not enter structure engine")
+
+    class ForbiddenFlow:
+        @classmethod
+        def from_csv(cls, path):
+            raise AssertionError("unsupported actions must not load flow history")
+
+    def forbidden_evaluate(row, engine, flow):
+        raise AssertionError("unsupported actions must not reach evaluate_row")
+
+    monkeypatch.setattr(runtime, "MarketStructureEngine", ForbiddenEngine)
+    monkeypatch.setattr(runtime, "FlowHistory", ForbiddenFlow)
+    monkeypatch.setattr(runtime, "evaluate_row", forbidden_evaluate)
+
+    result = runtime.run_incremental(decisions, bars, output, batch_size=10)
+
+    assert result.processed_batch == 1
+    assert result.eligible_total == 0
+    assert result.rejected_total == 1
+    assert result.error_total == 0
+    assert result.remaining_decisions == 0
+    errors = json.loads((output / "errors.json").read_text(encoding="utf-8"))
+    assert errors == {"errors": []}
+    rejection = json.loads(
+        (output / "rejections.jsonl").read_text(encoding="utf-8").strip()
+    )
+    assert rejection["source_decision_id"] == "d-wait"
+    assert rejection["reasons"] == ["ACTION_NOT_BUY_SELL"]
+    status = json.loads((output / "status.json").read_text(encoding="utf-8"))
+    assert status["recovered_legacy_action_errors"] == 1
 
 
 def test_incremental_safety_contract() -> None:
