@@ -93,6 +93,7 @@ if ($DashboardCandidateLimit -lt 1) {
 
 if ($RunTests) {
     & $python -m pytest -q `
+        ".\tests\test_live_signal_runtime_v122.py" `
         ".\tests\test_live_signal_dashboard.py" `
         ".\tests\test_live_signal_runtime.py" `
         ".\tests\test_signal_passport_factory.py" `
@@ -106,7 +107,7 @@ if ($RunTests) {
 }
 
 $arguments = @(
-    "-m", "trademind.live_signal_runtime",
+    "-m", "trademind.live_signal_runtime_v122",
     "--login", $Login,
     "--volume-source-dir", $VolumeSourceDir,
     "--canonical-volume", $CanonicalVolume,
@@ -131,7 +132,7 @@ if ($Correlations) {
 
 & $python @arguments
 if ($LASTEXITCODE -ne 0) {
-    throw "Live Signal Runtime execution failed"
+    throw "Live Signal Runtime v1.22.1 execution failed"
 }
 
 & $python -m trademind.live_signal_dashboard `
