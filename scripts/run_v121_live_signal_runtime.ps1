@@ -44,7 +44,12 @@ param(
     [Parameter(Mandatory=$false)]
     [double]$CostR = 0.04,
 
-    [switch]$RunTests
+    [Parameter(Mandatory=$false)]
+    [int]$DashboardCandidateLimit = 60,
+
+    [switch]$RunTests,
+
+    [switch]$OpenDashboard
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,6 +71,7 @@ $accountCsv = Join-Path $CommonFilesRoot "mt5_risk_account_utc_$Login.csv"
 $positionsCsv = Join-Path $CommonFilesRoot "mt5_risk_positions_utc_$Login.csv"
 $symbolsCsv = Join-Path $CommonFilesRoot "mt5_risk_symbols_utc_$Login.csv"
 $journal = Join-Path $RuntimeRoot "events.jsonl"
+$dashboard = Join-Path $RuntimeRoot "dashboard\index.html"
 
 foreach ($path in @($HistoricalOutcomes, $Profile, $accountCsv, $positionsCsv, $symbolsCsv)) {
     if (-not (Test-Path $path)) {
@@ -81,9 +87,14 @@ if ($Correlations -and -not (Test-Path $Correlations)) {
 if ($ServerUTCOffsetHours -lt -14 -or $ServerUTCOffsetHours -gt 14) {
     throw "ServerUTCOffsetHours must be between -14 and 14"
 }
+if ($DashboardCandidateLimit -lt 1) {
+    throw "DashboardCandidateLimit must be positive"
+}
 
 if ($RunTests) {
     & $python -m pytest -q `
+        ".\tests\test_live_signal_runtime_v122.py" `
+        ".\tests\test_live_signal_dashboard.py" `
         ".\tests\test_live_signal_runtime.py" `
         ".\tests\test_signal_passport_factory.py" `
         ".\tests\test_signal_to_risk_bridge.py" `
@@ -91,12 +102,12 @@ if ($RunTests) {
         ".\tests\test_risk_manager.py" `
         ".\tests\test_signal_intelligence.py"
     if ($LASTEXITCODE -ne 0) {
-        throw "Live Signal Runtime tests failed"
+        throw "Live Signal Runtime and Dashboard tests failed"
     }
 }
 
 $arguments = @(
-    "-m", "trademind.live_signal_runtime",
+    "-m", "trademind.live_signal_runtime_v122",
     "--login", $Login,
     "--volume-source-dir", $VolumeSourceDir,
     "--canonical-volume", $CanonicalVolume,
@@ -121,8 +132,21 @@ if ($Correlations) {
 
 & $python @arguments
 if ($LASTEXITCODE -ne 0) {
-    throw "Live Signal Runtime execution failed"
+    throw "Live Signal Runtime v1.22.1 execution failed"
+}
+
+& $python -m trademind.live_signal_dashboard `
+    --runtime-root $RuntimeRoot `
+    --login $Login `
+    --candidate-limit $DashboardCandidateLimit
+if ($LASTEXITCODE -ne 0) {
+    throw "Live Signal Dashboard execution failed"
 }
 
 Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
+Write-Host "Dashboard: $dashboard" -ForegroundColor Cyan
 Write-Host "Read-only. Orders OFF. Publication OFF. Historical archive unchanged." -ForegroundColor Green
+
+if ($OpenDashboard -and (Test-Path $dashboard)) {
+    Start-Process $dashboard
+}

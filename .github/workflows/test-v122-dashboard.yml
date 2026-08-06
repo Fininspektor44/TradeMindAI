@@ -1,0 +1,77 @@
+name: Test TradeMind v1.22 Live Signal Dashboard
+
+on:
+  pull_request:
+    paths:
+      - "src/trademind/live_signal_dashboard.py"
+      - "src/trademind/live_signal_runtime_v122.py"
+      - "scripts/run_v121_live_signal_runtime.ps1"
+      - "scripts/repair_v122_live_runtime.ps1"
+      - "tests/test_live_signal_dashboard.py"
+      - "tests/test_live_signal_runtime_v122.py"
+      - "pyproject.toml"
+      - ".github/workflows/test-v122-dashboard.yml"
+  push:
+    branches:
+      - "feature/v1.22-live-signal-dashboard"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: >-
+          ruff check
+          --extend-per-file-ignores "src/trademind/live_signal_runtime_v122.py:F401"
+          src/trademind/live_signal_dashboard.py
+          src/trademind/live_signal_runtime_v122.py
+          tests/test_live_signal_dashboard.py
+          tests/test_live_signal_runtime_v122.py
+      - name: Tests
+        run: >-
+          pytest -q
+          tests/test_live_signal_runtime_v122.py
+          tests/test_live_signal_dashboard.py
+          tests/test_live_signal_runtime.py
+          tests/test_signal_passport_factory.py
+          tests/test_signal_to_risk_bridge.py
+          tests/test_mt5_risk_adapter.py
+          tests/test_risk_manager.py
+          tests/test_signal_intelligence.py
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          foreach ($path in @(
+            "scripts/run_v121_live_signal_runtime.ps1",
+            "scripts/repair_v122_live_runtime.ps1"
+          )) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$path`: $($_.Message)" }
+              exit 1
+            }
+          }
+      - name: Verify read-only boundary
+        shell: pwsh
+        run: |
+          $source = (
+            (Get-Content "src/trademind/live_signal_dashboard.py" -Raw) +
+            (Get-Content "src/trademind/live_signal_runtime_v122.py" -Raw)
+          )
+          foreach ($token in @("OrderSend(", "PositionClose(", "PositionModify(", "import MetaTrader5", "import requests")) {
+            if ($source.Contains($token)) {
+              throw "Forbidden execution or broker-client token found: $token"
+            }
+          }
