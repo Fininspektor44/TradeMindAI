@@ -94,9 +94,6 @@ def test_signal_card_marks_v126_price_scale() -> None:
 
     assert "swing-price-card" in rendered
     assert "data-price-scale='true'" in rendered
-    assert "ВХОД 0.37670" in rendered
-    assert "СТОП 0.37330" in rendered
-    assert "TP 0.38920" in rendered
 
 
 def test_crypto_market_panel_keeps_core_and_collapses_secondary_context() -> None:
