@@ -1,0 +1,94 @@
+name: Test TradeMind v1.26 H1 Swing Opportunity
+
+on:
+  pull_request:
+    paths:
+      - "src/trademind/crypto_h1_swing_filter.py"
+      - "src/trademind/crypto_h1_swing_incremental.py"
+      - "src/trademind/product_ui_v126.py"
+      - "tests/test_crypto_h1_swing_filter.py"
+      - "tests/test_crypto_h1_swing_incremental.py"
+      - "tests/test_product_ui_v126.py"
+      - "scripts/run_v121_live_signal_runtime.ps1"
+      - "pyproject.toml"
+      - ".github/workflows/test-v126-h1-swing-opportunity.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: |
+          ruff check src/trademind/crypto_h1_swing_filter.py tests/test_crypto_h1_swing_filter.py
+          ruff check src/trademind/crypto_h1_swing_incremental.py tests/test_crypto_h1_swing_incremental.py
+          ruff check src/trademind/product_ui_v126.py tests/test_product_ui_v126.py
+      - name: Tests
+        run: >-
+          pytest -q
+          tests/test_crypto_h1_swing_filter.py
+          tests/test_crypto_h1_swing_incremental.py
+          tests/test_product_ui_v126.py
+          tests/test_crypto_market_structure.py
+          tests/test_crypto_signal_adapter_v125.py
+          tests/test_crypto_structure_incremental.py
+          tests/test_product_ui_v1252.py
+          tests/test_product_ui_v125.py
+          tests/test_crypto_signal_adapter.py
+          tests/test_product_ui_v124.py
+          tests/test_product_ui_v1235.py
+          tests/test_product_ui_v1234.py
+          tests/test_product_ui_v1233.py
+          tests/test_product_ui_v1232.py
+          tests/test_product_ui_v1231.py
+          tests/test_product_ui.py
+          tests/test_live_signal_runtime_v122.py
+          tests/test_live_signal_dashboard.py
+          tests/test_live_signal_runtime.py
+          tests/test_signal_passport_factory.py
+          tests/test_signal_to_risk_bridge.py
+          tests/test_mt5_risk_adapter.py
+          tests/test_risk_manager.py
+          tests/test_signal_intelligence.py
+      - name: Parse PowerShell runner
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "scripts/run_v121_live_signal_runtime.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+      - name: Verify read-only boundary
+        shell: pwsh
+        run: |
+          $source = @(
+            Get-Content "src/trademind/crypto_h1_swing_filter.py" -Raw
+            Get-Content "src/trademind/crypto_h1_swing_incremental.py" -Raw
+            Get-Content "src/trademind/product_ui_v126.py" -Raw
+          ) -join "`n"
+          foreach ($token in @(
+            "OrderSend(",
+            "PositionClose(",
+            "PositionModify(",
+            "import MetaTrader5",
+            "import requests",
+            "import pybit",
+            "HTTP(",
+            "WebSocket("
+          )) {
+            if ($source.Contains($token)) {
+              throw "Forbidden execution, broker-client or network token found: $token"
+            }
+          }
