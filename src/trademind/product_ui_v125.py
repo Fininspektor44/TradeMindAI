@@ -322,7 +322,6 @@ def safety_contract() -> Mapping[str, Any]:
         "publication_enabled": False,
         "broker_api_called": False,
         "future_bars_used": False,
-        "crypto_position_sizing_available": False,
     }
 
 
