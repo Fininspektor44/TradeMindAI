@@ -24,6 +24,15 @@ param(
     [string]$Correlations = ".\config\mt5\correlation_groups_v1.json",
 
     [Parameter(Mandatory=$false)]
+    [string]$BybitBars = ".\data\bybit_v1_9\bybit_bars.csv",
+
+    [Parameter(Mandatory=$false)]
+    [string]$BybitShadowDir = ".\data\bybit_shadow_v1_10",
+
+    [Parameter(Mandatory=$false)]
+    [string]$CryptoRoot = ".\data\crypto_signal_intelligence_v1_24",
+
+    [Parameter(Mandatory=$false)]
     [int]$ServerUTCOffsetHours = 3,
 
     [Parameter(Mandatory=$false)]
@@ -49,6 +58,9 @@ param(
 
     [Parameter(Mandatory=$false)]
     [int]$ProductSignalLimit = 24,
+
+    [Parameter(Mandatory=$false)]
+    [int]$CryptoSignalLimit = 24,
 
     [Parameter(Mandatory=$false)]
     [int]$ProductCandleLimit = 48,
@@ -79,6 +91,12 @@ $symbolsCsv = Join-Path $CommonFilesRoot "mt5_risk_symbols_utc_$Login.csv"
 $journal = Join-Path $RuntimeRoot "events.jsonl"
 $technicalDashboard = Join-Path $RuntimeRoot "dashboard\index.html"
 $productUi = Join-Path $RuntimeRoot "product\index.html"
+$bybitDecisions = Join-Path $BybitShadowDir "decisions.csv"
+$bybitSignals = Join-Path $BybitShadowDir "signals.csv"
+$cryptoCandidates = Join-Path $CryptoRoot "candidates.jsonl"
+$cryptoOutcomes = Join-Path $CryptoRoot "outcomes.jsonl"
+$cryptoFactory = Join-Path $CryptoRoot "factory"
+$cryptoPassports = Join-Path $cryptoFactory "passports"
 
 foreach ($path in @($HistoricalOutcomes, $Profile, $accountCsv, $positionsCsv, $symbolsCsv)) {
     if (-not (Test-Path $path)) {
@@ -100,12 +118,17 @@ if ($DashboardCandidateLimit -lt 1) {
 if ($ProductSignalLimit -lt 1) {
     throw "ProductSignalLimit must be positive"
 }
+if ($CryptoSignalLimit -lt 1) {
+    throw "CryptoSignalLimit must be positive"
+}
 if ($ProductCandleLimit -lt 1) {
     throw "ProductCandleLimit must be positive"
 }
 
 if ($RunTests) {
     & $python -m pytest -q `
+        ".\tests\test_crypto_signal_adapter.py" `
+        ".\tests\test_product_ui_v124.py" `
         ".\tests\test_product_ui_v1235.py" `
         ".\tests\test_product_ui_v1234.py" `
         ".\tests\test_product_ui_v1233.py" `
@@ -121,7 +144,7 @@ if ($RunTests) {
         ".\tests\test_risk_manager.py" `
         ".\tests\test_signal_intelligence.py"
     if ($LASTEXITCODE -ne 0) {
-        throw "Live Signal Runtime, Dashboard and Product UI tests failed"
+        throw "Live Signal Runtime, Crypto Adapter and Product UI tests failed"
     }
 }
 
@@ -162,18 +185,55 @@ if ($LASTEXITCODE -ne 0) {
     throw "Live Signal Dashboard execution failed"
 }
 
-& $python -m trademind.product_ui_v1235 `
+$cryptoSourceReady = (
+    (Test-Path $BybitBars) -and
+    (Test-Path $bybitDecisions) -and
+    (Test-Path $bybitSignals)
+)
+if ($cryptoSourceReady) {
+    & $python -m trademind.crypto_signal_adapter `
+        --decisions $bybitDecisions `
+        --signals $bybitSignals `
+        --bars $BybitBars `
+        --output-dir $CryptoRoot `
+        --cost-r $CostR.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Crypto Signal Adapter failed. Forex runtime remains available."
+    }
+    elseif ((Test-Path $cryptoCandidates) -and (Test-Path $cryptoOutcomes)) {
+        & $python -m trademind.signal_passport_factory `
+            --candidates $cryptoCandidates `
+            --outcomes $cryptoOutcomes `
+            --output-dir $cryptoFactory `
+            --passports-dir $cryptoPassports `
+            --cost-r $CostR.ToString([System.Globalization.CultureInfo]::InvariantCulture) `
+            --maximum-candidate-age-seconds $MaximumCandidateAgeSeconds.ToString([System.Globalization.CultureInfo]::InvariantCulture) `
+            --candidate-limit 200
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Crypto Passport Factory failed. Crypto remains shadow-only in Product UI."
+        }
+    }
+}
+else {
+    Write-Warning "Bybit shadow sources not found. Product UI will show Forex only until crypto files appear."
+}
+
+& $python -m trademind.product_ui_v124 `
     --runtime-root $RuntimeRoot `
-    --limit $ProductSignalLimit `
+    --crypto-root $CryptoRoot `
+    --bybit-bars $BybitBars `
+    --fx-limit $ProductSignalLimit `
+    --crypto-limit $CryptoSignalLimit `
     --candle-limit $ProductCandleLimit
 if ($LASTEXITCODE -ne 0) {
-    throw "TradeMind Product UI v1.23.5 execution failed"
+    throw "TradeMind Product UI v1.24 execution failed"
 }
 
 Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
+Write-Host "Crypto Intelligence: $CryptoRoot" -ForegroundColor Cyan
 Write-Host "Product UI: $productUi" -ForegroundColor Cyan
 Write-Host "Technical dashboard: $technicalDashboard" -ForegroundColor DarkGray
-Write-Host "Read-only. Orders OFF. Publication OFF. Historical archive unchanged." -ForegroundColor Green
+Write-Host "Read-only. Forex + Crypto. Orders OFF. Publication OFF. Source archives unchanged." -ForegroundColor Green
 
 if ($OpenDashboard -and (Test-Path $productUi)) {
     Start-Process $productUi
