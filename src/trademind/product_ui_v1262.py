@@ -86,7 +86,11 @@ def _price_scale_svg(candidate: Mapping[str, Any]) -> str:
             rf"<path class='trade-tag-connector {css}' "
             rf"d='M 488 {line_y:.2f} L 495 {tag_y:.2f}'/>"
         )
-        svg = line_token.sub(rf"\1{connector}", svg, count=1)
+        svg = line_token.sub(
+            lambda match, connector=connector: match.group(1) + connector,
+            svg,
+            count=1,
+        )
         svg = re.sub(
             rf"(<rect class='trade-tag {css}' x='[^']+' )y='[^']+'",
             rf"\1y='{tag_y - 10:.2f}'",
