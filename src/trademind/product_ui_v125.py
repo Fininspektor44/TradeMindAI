@@ -1,4 +1,4 @@
-"""TradeMind Product UI v1.25 with native crypto market structure."""
+"""TradeMind Product UI v1.25.2 with risk-safe crypto presentation."""
 
 from __future__ import annotations
 
@@ -12,11 +12,19 @@ from typing import Any, Mapping, Sequence
 
 from trademind import product_ui_v124 as previous
 
-VERSION = "1.25.0"
+VERSION = "1.25.2"
+_BASE_ENTRIES_HTML = previous.base._entries_html
+_BASE_RISK_CANDIDATE_HTML = previous.base._risk_candidate_html
 
 
 def _mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _sequence(value: Any) -> list[Any]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return list(value)
+    return []
 
 
 def _text(value: Any) -> str:
@@ -67,6 +75,69 @@ def _price(value: Any) -> str:
         return "—"
     digits = 2 if abs(number) >= 100 else 5
     return _number(number, digits)
+
+
+def _risk_safe_crypto_plan(value: Any) -> dict[str, Any]:
+    """Remove allocation-looking fields until account-specific sizing exists."""
+
+    plan = _mapping(value)
+    normalized = dict(plan)
+    entries: list[dict[str, Any]] = []
+    for raw in _sequence(plan.get("entries")):
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        item.pop("weight", None)
+        item.pop("allocation", None)
+        entries.append(item)
+    normalized["entries"] = entries
+    normalized["position_sizing_available"] = False
+    normalized["position_sizing_state"] = "BYBIT_RISK_MANAGER_NOT_CONNECTED"
+    normalized["position_sizing_note"] = (
+        "Размер позиции не рассчитан. Bybit Risk Manager не подключён."
+    )
+    return normalized
+
+
+def _entries_html(plan: Mapping[str, Any]) -> str:
+    if plan.get("position_sizing_available") is not False:
+        return _BASE_ENTRIES_HTML(plan)
+
+    entries = _sequence(plan.get("entries"))
+    rows: list[str] = []
+    if not entries:
+        rows.append(
+            "<div class='entry-row'><span>Исследовательский вход</span>"
+            f"<b>{previous.base.fmt(plan.get('average_entry'), 5)}</b>"
+            "<small>Точка наблюдения без расчёта объёма</small></div>"
+        )
+    else:
+        for index, raw in enumerate(entries, start=1):
+            item = _mapping(raw)
+            rationale = previous.base.text(item.get("rationale")) or "Исследовательская точка входа"
+            rows.append(
+                "<div class='entry-row'>"
+                f"<span>Вход {index}</span>"
+                f"<b>{previous.base.fmt(item.get('price'), 5)}</b>"
+                f"<small>{html.escape(rationale)}</small>"
+                "</div>"
+            )
+
+    note = previous.base.text(plan.get("position_sizing_note")) or (
+        "Размер позиции не рассчитан. Bybit Risk Manager не подключён."
+    )
+    rows.append(f"<div class='muted-box crypto-sizing-note'>{html.escape(note)}</div>")
+    return "".join(rows)
+
+
+def _risk_candidate_html(candidate: Mapping[str, Any], decision: Mapping[str, Any]) -> str:
+    if str(candidate.get("asset_class") or "").upper() != "CRYPTO":
+        return _BASE_RISK_CANDIDATE_HTML(candidate, decision)
+    return (
+        "<div class='muted-box'>Bybit Risk Manager не подключён. "
+        "Размер позиции, риск деньгами, плечо и маржа не рассчитаны. "
+        "Карточка остаётся исследовательским наблюдением, а не рекомендацией объёма.</div>"
+    )
 
 
 def _crypto_market_html(candidate: Mapping[str, Any]) -> str:
@@ -160,17 +231,25 @@ def build_payload(
                 and str(item.get("asset_class") or "").upper() == "CRYPTO"
             ):
                 item["setup_family_label"] = "Крипто Structure + Flow"
+                item["plan"] = _risk_safe_crypto_plan(item.get("plan"))
     return payload
 
 
 def render(data: Mapping[str, Any]) -> str:
-    original = previous._market_html
+    original_market = previous._market_html
+    original_entries = previous.base._entries_html
+    original_risk = previous.base._risk_candidate_html
     try:
         previous._market_html = _market_html
+        previous.base._entries_html = _entries_html
+        previous.base._risk_candidate_html = _risk_candidate_html
         page = previous.render(data)
     finally:
-        previous._market_html = original
-    page = page.replace("TradeMind Product UI v1.24", "TradeMind Product UI v1.25")
+        previous._market_html = original_market
+        previous.base._entries_html = original_entries
+        previous.base._risk_candidate_html = original_risk
+    page = page.replace("TradeMind Product UI v1.24", "TradeMind Product UI v1.25.2")
+    page = page.replace("TradeMind Product UI v1.25", "TradeMind Product UI v1.25.2")
     page = page.replace(
         "Движок фильтрует Forex и Crypto и не показывает сырой шум как готовый сигнал.",
         "Движок проверяет Forex и нативную структуру Crypto, затем допускает только "
@@ -226,6 +305,7 @@ def run_product_ui(
                 "crypto_signals": base.integer(crypto_status.get("displayed")),
                 "crypto_state": crypto_status.get("state"),
                 "native_crypto_structure": True,
+                "crypto_position_sizing_available": False,
                 "read_only": True,
             },
             ensure_ascii=False,
@@ -242,12 +322,13 @@ def safety_contract() -> Mapping[str, Any]:
         "publication_enabled": False,
         "broker_api_called": False,
         "future_bars_used": False,
+        "crypto_position_sizing_available": False,
     }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="TradeMind Product UI v1.25 Forex + native Crypto structure"
+        description="TradeMind Product UI v1.25.2 Forex + risk-safe Crypto structure"
     )
     parser.add_argument(
         "--runtime-root",
@@ -279,14 +360,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             candle_limit=args.candle_limit,
         )
     except (OSError, ValueError, TypeError, csv.Error, json.JSONDecodeError) as exc:
-        print(f"TradeMind Product UI v1.25 failed: {exc}")
+        print(f"TradeMind Product UI v1.25.2 failed: {exc}")
         return 1
 
     summary = previous.base._mapping(payload.get("summary"))
-    print("TradeMind Product UI v1.25")
-    print("Forex + native Crypto structure. Read-only. Orders OFF. Publication OFF.")
+    print("TradeMind Product UI v1.25.2")
+    print("Risk-safe Crypto UI. Read-only. Orders OFF. Publication OFF.")
     print(f"Forex displayed: {previous.base.integer(summary.get('forex_displayed'))}")
     print(f"Crypto displayed: {previous.base.integer(summary.get('crypto_displayed'))}")
+    print("Crypto position sizing: NOT CALCULATED")
     print(f"Product UI: {index}")
     if args.open and hasattr(os, "startfile"):
         os.startfile(index)  # type: ignore[attr-defined]
