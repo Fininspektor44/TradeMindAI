@@ -135,6 +135,7 @@ if ($RunTests) {
     & $python -m pytest -q `
         ".\tests\test_crypto_h1_swing_filter.py" `
         ".\tests\test_crypto_h1_swing_incremental.py" `
+        ".\tests\test_product_ui_v1262.py" `
         ".\tests\test_product_ui_v126.py" `
         ".\tests\test_crypto_market_structure.py" `
         ".\tests\test_crypto_signal_adapter_v125.py" `
@@ -230,7 +231,7 @@ else {
     Write-Warning "Bybit decisions or bars not found. Product UI will show Forex only until crypto files appear."
 }
 
-& $python -m trademind.product_ui_v126 `
+& $python -m trademind.product_ui_v1262 `
     --runtime-root $RuntimeRoot `
     --crypto-root $CryptoRoot `
     --bybit-bars $BybitBars `
@@ -238,7 +239,7 @@ else {
     --crypto-limit $CryptoSignalLimit `
     --candle-limit $ProductCandleLimit
 if ($LASTEXITCODE -ne 0) {
-    throw "TradeMind Product UI v1.26 execution failed"
+    throw "TradeMind Product UI v1.26.2 execution failed"
 }
 
 Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
