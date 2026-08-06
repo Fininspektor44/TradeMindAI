@@ -11,6 +11,7 @@ on:
       - "tests/test_crypto_signal_adapter_v125.py"
       - "tests/test_crypto_structure_incremental.py"
       - "tests/test_product_ui_v125.py"
+      - "tests/test_product_ui_v1252.py"
       - "scripts/run_v121_live_signal_runtime.ps1"
       - "pyproject.toml"
       - ".github/workflows/test-v125-crypto-market-structure.yml"
@@ -31,13 +32,14 @@ jobs:
           ruff check src/trademind/crypto_market_structure.py tests/test_crypto_market_structure.py
           ruff check src/trademind/crypto_signal_adapter_v125.py tests/test_crypto_signal_adapter_v125.py
           ruff check src/trademind/crypto_structure_incremental.py tests/test_crypto_structure_incremental.py
-          ruff check src/trademind/product_ui_v125.py tests/test_product_ui_v125.py
+          ruff check src/trademind/product_ui_v125.py tests/test_product_ui_v125.py tests/test_product_ui_v1252.py
       - name: Tests
         run: >-
           pytest -q
           tests/test_crypto_market_structure.py
           tests/test_crypto_signal_adapter_v125.py
           tests/test_crypto_structure_incremental.py
+          tests/test_product_ui_v1252.py
           tests/test_product_ui_v125.py
           tests/test_crypto_signal_adapter.py
           tests/test_product_ui_v124.py
