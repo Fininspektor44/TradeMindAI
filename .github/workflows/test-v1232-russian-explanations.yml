@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "src/trademind/product_ui_v1232.py"
+      - "src/trademind/product_ui_v1232_entry.py"
       - "tests/test_product_ui_v1232.py"
       - "scripts/run_v121_live_signal_runtime.ps1"
       - "pyproject.toml"
@@ -25,7 +26,7 @@ jobs:
       - name: Ruff
         run: |
           ruff check --ignore F401 src/trademind/product_ui_v1232.py
-          ruff check tests/test_product_ui_v1232.py
+          ruff check src/trademind/product_ui_v1232_entry.py tests/test_product_ui_v1232.py
       - name: Tests
         run: >-
           pytest -q
@@ -57,7 +58,10 @@ jobs:
       - name: Verify read-only boundary
         shell: pwsh
         run: |
-          $source = Get-Content "src/trademind/product_ui_v1232.py" -Raw
+          $source = @(
+            Get-Content "src/trademind/product_ui_v1232.py" -Raw
+            Get-Content "src/trademind/product_ui_v1232_entry.py" -Raw
+          ) -join "`n"
           foreach ($token in @("OrderSend(", "PositionClose(", "PositionModify(", "import MetaTrader5", "import requests")) {
             if ($source.Contains($token)) {
               throw "Forbidden execution or broker-client token found: $token"
