@@ -106,6 +106,7 @@ if ($ProductCandleLimit -lt 1) {
 
 if ($RunTests) {
     & $python -m pytest -q `
+        ".\tests\test_product_ui_v1235.py" `
         ".\tests\test_product_ui_v1234.py" `
         ".\tests\test_product_ui_v1233.py" `
         ".\tests\test_product_ui_v1232.py" `
@@ -161,12 +162,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "Live Signal Dashboard execution failed"
 }
 
-& $python -m trademind.product_ui_v1234 `
+& $python -m trademind.product_ui_v1235 `
     --runtime-root $RuntimeRoot `
     --limit $ProductSignalLimit `
     --candle-limit $ProductCandleLimit
 if ($LASTEXITCODE -ne 0) {
-    throw "TradeMind Product UI v1.23.4 execution failed"
+    throw "TradeMind Product UI v1.23.5 execution failed"
 }
 
 Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
