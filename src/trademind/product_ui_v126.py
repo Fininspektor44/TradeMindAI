@@ -14,6 +14,7 @@ from trademind import product_ui_v125 as previous
 
 VERSION = "1.26.0"
 SETUP_FAMILY = "CRYPTO_H1_SWING_M5_VOLUME_BREAKOUT"
+base = previous.previous.base
 _BASE_BUILD_PAYLOAD = previous.build_payload
 _BASE_RENDER = previous.render
 _BASE_MARKET_HTML = previous._market_html
@@ -165,7 +166,7 @@ def run_product_ui(
         previous.VERSION = original_version
 
     status_path = runtime_root.expanduser().resolve() / "product" / "status.json"
-    status = previous.base.read_json(status_path)
+    status = base.read_json(status_path)
     status = dict(status)
     status.update(
         {
@@ -179,7 +180,7 @@ def run_product_ui(
             "read_only": True,
         }
     )
-    previous.base.atomic_write(
+    base.atomic_write(
         status_path,
         json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True),
     )
@@ -234,11 +235,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"TradeMind Product UI v1.26 failed: {exc}")
         return 1
 
-    summary = previous.base._mapping(payload.get("summary"))
+    summary = base._mapping(payload.get("summary"))
     print("TradeMind Product UI v1.26")
     print("H1 Swing + M5 volume breakout. Read-only. Orders OFF. Publication OFF.")
-    print(f"Forex displayed: {previous.base.integer(summary.get('forex_displayed'))}")
-    print(f"Crypto displayed: {previous.base.integer(summary.get('crypto_displayed'))}")
+    print(f"Forex displayed: {base.integer(summary.get('forex_displayed'))}")
+    print(f"Crypto displayed: {base.integer(summary.get('crypto_displayed'))}")
     print("Crypto position sizing: NOT CALCULATED")
     print(f"Product UI: {index}")
     if args.open and hasattr(os, "startfile"):
