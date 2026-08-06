@@ -136,6 +136,7 @@ if ($RunTests) {
         ".\tests\test_crypto_market_structure.py" `
         ".\tests\test_crypto_signal_adapter_v125.py" `
         ".\tests\test_crypto_structure_incremental.py" `
+        ".\tests\test_product_ui_v1252.py" `
         ".\tests\test_product_ui_v125.py" `
         ".\tests\test_crypto_signal_adapter.py" `
         ".\tests\test_product_ui_v124.py" `
@@ -237,14 +238,14 @@ else {
     --crypto-limit $CryptoSignalLimit `
     --candle-limit $ProductCandleLimit
 if ($LASTEXITCODE -ne 0) {
-    throw "TradeMind Product UI v1.25 execution failed"
+    throw "TradeMind Product UI v1.25.2 execution failed"
 }
 
 Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
 Write-Host "Crypto Structure Intelligence: $CryptoRoot" -ForegroundColor Cyan
 Write-Host "Product UI: $productUi" -ForegroundColor Cyan
 Write-Host "Technical dashboard: $technicalDashboard" -ForegroundColor DarkGray
-Write-Host "Read-only. Incremental Crypto structure. Orders OFF. Publication OFF. Source archives unchanged." -ForegroundColor Green
+Write-Host "Read-only. Crypto sizing not calculated. Orders OFF. Publication OFF. Source archives unchanged." -ForegroundColor Green
 
 if ($OpenDashboard -and (Test-Path $productUi)) {
     Start-Process $productUi
