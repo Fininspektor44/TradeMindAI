@@ -39,16 +39,27 @@ Register-ScheduledTask `
     -Description "TradeMind read-only BE shadow statistics and counterfactual runtime" `
     -Force | Out-Null
 
+Start-ScheduledTask -TaskName $TaskName
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Seconds 1
+    $task = Get-ScheduledTask -TaskName $TaskName
+    if ($task.State -ne "Running") {
+        break
+    }
+}
+
+$info = Get-ScheduledTask -TaskName $TaskName | Get-ScheduledTaskInfo
+$info | Select-Object LastRunTime,NextRunTime,LastTaskResult,NumberOfMissedRuns
+if ($info.LastTaskResult -ne 0) {
+    throw "Unified v1.30 task verification failed with result $($info.LastTaskResult). Legacy task kept."
+}
+
 $legacy = Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue
 if ($null -ne $legacy -and $legacy.State -ne "Disabled") {
     Disable-ScheduledTask -TaskName $LegacyTaskName | Out-Null
-    Write-Host "Legacy task disabled: $LegacyTaskName" -ForegroundColor Yellow
+    Write-Host "Legacy task disabled after v1.30 verification: $LegacyTaskName" `
+        -ForegroundColor Yellow
 }
-
-Start-ScheduledTask -TaskName $TaskName
-Start-Sleep -Seconds 3
-$info = Get-ScheduledTask -TaskName $TaskName | Get-ScheduledTaskInfo
-$info | Select-Object LastRunTime,NextRunTime,LastTaskResult,NumberOfMissedRuns
 
 Write-Host "`nInstalled: $TaskName" -ForegroundColor Green
 Write-Host "Interval: 1 minute" -ForegroundColor Green
