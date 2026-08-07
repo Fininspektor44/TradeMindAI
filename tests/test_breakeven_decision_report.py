@@ -48,6 +48,42 @@ def test_summary_stays_collecting_below_sample_threshold() -> None:
     assert summary["classes"] == {"LOSS_AVOIDED_BY_BE": 1, "WINNER_CUT_BY_BE": 1}
 
 
+def test_coverage_excludes_baskets_closed_before_monitor_start() -> None:
+    sample_rows = [
+        {
+            "basket_closed_at": "2026-08-07T10:00:00+00:00",
+            "mapped_shadow_epochs": "0",
+            "effect_class": "NO_SHADOW_COVERAGE",
+        },
+        {
+            "basket_closed_at": "2026-08-07T12:00:00+00:00",
+            "mapped_shadow_epochs": "1",
+            "effect_class": "NOT_TRIGGERED",
+        },
+        {
+            "basket_closed_at": "2026-08-07T13:00:00+00:00",
+            "mapped_shadow_epochs": "1",
+            "effect_class": "NOT_TRIGGERED",
+        },
+    ]
+    runtime = {
+        "login": "37365712",
+        "shadow": {"monitor_started_at": "2026-08-07T11:00:00+00:00"},
+    }
+    counter = {
+        "completed_baskets": 3,
+        "covered_completed_baskets": 2,
+        "affected_by_shadow_be_baskets": 0,
+    }
+    summary = report.build_summary(runtime, counter, sample_rows)
+    assert summary["sample"]["all_completed_baskets"] == 3
+    assert summary["sample"]["completed_baskets"] == 2
+    assert summary["sample"]["pre_monitor_completed_baskets"] == 1
+    assert summary["sample"]["covered_completed_baskets"] == 2
+    assert summary["sample"]["coverage_ratio"] == 1.0
+    assert summary["sample"]["coverage_basis"] == "CLOSED_SINCE_MONITOR_START"
+
+
 def test_summary_becomes_ready_only_with_coverage_and_sample() -> None:
     runtime = {"login": "37365712"}
     counter = {
@@ -81,7 +117,7 @@ def test_generate_report_writes_json_and_html(tmp_path: Path) -> None:
     assert summary["state"] == "OK"
     assert (out / "summary.json").is_file()
     html = (out / "index.html").read_text(encoding="utf-8")
-    assert "TradeMind v1.31" in html
+    assert "TradeMind v1.31.1" in html
     assert "READ-ONLY" in html
     assert "EURUSD" in html
 
