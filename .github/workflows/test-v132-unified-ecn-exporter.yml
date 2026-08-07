@@ -5,6 +5,7 @@ on:
     paths:
       - "mt5/exporters/**"
       - "scripts/install_v132_unified_ecn_exporter.ps1"
+      - "scripts/verify_v132_unified_outputs.ps1"
       - "tests/test_unified_ecn_exporter_v132.py"
       - ".github/workflows/test-v132-unified-ecn-exporter.yml"
   push:
@@ -24,15 +25,20 @@ jobs:
       - name: PowerShell syntax
         shell: pwsh
         run: |
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path "scripts/install_v132_unified_ecn_exporter.ps1"),
-            [ref]$null,
-            [ref]$errors
-          )
-          if ($errors.Count) {
-            $errors | Format-List | Out-String | Write-Error
-            exit 1
+          foreach ($file in @(
+            "scripts/install_v132_unified_ecn_exporter.ps1",
+            "scripts/verify_v132_unified_outputs.ps1"
+          )) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file),
+              [ref]$null,
+              [ref]$errors
+            )
+            if ($errors.Count) {
+              $errors | Format-List | Out-String | Write-Error
+              exit 1
+            }
           }
       - name: Read-only token gate
         shell: pwsh
