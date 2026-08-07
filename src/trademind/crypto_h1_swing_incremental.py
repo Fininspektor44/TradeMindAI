@@ -2,8 +2,8 @@
 
 Newest unseen Bybit shadow decisions are evaluated first. Every decision becomes
 one immutable audit record and either an eligible candidate or an explicit
-rejection, so the minute scheduler never repeats old work. Outcomes remain empty
-until a dedicated forward-only v1.26 paper journal is introduced.
+rejection, so the minute scheduler never repeats old work. Forward outcomes are
+owned by the dedicated v1.27 journal and must never be erased here.
 """
 
 from __future__ import annotations
@@ -291,7 +291,9 @@ def run_incremental(
     )
 
     source._atomic_text(root / "candidates.jsonl", _jsonl_text(candidates))
-    source._atomic_text(root / "outcomes.jsonl", "")
+    outcomes_path = root / "outcomes.jsonl"
+    if not outcomes_path.exists():
+        source._atomic_text(outcomes_path, "")
     source._atomic_text(root / "rejections.jsonl", _jsonl_text(rejections))
     source._atomic_text(root / "opportunity_audit.jsonl", _jsonl_text(audit))
     source._atomic_json(root / "errors.json", {"errors": errors})
@@ -301,44 +303,56 @@ def run_incremental(
         str(row.get("decision_id") or "") not in attempted_after for row in decisions
     )
     captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    source._atomic_json(
-        root / "status.json",
-        {
-            "schema_version": VERSION,
-            "state": "BACKFILLING" if remaining else "OK",
-            "updated_at": captured_at.isoformat(),
-            "asset_class": "CRYPTO",
-            "venue": "BYBIT",
-            "setup_family": SETUP_FAMILY,
-            "processed_batch": len(batch),
-            "batch_size": batch_size,
-            "remaining_decisions": remaining,
-            "eligible_candidates": len(candidates),
-            "rejected_decisions": len(rejections),
-            "errors": len(errors),
-            "recovered_legacy_action_errors": recovered_legacy_action_errors,
-            "outcomes": 0,
-            "evidence_state": "FORWARD_ONLY_JOURNAL_NOT_STARTED",
-            "decision_chain": (
-                "H1_DIRECTION>M15_VETO>M5_LAST_EXTREMUM_CLOSE_BREAK>"
-                "M5_VOLUME_DELTA>H1_TARGET_SPACE"
-            ),
-            "thresholds": {
-                "minimum_volume_ratio": 1.20,
-                "minimum_target_rr": 1.80,
-                "minimum_target_atr_h1": 0.70,
-            },
-            "safety": {
-                "read_only": True,
-                "orders_enabled": False,
-                "publication_enabled": False,
-                "exchange_api_called": False,
-                "source_files_modified": False,
-                "future_bars_used": False,
-                "account_sizing_calculated": False,
-            },
-        },
+    forward_status = _read_json(root / "forward_journal_status.json")
+    evidence_state = str(
+        forward_status.get("evidence_state") or "FORWARD_ONLY_JOURNAL_NOT_STARTED"
     )
+    outcomes_total = int(forward_status.get("outcomes") or 0)
+    status = {
+        "schema_version": VERSION,
+        "state": "BACKFILLING" if remaining else "OK",
+        "updated_at": captured_at.isoformat(),
+        "asset_class": "CRYPTO",
+        "venue": "BYBIT",
+        "setup_family": SETUP_FAMILY,
+        "processed_batch": len(batch),
+        "batch_size": batch_size,
+        "remaining_decisions": remaining,
+        "eligible_candidates": len(candidates),
+        "rejected_decisions": len(rejections),
+        "errors": len(errors),
+        "recovered_legacy_action_errors": recovered_legacy_action_errors,
+        "outcomes": outcomes_total,
+        "evidence_state": evidence_state,
+        "decision_chain": (
+            "H1_DIRECTION>M15_VETO>M5_LAST_EXTREMUM_CLOSE_BREAK>"
+            "M5_VOLUME_DELTA>H1_TARGET_SPACE"
+        ),
+        "thresholds": {
+            "minimum_volume_ratio": 1.20,
+            "minimum_target_rr": 1.80,
+            "minimum_target_atr_h1": 0.70,
+        },
+        "safety": {
+            "read_only": True,
+            "orders_enabled": False,
+            "publication_enabled": False,
+            "exchange_api_called": False,
+            "source_files_modified": False,
+            "future_bars_used": False,
+            "account_sizing_calculated": False,
+        },
+    }
+    if forward_status:
+        status.update(
+            {
+                "forward_pending": int(forward_status.get("pending") or 0),
+                "forward_ambiguous": int(forward_status.get("ambiguous") or 0),
+                "forward_journal_version": str(forward_status.get("schema_version") or ""),
+            }
+        )
+    source._atomic_json(root / "status.json", status)
+
     return IncrementalRun(
         processed_batch=len(batch),
         eligible_total=len(candidates),
