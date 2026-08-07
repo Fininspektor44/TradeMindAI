@@ -98,6 +98,7 @@ $productUi = Join-Path $RuntimeRoot "product\index.html"
 $bybitDecisions = Join-Path $BybitShadowDir "decisions.csv"
 $cryptoCandidates = Join-Path $CryptoRoot "candidates.jsonl"
 $cryptoOutcomes = Join-Path $CryptoRoot "outcomes.jsonl"
+$cryptoForwardStatus = Join-Path $CryptoRoot "forward_journal_status.json"
 $cryptoFactory = Join-Path $CryptoRoot "factory"
 $cryptoPassports = Join-Path $cryptoFactory "passports"
 
@@ -133,6 +134,7 @@ if ($ProductCandleLimit -lt 1) {
 
 if ($RunTests) {
     & $python -m pytest -q `
+        ".\tests\test_crypto_forward_outcome_journal.py" `
         ".\tests\test_crypto_h1_swing_filter.py" `
         ".\tests\test_crypto_h1_swing_incremental.py" `
         ".\tests\test_product_ui_v1262.py" `
@@ -159,7 +161,7 @@ if ($RunTests) {
         ".\tests\test_risk_manager.py" `
         ".\tests\test_signal_intelligence.py"
     if ($LASTEXITCODE -ne 0) {
-        throw "Live Signal Runtime, H1 Swing Opportunity and Product UI tests failed"
+        throw "Live Signal Runtime, Forward Journal, H1 Swing Opportunity and Product UI tests failed"
     }
 }
 
@@ -213,17 +215,26 @@ if ($cryptoSourceReady) {
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "H1 Swing Opportunity Filter failed. Forex runtime remains available."
     }
-    elseif ((Test-Path $cryptoCandidates) -and (Test-Path $cryptoOutcomes)) {
-        & $python -m trademind.signal_passport_factory `
+    else {
+        & $python -m trademind.crypto_forward_outcome_journal `
             --candidates $cryptoCandidates `
-            --outcomes $cryptoOutcomes `
-            --output-dir $cryptoFactory `
-            --passports-dir $cryptoPassports `
-            --cost-r $CostR.ToString([System.Globalization.CultureInfo]::InvariantCulture) `
-            --maximum-candidate-age-seconds $MaximumCandidateAgeSeconds.ToString([System.Globalization.CultureInfo]::InvariantCulture) `
-            --candidate-limit 200
+            --bars $BybitBars `
+            --output-dir $CryptoRoot
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Crypto Passport Factory failed. Crypto remains shadow-only in Product UI."
+            Write-Warning "Forward Outcome Journal failed. Existing forward evidence remains untouched."
+        }
+        elseif ((Test-Path $cryptoCandidates) -and (Test-Path $cryptoOutcomes)) {
+            & $python -m trademind.signal_passport_factory `
+                --candidates $cryptoCandidates `
+                --outcomes $cryptoOutcomes `
+                --output-dir $cryptoFactory `
+                --passports-dir $cryptoPassports `
+                --cost-r $CostR.ToString([System.Globalization.CultureInfo]::InvariantCulture) `
+                --maximum-candidate-age-seconds $MaximumCandidateAgeSeconds.ToString([System.Globalization.CultureInfo]::InvariantCulture) `
+                --candidate-limit 200
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Crypto Passport Factory failed. Crypto remains shadow-only in Product UI."
+            }
         }
     }
 }
@@ -244,9 +255,10 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "`nLive Signal Runtime output: $RuntimeRoot" -ForegroundColor Cyan
 Write-Host "H1 Swing Opportunity Intelligence: $CryptoRoot" -ForegroundColor Cyan
+Write-Host "Forward Outcome Journal: $cryptoForwardStatus" -ForegroundColor Cyan
 Write-Host "Product UI: $productUi" -ForegroundColor Cyan
 Write-Host "Technical dashboard: $technicalDashboard" -ForegroundColor DarkGray
-Write-Host "Read-only. H1 swing + M5 volume breakout. Sizing OFF. Orders OFF. Publication OFF." -ForegroundColor Green
+Write-Host "Read-only. H1 swing + M5 volume breakout. Forward journal ON. Sizing OFF. Orders OFF. Publication OFF." -ForegroundColor Green
 
 if ($OpenDashboard -and (Test-Path $productUi)) {
     Start-Process $productUi
