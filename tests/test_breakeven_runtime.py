@@ -6,7 +6,7 @@ from pathlib import Path
 from trademind import breakeven_runtime as runtime
 
 
-def test_runtime_orchestrates_existing_shadow_and_counterfactual(
+def test_runtime_orchestrates_shadow_counterfactual_and_report(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -23,7 +23,10 @@ def test_runtime_orchestrates_existing_shadow_and_counterfactual(
     def fake_monitor(path: Path, output: Path) -> dict:
         calls.append(("shadow", path, output))
         output.mkdir(parents=True, exist_ok=True)
-        (output / "state.json").write_text('{"epochs": {}}', encoding="utf-8")
+        (output / "state.json").write_text(
+            '{"epochs": {"e": {"first_seen_at": "2026-08-07T14:22:33+00:00"}}}',
+            encoding="utf-8",
+        )
         return {
             "state": "OK",
             "trackable_basket_epochs": 6,
@@ -40,20 +43,36 @@ def test_runtime_orchestrates_existing_shadow_and_counterfactual(
         login: str,
     ) -> dict:
         calls.append(("counterfactual", state, path, output, login))
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "basket_be_counterfactual.csv").write_text("effect_class\n", encoding="utf-8")
         return {
             "state": "OK",
             "completed_baskets": 12,
             "covered_completed_baskets": 4,
+            "affected_by_shadow_be_baskets": 1,
             "losses_avoided_count": 1,
             "winners_cut_count": 2,
             "triggered_without_revisit_count": 1,
+            "loss_avoided_proxy_money": 10.0,
+            "opportunity_cost_proxy_money": 17.5,
             "net_effect_proxy_money": -7.5,
             "unmapped_shadow_epochs": 2,
             "ambiguous_shadow_epochs": 0,
         }
 
+    def fake_report(runtime_status, counter_status, counter_csv: Path, output: Path) -> dict:
+        calls.append(("report", counter_csv, output))
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("report", encoding="utf-8")
+        (output / "summary.json").write_text("{}", encoding="utf-8")
+        return {
+            "review_state": "COLLECTING_EVIDENCE",
+            "sample": {"coverage_ratio": 1 / 3, "affected_by_shadow_be_baskets": 1},
+        }
+
     monkeypatch.setattr(runtime, "run_monitor", fake_monitor)
     monkeypatch.setattr(runtime, "run_counterfactual", fake_counterfactual)
+    monkeypatch.setattr(runtime, "generate_report", fake_report)
 
     status = runtime.run_runtime(
         positions,
@@ -66,13 +85,16 @@ def test_runtime_orchestrates_existing_shadow_and_counterfactual(
 
     assert status["state"] == "OK"
     assert status["shadow"]["be_triggered_epochs"] == 2
+    assert status["shadow"]["monitor_started_at"] == "2026-08-07T14:22:33+00:00"
     assert status["counterfactual"]["covered_completed_baskets"] == 4
     assert status["counterfactual"]["net_effect_proxy_money"] == -7.5
+    assert status["report"]["review_state"] == "COLLECTING_EVIDENCE"
     assert status["safety"]["read_only"] is True
     assert status["safety"]["orders_enabled"] is False
     assert calls[0] == ("shadow", positions, shadow_dir)
     assert calls[1][-1] == "37365712"
-    assert json.loads(status_path.read_text(encoding="utf-8"))["schema_version"] == "1.30.0"
+    assert calls[2][0] == "report"
+    assert json.loads(status_path.read_text(encoding="utf-8"))["schema_version"] == "1.31.1"
 
 
 def test_runtime_propagates_mapping_warning(tmp_path: Path, monkeypatch) -> None:
@@ -81,15 +103,29 @@ def test_runtime_propagates_mapping_warning(tmp_path: Path, monkeypatch) -> None
     positions.write_text("x", encoding="utf-8")
     deals.write_text("x", encoding="utf-8")
 
+    def fake_monitor(_path: Path, output: Path) -> dict:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "state.json").write_text('{"epochs": {}}', encoding="utf-8")
+        return {"state": "OK"}
+
+    monkeypatch.setattr(runtime, "run_monitor", fake_monitor)
+
+    def fake_counter(*_, **__) -> dict:
+        counter_dir = _[2]
+        counter_dir.mkdir(parents=True, exist_ok=True)
+        (counter_dir / "basket_be_counterfactual.csv").write_text(
+            "effect_class\n", encoding="utf-8"
+        )
+        return {"state": "WARN_AMBIGUOUS_MAPPING"}
+
+    monkeypatch.setattr(runtime, "run_counterfactual", fake_counter)
     monkeypatch.setattr(
         runtime,
-        "run_monitor",
-        lambda *_: {"state": "OK"},
-    )
-    monkeypatch.setattr(
-        runtime,
-        "run_counterfactual",
-        lambda *_, **__: {"state": "WARN_AMBIGUOUS_MAPPING"},
+        "generate_report",
+        lambda *_, **__: {
+            "review_state": "COLLECTING_EVIDENCE",
+            "sample": {"coverage_ratio": 0.0, "affected_by_shadow_be_baskets": 0},
+        },
     )
 
     status = runtime.run_runtime(
