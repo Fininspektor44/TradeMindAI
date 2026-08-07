@@ -1,8 +1,9 @@
 """Autonomous read-only runtime for break-even statistics.
 
 The runtime only orchestrates existing immutable MT5 CSV exports. It updates the
-v1.28 shadow journal, resolves v1.29 counterfactual outcomes, and writes one
-combined health/status file. It never connects to a broker or changes robot state.
+v1.28 shadow journal, resolves v1.29 counterfactual outcomes, refreshes the v1.31
+human decision report, and writes one combined health/status file. It never
+connects to a broker or changes robot state.
 """
 
 from __future__ import annotations
@@ -14,9 +15,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from trademind.breakeven_counterfactual import run_counterfactual
+from trademind.breakeven_decision_report import generate_report
 from trademind.breakeven_stat_monitor import run_monitor
 
-VERSION = "1.30.0"
+VERSION = "1.31.0"
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -57,11 +59,15 @@ def run_runtime(
     status_path: Path,
     *,
     login: str,
+    report_output_dir: Path | None = None,
 ) -> dict[str, Any]:
     if not positions_csv.is_file():
         raise ValueError(f"positions CSV not found: {positions_csv}")
     if not deals_csv.is_file():
         raise ValueError(f"deals CSV not found: {deals_csv}")
+
+    if report_output_dir is None:
+        report_output_dir = status_path.parent / "report"
 
     shadow = run_monitor(positions_csv, shadow_output_dir)
     counterfactual = run_counterfactual(
@@ -99,10 +105,19 @@ def run_runtime(
             "covered_completed_baskets": counterfactual.get(
                 "covered_completed_baskets", 0
             ),
+            "affected_by_shadow_be_baskets": counterfactual.get(
+                "affected_by_shadow_be_baskets", 0
+            ),
             "losses_avoided_count": counterfactual.get("losses_avoided_count", 0),
             "winners_cut_count": counterfactual.get("winners_cut_count", 0),
             "triggered_without_revisit_count": counterfactual.get(
                 "triggered_without_revisit_count", 0
+            ),
+            "loss_avoided_proxy_money": counterfactual.get(
+                "loss_avoided_proxy_money", 0.0
+            ),
+            "opportunity_cost_proxy_money": counterfactual.get(
+                "opportunity_cost_proxy_money", 0.0
             ),
             "net_effect_proxy_money": counterfactual.get("net_effect_proxy_money", 0.0),
             "unmapped_shadow_epochs": counterfactual.get("unmapped_shadow_epochs", 0),
@@ -111,8 +126,25 @@ def run_runtime(
         "outputs": {
             "shadow": str(shadow_output_dir.resolve()),
             "counterfactual": str(counterfactual_output_dir.resolve()),
+            "report": str(report_output_dir.resolve()),
         },
         "safety": _safety(),
+    }
+
+    report = generate_report(
+        status,
+        counterfactual,
+        counterfactual_output_dir / "basket_be_counterfactual.csv",
+        report_output_dir,
+    )
+    status["report"] = {
+        "review_state": report.get("review_state", ""),
+        "coverage_ratio": report.get("sample", {}).get("coverage_ratio", 0.0),
+        "affected_baskets": report.get("sample", {}).get(
+            "affected_by_shadow_be_baskets", 0
+        ),
+        "index": str((report_output_dir / "index.html").resolve()),
+        "summary": str((report_output_dir / "summary.json").resolve()),
     }
     _atomic_json(status_path, status)
     return status
@@ -142,6 +174,7 @@ def main() -> int:
     parser.add_argument("--shadow-output-dir", required=True, type=Path)
     parser.add_argument("--counterfactual-output-dir", required=True, type=Path)
     parser.add_argument("--status", required=True, type=Path)
+    parser.add_argument("--report-output-dir", type=Path, default=None)
     args = parser.parse_args()
 
     try:
@@ -152,13 +185,14 @@ def main() -> int:
             args.counterfactual_output_dir,
             args.status,
             login=args.login,
+            report_output_dir=args.report_output_dir,
         )
     except Exception as exc:  # scheduled boundary: persist failure for later inspection
         _write_error_status(args.status, args.login, exc)
         print(f"BreakEven autonomous runtime failed: {exc}")
         return 1
 
-    print("TradeMind v1.30 Autonomous BreakEven Runtime")
+    print("TradeMind v1.31 Autonomous BreakEven Runtime")
     print("READ-ONLY / SHADOW ONLY / ORDERS OFF")
     print(f"Open basket epochs: {status['shadow']['open_trackable_epochs']}")
     print(f"BE triggers: {status['shadow']['be_triggered_epochs']}")
@@ -166,6 +200,8 @@ def main() -> int:
     print(f"Losses avoided: {status['counterfactual']['losses_avoided_count']}")
     print(f"Winners cut: {status['counterfactual']['winners_cut_count']}")
     print(f"Net effect proxy: {status['counterfactual']['net_effect_proxy_money']}")
+    print(f"Review state: {status['report']['review_state']}")
+    print(f"Report: {status['report']['index']}")
     print(f"Status: {args.status.resolve()}")
     return 0
 
