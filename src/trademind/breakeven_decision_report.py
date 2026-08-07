@@ -12,10 +12,11 @@ import csv
 import html
 import json
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-VERSION = "1.31.0"
+VERSION = "1.31.1"
 MIN_AFFECTED_SAMPLE = 30
 MIN_COVERAGE_RATIO = 0.80
 
@@ -32,6 +33,19 @@ def _integer(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_time(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _atomic_text(path: Path, text: str) -> None:
@@ -52,23 +66,50 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _eligible_rows(
+    runtime_status: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[Mapping[str, Any]], datetime | None]:
+    shadow = dict(runtime_status.get("shadow") or {})
+    monitor_started_at = _parse_time(shadow.get("monitor_started_at"))
+    if monitor_started_at is None:
+        return list(rows), None
+    eligible = []
+    for row in rows:
+        closed_at = _parse_time(row.get("basket_closed_at"))
+        if closed_at is not None and closed_at >= monitor_started_at:
+            eligible.append(row)
+    return eligible, monitor_started_at
+
+
 def build_summary(
     runtime_status: Mapping[str, Any],
     counterfactual_status: Mapping[str, Any],
     rows: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    completed = _integer(counterfactual_status.get("completed_baskets"))
-    covered = _integer(counterfactual_status.get("covered_completed_baskets"))
-    affected = _integer(counterfactual_status.get("affected_by_shadow_be_baskets"))
-    coverage_ratio = covered / completed if completed else 0.0
+    all_completed = _integer(counterfactual_status.get("completed_baskets"), len(rows))
+    eligible, monitor_started_at = _eligible_rows(runtime_status, rows)
 
+    if monitor_started_at is None:
+        completed = all_completed
+        covered = _integer(counterfactual_status.get("covered_completed_baskets"))
+        coverage_basis = "ALL_COMPLETED_FALLBACK"
+    else:
+        completed = len(eligible)
+        covered = sum(_integer(row.get("mapped_shadow_epochs")) > 0 for row in eligible)
+        coverage_basis = "CLOSED_SINCE_MONITOR_START"
+
+    coverage_ratio = covered / completed if completed else 0.0
+    pre_monitor_completed = max(all_completed - completed, 0)
+
+    affected = _integer(counterfactual_status.get("affected_by_shadow_be_baskets"))
     losses_avoided = _integer(counterfactual_status.get("losses_avoided_count"))
     winners_cut = _integer(counterfactual_status.get("winners_cut_count"))
     loss_money = _number(counterfactual_status.get("loss_avoided_proxy_money"))
     cost_money = _number(counterfactual_status.get("opportunity_cost_proxy_money"))
     net_money = _number(counterfactual_status.get("net_effect_proxy_money"))
 
-    classes = Counter(str(row.get("effect_class") or "UNKNOWN") for row in rows)
+    classes = Counter(str(row.get("effect_class") or "UNKNOWN") for row in eligible)
     evidence_ready = affected >= MIN_AFFECTED_SAMPLE and coverage_ratio >= MIN_COVERAGE_RATIO
     if evidence_ready:
         review_state = "READY_FOR_HUMAN_REVIEW"
@@ -88,8 +129,14 @@ def build_summary(
         },
         "sample": {
             "completed_baskets": completed,
+            "all_completed_baskets": all_completed,
+            "pre_monitor_completed_baskets": pre_monitor_completed,
             "covered_completed_baskets": covered,
             "coverage_ratio": round(coverage_ratio, 6),
+            "coverage_basis": coverage_basis,
+            "monitor_started_at": (
+                monitor_started_at.isoformat() if monitor_started_at is not None else ""
+            ),
             "affected_by_shadow_be_baskets": affected,
         },
         "effect": {
@@ -101,6 +148,7 @@ def build_summary(
         },
         "classes": dict(sorted(classes.items())),
         "interpretation": (
+            "Coverage is measured only on baskets closed since shadow monitoring began. "
             "Proxy values use the actual final basket P/L after observed snapshot-level BE events. "
             "They are research evidence, not simulated executable BE P/L and not a command to "
             "enable or disable break-even in a robot."
@@ -152,7 +200,7 @@ def render_html(summary: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TradeMind BE Research v1.31</title>
+<title>TradeMind BE Research v1.31.1</title>
 <style>
 body{{font-family:Segoe UI,Arial,sans-serif;background:#111;color:#eee;margin:0;padding:24px}}
 main{{max-width:1100px;margin:auto}}h1{{margin-bottom:4px}}.muted{{color:#aaa}}
@@ -164,10 +212,10 @@ th{{color:#bbb}}.safe{{color:#8fd18f}}.warn{{color:#f4c96b}}
 </style>
 </head>
 <body><main>
-<h1>TradeMind v1.31 · BreakEven Research</h1>
+<h1>TradeMind v1.31.1 · BreakEven Research</h1>
 <div class="muted">Аккаунт {html.escape(str(summary.get('login') or ''))} · только статистика, без управления ордерами</div>
 <div class="grid">
-<div class="card"><div>Закрытых корзин</div><div class="value">{_integer(sample.get('completed_baskets'))}</div></div>
+<div class="card"><div>Закрытых после старта</div><div class="value">{_integer(sample.get('completed_baskets'))}</div><div class="muted">Исторических до мониторинга: {_integer(sample.get('pre_monitor_completed_baskets'))}</div></div>
 <div class="card"><div>Покрыто shadow BE</div><div class="value">{_integer(sample.get('covered_completed_baskets'))}</div><div>{_pct(sample.get('coverage_ratio'))}</div></div>
 <div class="card"><div>BE реально повлиял бы</div><div class="value">{_integer(sample.get('affected_by_shadow_be_baskets'))}</div></div>
 <div class="card"><div>Спасено убытков</div><div class="value">{_integer(effect.get('losses_avoided_count'))}</div><div>{_money(effect.get('loss_avoided_proxy_money'))}</div></div>
@@ -179,7 +227,7 @@ th{{color:#bbb}}.safe{{color:#8fd18f}}.warn{{color:#f4c96b}}
 <h2>Последние закрытые корзины с покрытием</h2>
 <table><thead><tr><th>Закрытие</th><th>Символ</th><th>Сторона</th><th>Класс</th><th>Факт P/L</th><th>BE proxy</th></tr></thead>
 <tbody>{''.join(table_rows)}</tbody></table>
-<p class="muted">Proxy использует фактический финальный P/L после наблюдавшегося shadow-события. Комиссии, проскальзывание и внутриминутные касания не выдумываются.</p>
+<p class="muted">Покрытие считается только по корзинам, закрытым после старта shadow-мониторинга. Proxy использует фактический финальный P/L после наблюдавшегося shadow-события. Комиссии, проскальзывание и внутриминутные касания не выдумываются.</p>
 </main></body></html>"""
 
 
@@ -207,7 +255,7 @@ def main() -> int:
     runtime_status = json.loads(args.runtime_status.read_text(encoding="utf-8-sig"))
     counter_status = json.loads(args.counterfactual_status.read_text(encoding="utf-8-sig"))
     summary = generate_report(runtime_status, counter_status, args.counterfactual_csv, args.output_dir)
-    print("TradeMind v1.31 BreakEven Decision Report")
+    print("TradeMind v1.31.1 BreakEven Decision Report")
     print(f"Review state: {summary['review_state']}")
     print(f"Coverage: {_pct(summary['sample']['coverage_ratio'])}")
     print(f"Affected baskets: {summary['sample']['affected_by_shadow_be_baskets']}")
