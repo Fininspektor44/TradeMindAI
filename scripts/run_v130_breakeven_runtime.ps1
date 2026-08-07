@@ -53,9 +53,10 @@ if ($RunTests) {
     & $python -m pytest -q `
         ".\tests\test_breakeven_stat_monitor.py" `
         ".\tests\test_breakeven_counterfactual.py" `
+        ".\tests\test_breakeven_decision_report.py" `
         ".\tests\test_breakeven_runtime.py"
     if ($LASTEXITCODE -ne 0) {
-        throw "v1.30 BreakEven runtime tests failed"
+        throw "v1.31 BreakEven runtime tests failed"
     }
 }
 
@@ -67,9 +68,11 @@ if ($RunTests) {
     --counterfactual-output-dir $CounterfactualOutputDir `
     --status $RuntimeStatus
 if ($LASTEXITCODE -ne 0) {
-    throw "v1.30 BreakEven runtime execution failed. Inspect: $RuntimeStatus"
+    throw "v1.31 BreakEven runtime execution failed. Inspect: $RuntimeStatus"
 }
 
+$status = Get-Content $RuntimeStatus -Raw | ConvertFrom-Json
 Write-Host "`nBreakEven runtime status: $RuntimeStatus" -ForegroundColor Cyan
+Write-Host "Decision report: $($status.report.index)" -ForegroundColor Cyan
 Write-Host "READ-ONLY. Shadow statistics only. Orders OFF. Robot/exporter unchanged." `
     -ForegroundColor Green
