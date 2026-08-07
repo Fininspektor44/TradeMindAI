@@ -3,7 +3,10 @@ param(
     [string]$Login = "37365712",
 
     [Parameter(Mandatory=$false)]
-    [int]$ServerUTCOffsetHours = 3
+    [int]$ServerUTCOffsetHours = 3,
+
+    [Parameter(Mandatory=$false)]
+    [string]$RuntimeRoot = ".\data\live_signal_runtime_v1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,16 +21,23 @@ if (-not $createdNew) {
     exit 0
 }
 
-$logDir = Join-Path $repo "data\live_signal_runtime_v1\logs"
+$resolvedRuntimeRoot = if ([System.IO.Path]::IsPathRooted($RuntimeRoot)) {
+    $RuntimeRoot
+}
+else {
+    Join-Path $repo $RuntimeRoot
+}
+$logDir = Join-Path $resolvedRuntimeRoot "logs"
 $logPath = Join-Path $logDir "live_signal_watch.log"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 
 try {
     $started = Get-Date
-    "[$($started.ToString('o'))] START account=$Login offset=$ServerUTCOffsetHours" | Add-Content -Path $logPath -Encoding UTF8
+    "[$($started.ToString('o'))] START account=$Login offset=$ServerUTCOffsetHours runtime_root=$resolvedRuntimeRoot" | Add-Content -Path $logPath -Encoding UTF8
     & (Join-Path $PSScriptRoot "run_v121_live_signal_runtime.ps1") `
         -Login $Login `
-        -ServerUTCOffsetHours $ServerUTCOffsetHours 2>&1 | Tee-Object -FilePath $logPath -Append
+        -ServerUTCOffsetHours $ServerUTCOffsetHours `
+        -RuntimeRoot $resolvedRuntimeRoot 2>&1 | Tee-Object -FilePath $logPath -Append
     if ($LASTEXITCODE -ne 0) {
         throw "Live Signal Runtime returned exit code $LASTEXITCODE"
     }
