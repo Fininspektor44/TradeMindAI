@@ -23,7 +23,10 @@ def test_runtime_orchestrates_shadow_counterfactual_and_report(
     def fake_monitor(path: Path, output: Path) -> dict:
         calls.append(("shadow", path, output))
         output.mkdir(parents=True, exist_ok=True)
-        (output / "state.json").write_text('{"epochs": {}}', encoding="utf-8")
+        (output / "state.json").write_text(
+            '{"epochs": {"e": {"first_seen_at": "2026-08-07T14:22:33+00:00"}}}',
+            encoding="utf-8",
+        )
         return {
             "state": "OK",
             "trackable_basket_epochs": 6,
@@ -82,6 +85,7 @@ def test_runtime_orchestrates_shadow_counterfactual_and_report(
 
     assert status["state"] == "OK"
     assert status["shadow"]["be_triggered_epochs"] == 2
+    assert status["shadow"]["monitor_started_at"] == "2026-08-07T14:22:33+00:00"
     assert status["counterfactual"]["covered_completed_baskets"] == 4
     assert status["counterfactual"]["net_effect_proxy_money"] == -7.5
     assert status["report"]["review_state"] == "COLLECTING_EVIDENCE"
@@ -90,7 +94,7 @@ def test_runtime_orchestrates_shadow_counterfactual_and_report(
     assert calls[0] == ("shadow", positions, shadow_dir)
     assert calls[1][-1] == "37365712"
     assert calls[2][0] == "report"
-    assert json.loads(status_path.read_text(encoding="utf-8"))["schema_version"] == "1.31.0"
+    assert json.loads(status_path.read_text(encoding="utf-8"))["schema_version"] == "1.31.1"
 
 
 def test_runtime_propagates_mapping_warning(tmp_path: Path, monkeypatch) -> None:
@@ -99,7 +103,12 @@ def test_runtime_propagates_mapping_warning(tmp_path: Path, monkeypatch) -> None
     positions.write_text("x", encoding="utf-8")
     deals.write_text("x", encoding="utf-8")
 
-    monkeypatch.setattr(runtime, "run_monitor", lambda *_: {"state": "OK"})
+    def fake_monitor(_path: Path, output: Path) -> dict:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "state.json").write_text('{"epochs": {}}', encoding="utf-8")
+        return {"state": "OK"}
+
+    monkeypatch.setattr(runtime, "run_monitor", fake_monitor)
 
     def fake_counter(*_, **__) -> dict:
         counter_dir = _[2]
