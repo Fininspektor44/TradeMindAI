@@ -1,0 +1,60 @@
+name: test-v132-unified-ecn-exporter
+
+on:
+  pull_request:
+    paths:
+      - "mt5/exporters/**"
+      - "scripts/install_v132_unified_ecn_exporter.ps1"
+      - "scripts/verify_v132_unified_outputs.ps1"
+      - "tests/test_unified_ecn_exporter_v132.py"
+      - ".github/workflows/test-v132-unified-ecn-exporter.yml"
+  push:
+    branches:
+      - "feature/v1.32-unified-ecn-exporter"
+
+jobs:
+  static-read-only-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependency
+        run: python -m pip install pytest
+      - name: Run unified exporter tests
+        run: python -m pytest -q tests/test_unified_ecn_exporter_v132.py
+      - name: PowerShell syntax
+        shell: pwsh
+        run: |
+          foreach ($file in @(
+            "scripts/install_v132_unified_ecn_exporter.ps1",
+            "scripts/verify_v132_unified_outputs.ps1"
+          )) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file),
+              [ref]$null,
+              [ref]$errors
+            )
+            if ($errors.Count) {
+              $errors | Format-List | Out-String | Write-Error
+              exit 1
+            }
+          }
+      - name: Read-only token gate
+        shell: pwsh
+        run: |
+          $paths = @(
+            "mt5/exporters/TradeMindAI_ECN_UnifiedExporter_v1_32.mq5",
+            "mt5/exporters/source/TradeMindAI_ECN_UniversalVolumeExporter_v1_9_4.mq5",
+            "mt5/exporters/source/TradeMind_Grid_Deal_Exporter.mq5",
+            "mt5/exporters/source/TradeMind_MT5_Risk_Snapshot_Exporter.mq5"
+          )
+          $forbidden = 'OrderSend\s*\(|OrderSendAsync\s*\(|PositionModify\s*\(|PositionClose\s*\(|\bCTrade\b|\.Buy\s*\(|\.Sell\s*\('
+          $hits = Select-String -Path $paths -Pattern $forbidden -AllMatches
+          if ($hits) {
+            $hits | Format-Table -AutoSize | Out-String | Write-Error
+            exit 1
+          }
+          Write-Host "v1.32 READ-ONLY gate passed"
