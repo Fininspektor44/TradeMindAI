@@ -4,6 +4,7 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "mt5" / "exporters" / "TradeMindAI_ECN_UnifiedExporter_v1_32.mq5"
 SOURCE_DIR = ROOT / "mt5" / "exporters" / "source"
+VERIFY = ROOT / "scripts" / "verify_v132_unified_outputs.ps1"
 
 
 def text(path: Path) -> str:
@@ -65,3 +66,13 @@ def test_one_master_timer_schedules_three_cadences() -> None:
     assert "now-g_unified_last_risk" in body
     assert "now-g_unified_last_deals" in body
     assert "READ-ONLY. No orders. No position modification." in body
+
+
+def test_verifier_cannot_false_green_on_required_stale_output() -> None:
+    body = text(VERIFY)
+    assert "$failures = @($rows | Where-Object" in body
+    assert "$failures.Count -gt 0" in body
+    assert "RequiredFresh = $true" in body
+    assert 'Kind = "deal-positions"' in body
+    assert "RequireFresh = $false" in body
+    assert "deal-positions can remain timestamp-stale when no matching positions exist" in body
