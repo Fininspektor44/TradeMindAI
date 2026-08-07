@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trademind-ai"
-version = "1.29.0"
+version = "1.30.0"
 description = "Explainable market screening and trader analytics platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -69,6 +69,7 @@ trademind-live-dashboard = "trademind.live_signal_dashboard:main"
 trademind-product-ui = "trademind.product_ui_v1262:main"
 trademind-breakeven-stats = "trademind.breakeven_stat_monitor:main"
 trademind-breakeven-counterfactual = "trademind.breakeven_counterfactual:main"
+trademind-breakeven-runtime = "trademind.breakeven_runtime:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
