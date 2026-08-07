@@ -109,6 +109,40 @@ def test_incremental_archives_candidates_and_rejections_without_repeating(
     assert (output / "outcomes.jsonl").read_text(encoding="utf-8") == ""
 
 
+def test_incremental_preserves_forward_outcomes_and_status(tmp_path) -> None:
+    decisions = tmp_path / "decisions.csv"
+    bars = tmp_path / "bars.csv"
+    output = tmp_path / "output"
+    output.mkdir()
+    decisions.write_text("decision_id,signal_time,symbol,action\n", encoding="utf-8")
+    bars.write_text("unused\n", encoding="utf-8")
+    outcome_text = '{"signal_id":"forward-1","outcome":"WIN","net_r":2.0}\n'
+    (output / "outcomes.jsonl").write_text(outcome_text, encoding="utf-8")
+    (output / "forward_journal_status.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.27.0",
+                "evidence_state": "FORWARD_ONLY_JOURNAL_ACTIVE",
+                "outcomes": 1,
+                "pending": 2,
+                "ambiguous": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runtime.run_incremental(decisions, bars, output, batch_size=10)
+
+    assert result.processed_batch == 0
+    assert (output / "outcomes.jsonl").read_text(encoding="utf-8") == outcome_text
+    status = json.loads((output / "status.json").read_text(encoding="utf-8"))
+    assert status["outcomes"] == 1
+    assert status["evidence_state"] == "FORWARD_ONLY_JOURNAL_ACTIVE"
+    assert status["forward_pending"] == 2
+    assert status["forward_ambiguous"] == 1
+    assert status["forward_journal_version"] == "1.27.0"
+
+
 def test_unsupported_action_is_rejected_and_legacy_error_is_recovered(
     tmp_path, monkeypatch
 ) -> None:
