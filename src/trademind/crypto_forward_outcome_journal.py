@@ -1,4 +1,9 @@
-"""Forward-only outcome journal for TradeMind v1.27 crypto H1 swing candidates."""
+"""Forward-only outcome journal for TradeMind v1.27 crypto H1 swing candidates.
+
+The canonical forward evidence is kept separately from the v1.26 placeholder
+outcomes file. A compatibility mirror is rebuilt after every journal run so the
+existing Passport Factory can consume the evidence without changing its schema.
+"""
 
 from __future__ import annotations
 
@@ -100,7 +105,9 @@ def _candidate_geometry(candidate: Mapping[str, Any]) -> dict[str, Any] | None:
     if action not in {"BUY", "SELL"} or entry is None or stop is None or target is None:
         return None
     valid = stop < entry < target if action == "BUY" else target < entry < stop
-    return {"action": action, "entry": entry, "stop": stop, "target": target} if valid else None
+    if not valid:
+        return None
+    return {"action": action, "entry": entry, "stop": stop, "target": target}
 
 
 def _pending_record(candidate: Mapping[str, Any], tracked_at: datetime) -> dict[str, Any] | None:
@@ -190,7 +197,9 @@ def _evaluate_pending(
             "completed_at": _iso_from_ms(bar.end_ms),
             "resolution_bar_start": _iso_from_ms(bar.start_ms),
             "bars_held": bars_held,
-            "outcome": "WIN" if resolution == "TARGET_HIT" else "LOSS" if resolution == "STOP_HIT" else "",
+            "outcome": (
+                "WIN" if resolution == "TARGET_HIT" else "LOSS" if resolution == "STOP_HIT" else ""
+            ),
             "net_r": net_r,
             "safety": safety_contract(),
         }, False
@@ -234,7 +243,8 @@ def run_forward_journal(
     captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     state_path = root / "forward_journal_state.json"
     pending_path = root / "forward_pending.jsonl"
-    outcomes_path = root / "outcomes.jsonl"
+    canonical_outcomes_path = root / "forward_outcomes.jsonl"
+    compatibility_outcomes_path = root / "outcomes.jsonl"
     ambiguous_path = root / "forward_ambiguous.jsonl"
 
     state = _read_json(state_path)
@@ -246,10 +256,12 @@ def run_forward_journal(
             "setup_family": SETUP_FAMILY,
             "mode": "FORWARD_ONLY",
             "historical_candidates_backfilled": False,
+            "canonical_outcomes": canonical_outcomes_path.name,
+            "compatibility_outcomes": compatibility_outcomes_path.name,
             "safety": safety_contract(),
         }
         source._atomic_json(state_path, state)
-        for path in (pending_path, outcomes_path, ambiguous_path):
+        for path in (pending_path, canonical_outcomes_path, ambiguous_path):
             if not path.exists():
                 source._atomic_text(path, "")
 
@@ -259,13 +271,17 @@ def run_forward_journal(
 
     candidates = _read_jsonl(candidates_path)
     pending = _read_jsonl(pending_path)
-    outcomes = _read_jsonl(outcomes_path)
+    outcomes = _read_jsonl(canonical_outcomes_path)
     ambiguous = _read_jsonl(ambiguous_path)
     finalized_ids = {
-        str(row.get("signal_id") or "") for row in [*outcomes, *ambiguous] if row.get("signal_id")
+        str(row.get("signal_id") or "")
+        for row in [*outcomes, *ambiguous]
+        if row.get("signal_id")
     }
     pending_by_id = {
-        str(row.get("signal_id") or ""): dict(row) for row in pending if row.get("signal_id")
+        str(row.get("signal_id") or ""): dict(row)
+        for row in pending
+        if row.get("signal_id")
     }
 
     tracked_new = 0
@@ -295,7 +311,8 @@ def run_forward_journal(
     gap_count = 0
 
     for identity, record in sorted(
-        pending_by_id.items(), key=lambda item: str(item[1].get("signal_time") or "")
+        pending_by_id.items(),
+        key=lambda item: str(item[1].get("signal_time") or ""),
     ):
         if identity in finalized_ids:
             continue
@@ -313,15 +330,19 @@ def run_forward_journal(
             resolved.append(result)
         finalized_ids.add(identity)
 
-    _append_jsonl(outcomes_path, resolved)
+    _append_jsonl(canonical_outcomes_path, resolved)
     _append_jsonl(ambiguous_path, ambiguous_new)
     source._atomic_text(pending_path, _jsonl_text(remaining))
 
-    all_outcomes = _read_jsonl(outcomes_path)
+    all_outcomes = _read_jsonl(canonical_outcomes_path)
     all_ambiguous = _read_jsonl(ambiguous_path)
+    source._atomic_text(compatibility_outcomes_path, _jsonl_text(all_outcomes))
+
     wins = sum(str(row.get("outcome") or "") == "WIN" for row in all_outcomes)
     losses = sum(str(row.get("outcome") or "") == "LOSS" for row in all_outcomes)
-    evidence_state = EVIDENCE_ACTIVE if pending_by_id or all_outcomes or all_ambiguous else EVIDENCE_WAITING
+    evidence_state = (
+        EVIDENCE_ACTIVE if pending_by_id or all_outcomes or all_ambiguous else EVIDENCE_WAITING
+    )
     status = {
         "schema_version": VERSION,
         "state": "OK",
@@ -339,6 +360,8 @@ def run_forward_journal(
         "losses": losses,
         "ambiguous": len(all_ambiguous),
         "data_gap_pending": gap_count,
+        "canonical_outcomes": str(canonical_outcomes_path),
+        "compatibility_outcomes": str(compatibility_outcomes_path),
         "safety": safety_contract(),
     }
     source._atomic_json(root / "forward_journal_status.json", status)
@@ -382,13 +405,19 @@ def safety_contract() -> Mapping[str, Any]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="TradeMind v1.27 forward-only crypto outcome journal")
+    parser = argparse.ArgumentParser(
+        description="TradeMind v1.27 forward-only crypto outcome journal"
+    )
     parser.add_argument(
         "--candidates",
         type=Path,
         default=Path("data/crypto_signal_intelligence_v1_26/candidates.jsonl"),
     )
-    parser.add_argument("--bars", type=Path, default=Path("data/bybit_v1_9/bybit_bars.csv"))
+    parser.add_argument(
+        "--bars",
+        type=Path,
+        default=Path("data/bybit_v1_9/bybit_bars.csv"),
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
