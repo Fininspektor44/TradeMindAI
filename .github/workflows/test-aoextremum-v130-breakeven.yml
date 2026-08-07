@@ -19,6 +19,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install test dependency
+        run: python -m pip install pytest
       - name: Test break-even patch invariants
         run: python -m pytest -q tests/test_aoextremum_v130_breakeven_patch.py
       - name: Python syntax check
