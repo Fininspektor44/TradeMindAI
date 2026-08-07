@@ -18,7 +18,7 @@ from trademind.breakeven_counterfactual import run_counterfactual
 from trademind.breakeven_decision_report import generate_report
 from trademind.breakeven_stat_monitor import run_monitor
 
-VERSION = "1.31.0"
+VERSION = "1.31.1"
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -51,6 +51,34 @@ def _safety() -> dict[str, bool]:
     }
 
 
+def _shadow_monitor_started_at(state_path: Path) -> str:
+    if not state_path.is_file():
+        return ""
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    epochs = payload.get("epochs") if isinstance(payload, dict) else None
+    if not isinstance(epochs, dict):
+        return ""
+
+    timestamps: list[datetime] = []
+    for record in epochs.values():
+        if not isinstance(record, dict):
+            continue
+        text = str(record.get("first_seen_at") or "").strip()
+        if not text:
+            continue
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamps.append(parsed.astimezone(timezone.utc))
+    return min(timestamps).isoformat() if timestamps else ""
+
+
 def run_runtime(
     positions_csv: Path,
     deals_csv: Path,
@@ -70,6 +98,7 @@ def run_runtime(
         report_output_dir = status_path.parent / "report"
 
     shadow = run_monitor(positions_csv, shadow_output_dir)
+    monitor_started_at = _shadow_monitor_started_at(shadow_output_dir / "state.json")
     counterfactual = run_counterfactual(
         shadow_output_dir / "state.json",
         deals_csv,
@@ -93,6 +122,7 @@ def run_runtime(
             "deals": _file_meta(deals_csv),
         },
         "shadow": {
+            "monitor_started_at": monitor_started_at,
             "trackable_basket_epochs": shadow.get("trackable_basket_epochs", 0),
             "open_trackable_epochs": shadow.get("open_trackable_epochs", 0),
             "be_triggered_epochs": shadow.get("be_triggered_epochs", 0),
@@ -192,7 +222,7 @@ def main() -> int:
         print(f"BreakEven autonomous runtime failed: {exc}")
         return 1
 
-    print("TradeMind v1.31 Autonomous BreakEven Runtime")
+    print("TradeMind v1.31.1 Autonomous BreakEven Runtime")
     print("READ-ONLY / SHADOW ONLY / ORDERS OFF")
     print(f"Open basket epochs: {status['shadow']['open_trackable_epochs']}")
     print(f"BE triggers: {status['shadow']['be_triggered_epochs']}")
