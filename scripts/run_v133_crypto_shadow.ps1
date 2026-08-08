@@ -1,7 +1,7 @@
 param(
     [string]$Decisions = ".\data\bybit_shadow_v1_10\decisions.csv",
     [string]$Bars = ".\data\bybit_v1_9\bybit_bars.csv",
-    [string]$OutputDir = ".\data\crypto_signal_intelligence_v1_33_shadow",
+    [string]$OutputDir = ".\data\crypto_signal_intelligence_v1_33_1_shadow",
     [int]$BatchSize = 400,
     [switch]$RunTests
 )
@@ -16,7 +16,7 @@ if (-not (Test-Path $Bars)) { throw "Bybit bars not found: $Bars" }
 
 if ($RunTests) {
     & $python -m pytest -q ".\tests\test_crypto_h1_swing_filter_v133.py"
-    if ($LASTEXITCODE -ne 0) { throw "v1.33 tests failed" }
+    if ($LASTEXITCODE -ne 0) { throw "v1.33.1 tests failed" }
 }
 
 & $python -m trademind.crypto_h1_swing_incremental_v133 `
@@ -24,13 +24,13 @@ if ($RunTests) {
     --bars $Bars `
     --output-dir $OutputDir `
     --batch-size $BatchSize
-if ($LASTEXITCODE -ne 0) { throw "v1.33 crypto shadow run failed" }
+if ($LASTEXITCODE -ne 0) { throw "v1.33.1 crypto shadow run failed" }
 
 $statusPath = Join-Path $OutputDir "status.json"
 $rejectionsPath = Join-Path $OutputDir "rejections.jsonl"
 $candidatesPath = Join-Path $OutputDir "candidates.jsonl"
 
-Write-Host "`n===== v1.33 SHADOW SUMMARY =====" -ForegroundColor Cyan
+Write-Host "`n===== v1.33.1 SHADOW SUMMARY =====" -ForegroundColor Cyan
 if (Test-Path $statusPath) {
     Get-Content $statusPath -Raw | ConvertFrom-Json |
         Select-Object state,updated_at,processed_batch,eligible_candidates,rejected_decisions,errors,remaining_decisions |
@@ -55,4 +55,4 @@ if (Test-Path $candidatesPath) {
         Format-Table -AutoSize
 }
 
-Write-Host "READ-ONLY SHADOW. Existing v1.32/v1.26 runtime state was not modified." -ForegroundColor Green
+Write-Host "READ-ONLY LEARNING SHADOW. Existing v1.32/v1.26 runtime state was not modified." -ForegroundColor Green
