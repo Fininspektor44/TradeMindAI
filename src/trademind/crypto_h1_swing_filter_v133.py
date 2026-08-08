@@ -1,39 +1,39 @@
-"""TradeMind v1.33 H1 swing opportunity filter.
+"""TradeMind v1.33.1 H1 swing opportunity filter.
 
-v1.33 keeps H1 direction as the hard trend gate, keeps only an opposite M15
-structure break as a veto, and accepts a confirmed close breakout that happened
-within the last three closed M5 bars as long as the latest M5 close still holds
-beyond the broken extremum. Volume and delta confirmation are taken from the
-actual breakout bar, while entry geometry uses the latest closed M5 price.
+This is a read-only learning-shadow filter. It keeps H1 direction as the hard
+trend gate and only an explicit opposite M15 structure break as a veto. A
+confirmed M5 close breakout may have happened within the last six closed M5
+bars, provided the latest close still holds beyond the broken extremum.
 
-The module is read-only. It reads local closed Bybit data only and never calls
-an exchange, publishes a signal, calculates account sizing or sends orders.
+Compared with v1.33.0, the shadow thresholds are intentionally less restrictive
+so the system can actually collect forward candidates and outcomes:
+- breakout lookback: 6 closed M5 bars;
+- volume ratio: >= 1.00x median;
+- first H1 target: >= 1.20R;
+- H1 target distance: >= 0.40 ATR H1.
+Delta direction remains mandatory. Orders and publication remain disabled.
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
-import json
 import statistics
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from trademind import crypto_h1_swing_filter as base
 from trademind.crypto_market_structure import MarketStructureEngine
 
-VERSION = "1.33.0"
+VERSION = "1.33.1"
 SETUP_FAMILY = base.SETUP_FAMILY
-BREAKOUT_LOOKBACK_BARS = 3
-MIN_VOLUME_RATIO = base.MIN_VOLUME_RATIO
-MIN_TARGET_RR = base.MIN_TARGET_RR
-MIN_TARGET_ATR_H1 = base.MIN_TARGET_ATR_H1
+BREAKOUT_LOOKBACK_BARS = 6
+MIN_VOLUME_RATIO = 1.00
+MIN_TARGET_RR = 1.20
+MIN_TARGET_ATR_H1 = 0.40
 
 FlowBar = base.FlowBar
 FlowHistory = base.FlowHistory
 Opportunity = base.Opportunity
+Pivot = base.Pivot
 
 
 def evaluate_opportunity(
@@ -46,12 +46,7 @@ def evaluate_opportunity(
     minimum_target_atr_h1: float = MIN_TARGET_ATR_H1,
     breakout_lookback_bars: int = BREAKOUT_LOOKBACK_BARS,
 ) -> Opportunity:
-    """Evaluate a recent M5 breakout-and-hold continuation setup.
-
-    The breakout may occur on any of the last ``breakout_lookback_bars`` closed
-    M5 bars. The current/latest close must still be beyond the broken pivot.
-    Flow confirmation belongs to the breakout bar, not to a later hold bar.
-    """
+    """Evaluate a recent M5 breakout-and-hold continuation setup."""
     action = action.upper()
     if action not in {"BUY", "SELL"}:
         return base._reject(action, "ACTION_NOT_BUY_SELL")
@@ -72,46 +67,46 @@ def evaluate_opportunity(
     if str(h1.get("bias") or "NEUTRAL") != direction:
         return base._reject(action, "H1_DIRECTION_NOT_ALIGNED")
 
-    # v1.33: M15 bias alone is context, not a veto. Only an explicit opposite
-    # structural break blocks the H1 continuation setup.
     if str(m15.get("break_direction") or "NONE") == opposite:
         return base._reject(action, "M15_BREAK_VETO")
 
-    lookback = min(breakout_lookback_bars, len(m5_bars) - 1)
-    window_start = len(m5_bars) - lookback
-    pivot_history = m5_bars[:window_start]
-    highs, lows = base._pivots(pivot_history)
-    if not highs or not lows:
-        return base._reject(action, "M5_CONFIRMED_EXTREMUM_MISSING")
-
-    breakout = highs[-1] if action == "BUY" else lows[-1]
-    opposite_pivot = lows[-1] if action == "BUY" else highs[-1]
-
+    window_start = max(1, len(m5_bars) - breakout_lookback_bars)
     breakout_bar: FlowBar | None = None
+    breakout: Pivot | None = None
+    opposite_pivot: Pivot | None = None
+    breakout_history: Sequence[FlowBar] | None = None
+
+    # Evaluate each recent bar against the latest pivot that was already
+    # confirmed before that bar closed. Keep the most recent valid crossing.
     for index in range(window_start, len(m5_bars)):
+        confirmed_history = m5_bars[:index]
+        highs, lows = base._pivots(confirmed_history)
+        if not highs or not lows:
+            continue
+        candidate_breakout = highs[-1] if action == "BUY" else lows[-1]
+        candidate_opposite = lows[-1] if action == "BUY" else highs[-1]
         previous = m5_bars[index - 1]
         current = m5_bars[index]
         crossed = (
-            previous.close <= breakout.price < current.close
+            previous.close <= candidate_breakout.price < current.close
             if action == "BUY"
-            else previous.close >= breakout.price > current.close
+            else previous.close >= candidate_breakout.price > current.close
         )
         if crossed:
             breakout_bar = current
+            breakout = candidate_breakout
+            opposite_pivot = candidate_opposite
+            breakout_history = confirmed_history
 
-    if breakout_bar is None:
+    if breakout_bar is None or breakout is None or opposite_pivot is None or breakout_history is None:
         return base._reject(action, "M5_CLOSE_DID_NOT_BREAK_LAST_EXTREMUM")
 
     latest = m5_bars[-1]
-    breakout_held = (
-        latest.close > breakout.price
-        if action == "BUY"
-        else latest.close < breakout.price
-    )
+    breakout_held = latest.close > breakout.price if action == "BUY" else latest.close < breakout.price
     if not breakout_held:
         return base._reject(action, "M5_BREAKOUT_NOT_HELD")
 
-    prior_volumes = [bar.volume for bar in pivot_history[-20:] if bar.volume > 0]
+    prior_volumes = [bar.volume for bar in breakout_history[-20:] if bar.volume > 0]
     if not prior_volumes:
         return base._reject(action, "M5_VOLUME_BASELINE_MISSING")
     median_volume = statistics.median(prior_volumes)
@@ -128,9 +123,7 @@ def evaluate_opportunity(
     target = base._number(
         h1.get("last_swing_high") if action == "BUY" else h1.get("last_swing_low")
     )
-    valid_geometry = (
-        stop < entry < target if action == "BUY" else target < entry < stop
-    )
+    valid_geometry = stop < entry < target if action == "BUY" else target < entry < stop
     if not valid_geometry:
         return base._reject(action, "H1_TARGET_OR_M5_STOP_GEOMETRY_INVALID")
 
@@ -173,7 +166,6 @@ def evaluate_opportunity(
 
 @contextmanager
 def _v133_base_version() -> Iterator[None]:
-    """Make the inherited candidate renderer stamp the v1.33 provenance."""
     previous_version = base.VERSION
     try:
         base.VERSION = VERSION
