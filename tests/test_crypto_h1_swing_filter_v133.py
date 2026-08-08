@@ -88,16 +88,16 @@ def snapshot(
     }
 
 
-def recent_breakout_rows(*, final_close: float = 109.1) -> list[FlowBar]:
+def recent_breakout_rows(*, final_close: float = 109.1, breakout_volume: float = 110.0) -> list[FlowBar]:
     rows = base_history()
-    rows.append(flow(24, 109.0, volume=130.0, delta=500.0))
+    rows.append(flow(24, 109.0, volume=breakout_volume, delta=500.0))
     rows.append(flow(25, 109.3, volume=80.0, delta=-50.0))
     rows.append(flow(26, final_close, volume=90.0, delta=-10.0))
     return rows
 
 
-def test_version_is_v133() -> None:
-    assert VERSION == "1.33.0"
+def test_version_is_v1331() -> None:
+    assert VERSION == "1.33.1"
 
 
 def test_accepts_breakout_from_two_bars_ago_when_level_is_held() -> None:
@@ -106,7 +106,7 @@ def test_accepts_breakout_from_two_bars_ago_when_level_is_held() -> None:
     assert result.eligible is True
     assert result.breakout_level == pytest.approx(108.5)
     assert result.entry == pytest.approx(109.1)
-    assert result.volume_ratio == pytest.approx(1.3)
+    assert result.volume_ratio == pytest.approx(1.1)
     assert result.delta_turnover == pytest.approx(500.0)
     assert "M5_RECENT_EXTREMUM_CLOSE_BREAK" in result.reasons
     assert "M5_BREAKOUT_HELD" in result.reasons
@@ -144,16 +144,35 @@ def test_opposite_m15_structure_break_remains_a_veto() -> None:
     assert result.reasons == ("M15_BREAK_VETO",)
 
 
-def test_breakout_bar_must_still_have_volume_and_delta_confirmation() -> None:
-    rows = base_history()
-    rows.append(flow(24, 109.0, volume=119.0, delta=500.0))
-    rows.append(flow(25, 109.2, volume=500.0, delta=999.0))
-    rows.append(flow(26, 109.1, volume=500.0, delta=999.0))
+def test_breakout_bar_must_still_have_delta_confirmation() -> None:
+    rows = recent_breakout_rows()
+    rows[24] = flow(24, 109.0, volume=110.0, delta=-1.0)
 
     result = evaluate_opportunity("BUY", rows, snapshot())
 
     assert result.eligible is False
+    assert result.reasons == ("M5_DELTA_NOT_BULLISH",)
+
+
+def test_breakout_volume_must_meet_one_x_baseline() -> None:
+    result = evaluate_opportunity(
+        "BUY",
+        recent_breakout_rows(breakout_volume=99.0),
+        snapshot(),
+    )
+
+    assert result.eligible is False
     assert result.reasons == ("M5_VOLUME_BELOW_THRESHOLD",)
+
+
+def test_shadow_rr_floor_is_1_2r() -> None:
+    accepted = evaluate_opportunity("BUY", recent_breakout_rows(), snapshot(target=122.0))
+    rejected = evaluate_opportunity("BUY", recent_breakout_rows(), snapshot(target=121.0))
+
+    assert accepted.eligible is True
+    assert accepted.target_rr >= 1.2
+    assert rejected.eligible is False
+    assert rejected.reasons == ("H1_TARGET_BELOW_MINIMUM_RR",)
 
 
 def test_safety_contract_remains_read_only() -> None:
