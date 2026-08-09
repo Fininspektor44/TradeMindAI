@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +24,7 @@ class ApprovalRequired(RuntimeError):
 
 
 _AI_ROLES = frozenset({Role.ARCHITECT, Role.DEVELOPER, Role.AUDITOR})
+_HASH_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class ControlPlane:
@@ -72,6 +76,7 @@ class ControlPlane:
                     from_state=None,
                     to_state=TaskState.NEW,
                     policy_result=PolicyDecision.AUTO_ALLOWED_WITH_AUDIT,
+                    output_artifact_hashes=task.artifact_refs,
                 ),
             )
         return task
@@ -102,6 +107,12 @@ class ControlPlane:
         elif model_provider is not None or model_name is not None:
             raise UnauthorizedActor("OPERATOR transitions cannot claim model provider metadata")
 
+    @staticmethod
+    def _validate_artifact_hashes(values: tuple[str, ...]) -> None:
+        for value in values:
+            if not _HASH_REF.fullmatch(value):
+                raise ValueError(f"invalid artifact hash reference: {value!r}")
+
     def record_human_approval(
         self,
         task_id: str,
@@ -131,6 +142,17 @@ class ControlPlane:
             task = TaskStore._row_to_task(row)
             if task.state is not TaskState.HUMAN_REQUIRED or task.resume_state is None:
                 raise ApprovalRequired("approval may be recorded only for HUMAN_REQUIRED task")
+
+            existing = db.execute(
+                """
+                SELECT 1 FROM human_approvals
+                WHERE task_id=? AND revision=? AND resume_state=? AND consumed_at IS NULL
+                LIMIT 1
+                """,
+                (task.task_id, task.revision, task.resume_state.value),
+            ).fetchone()
+            if existing is not None:
+                raise ApprovalRequired("an unused approval already exists for this human gate")
 
             db.execute(
                 """
@@ -173,8 +195,10 @@ class ControlPlane:
         policy_result: PolicyDecision | None = None,
         model_provider: str | None = None,
         model_name: str | None = None,
+        output_artifact_hashes: tuple[str, ...] = (),
     ) -> Task:
         """Advance one task and append its audit event atomically."""
+        self._validate_artifact_hashes(output_artifact_hashes)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if revision is None:
@@ -215,16 +239,21 @@ class ControlPlane:
                 target,
                 human_approval_recorded=approval_available,
             )
+            merged_artifacts = tuple(
+                dict.fromkeys((*current.artifact_refs, *output_artifact_hashes))
+            )
+            updated = replace(updated, artifact_refs=merged_artifacts)
             cursor = db.execute(
                 """
                 UPDATE tasks
-                SET state=?, assigned_role=?, resume_state=?
+                SET state=?, assigned_role=?, resume_state=?, artifact_refs_json=?
                 WHERE task_id=? AND revision=? AND state=?
                 """,
                 (
                     updated.state.value,
                     updated.assigned_role.value if updated.assigned_role else None,
                     updated.resume_state.value if updated.resume_state else None,
+                    json.dumps(merged_artifacts),
                     current.task_id,
                     current.revision,
                     current.state.value,
@@ -250,6 +279,7 @@ class ControlPlane:
                     action=action,
                     model_provider=model_provider,
                     model_name=model_name,
+                    output_artifact_hashes=output_artifact_hashes,
                     from_state=current.state,
                     to_state=updated.state,
                     policy_result=policy_result,
