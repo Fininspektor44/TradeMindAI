@@ -39,6 +39,16 @@ class MockProvider:
         )
 
 
+class AlternateArchitectProvider(MockProvider):
+    @property
+    def provider_name(self) -> str:
+        return "alternate-provider"
+
+    @property
+    def model_name(self) -> str:
+        return "alternate-architect-model"
+
+
 class RejectingAuditor(MockProvider):
     def execute(self, envelope: AgentEnvelope) -> AgentResult:
         self.seen.append(envelope)
@@ -186,12 +196,18 @@ def test_cached_result_advances_without_second_provider_call(tmp_path):
         Task.new(task_id="T-cache", goal="reuse exact request", budget_limit=1.0)
     )
     triaged = engine.step("T-cache")
+    provider = providers[Role.ARCHITECT]
     envelope = engine.router.envelope_for(
         triaged,
         role=Role.ARCHITECT,
         required_output_schema="architect-spec-v1",
     )
-    request_hash = budget.request_hash(envelope.to_payload())
+    request_hash = engine._model_request_hash(
+        budget,
+        provider_name=provider.provider_name,
+        model_name=provider.model_name,
+        envelope_payload=envelope.to_payload(),
+    )
     budget.record(
         task_id="T-cache",
         role=Role.ARCHITECT,
@@ -217,6 +233,55 @@ def test_cached_result_advances_without_second_provider_call(tmp_path):
     assert advanced.state is TaskState.SPECIFIED
     assert providers[Role.ARCHITECT].seen == []
     assert budget.total_calls() == 1
+    assert control.audit_log.verify()
+
+
+def test_cache_is_not_reused_after_provider_or_model_change(tmp_path):
+    engine, control, budget, providers = _engine(tmp_path)
+    control.create_task(
+        Task.new(task_id="T-provenance", goal="keep cache provenance", budget_limit=1.0)
+    )
+    triaged = engine.step("T-provenance")
+    original = providers[Role.ARCHITECT]
+    envelope = engine.router.envelope_for(
+        triaged,
+        role=Role.ARCHITECT,
+        required_output_schema="architect-spec-v1",
+    )
+    original_hash = engine._model_request_hash(
+        budget,
+        provider_name=original.provider_name,
+        model_name=original.model_name,
+        envelope_payload=envelope.to_payload(),
+    )
+    budget.record(
+        task_id="T-provenance",
+        role=Role.ARCHITECT,
+        request_hash=original_hash,
+        cost=0.01,
+        tokens=10,
+        success=True,
+        cacheable=True,
+        cache_payload={
+            "success": True,
+            "summary": "old provider result",
+            "artifact_refs": [],
+            "output_schema": "architect-spec-v1",
+            "tokens": 10,
+            "cost": 0.01,
+            "error": None,
+            "decision": "CONTINUE",
+        },
+    )
+
+    alternate = AlternateArchitectProvider(Role.ARCHITECT)
+    providers[Role.ARCHITECT] = alternate
+    engine.router = RoleRouter(providers)
+    advanced = engine.step("T-provenance")
+
+    assert advanced.state is TaskState.SPECIFIED
+    assert len(alternate.seen) == 1
+    assert budget.total_calls() == 2
     assert control.audit_log.verify()
 
 
