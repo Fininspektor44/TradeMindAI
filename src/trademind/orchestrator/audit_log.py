@@ -17,6 +17,15 @@ def _canonical(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _event_payload(event: AuditEvent) -> str:
+    payload = asdict(event)
+    for key in ("actor_role", "from_state", "to_state", "policy_result"):
+        value = payload.get(key)
+        if value is not None:
+            payload[key] = value.value
+    return _canonical(payload)
+
+
 class AuditLog:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -50,44 +59,15 @@ class AuditLog:
                 (_GENESIS,),
             )
 
-    def append(self, event: AuditEvent) -> str:
-        if not self.verify():
-            raise RuntimeError("audit log integrity verification failed before append")
-
-        payload = asdict(event)
-        for key in ("actor_role", "from_state", "to_state", "policy_result"):
-            value = payload.get(key)
-            if value is not None:
-                payload[key] = value.value
-        payload_text = _canonical(payload)
-
-        with self._connect() as db:
-            meta = db.execute(
-                "SELECT head_hash, event_count FROM audit_meta WHERE id=1"
-            ).fetchone()
-            prev_hash = meta["head_hash"]
-            record_hash = hashlib.sha256(
-                (prev_hash + payload_text).encode("utf-8")
-            ).hexdigest()
-            db.execute(
-                "INSERT INTO audit_events(payload, prev_hash, record_hash) VALUES (?, ?, ?)",
-                (payload_text, prev_hash, record_hash),
-            )
-            db.execute(
-                "UPDATE audit_meta SET head_hash=?, event_count=? WHERE id=1",
-                (record_hash, int(meta["event_count"]) + 1),
-            )
-        return record_hash
-
-    def verify(self) -> bool:
+    @staticmethod
+    def verify_connection(db: sqlite3.Connection) -> bool:
         expected_prev = _GENESIS
-        with self._connect() as db:
-            rows = db.execute(
-                "SELECT payload, prev_hash, record_hash FROM audit_events ORDER BY id ASC"
-            ).fetchall()
-            meta = db.execute(
-                "SELECT head_hash, event_count FROM audit_meta WHERE id=1"
-            ).fetchone()
+        rows = db.execute(
+            "SELECT payload, prev_hash, record_hash FROM audit_events ORDER BY id ASC"
+        ).fetchall()
+        meta = db.execute(
+            "SELECT head_hash, event_count FROM audit_meta WHERE id=1"
+        ).fetchone()
 
         if meta is None:
             return False
@@ -101,7 +81,35 @@ class AuditLog:
                 return False
             expected_prev = row["record_hash"]
 
-        return (
-            int(meta["event_count"]) == len(rows)
-            and meta["head_hash"] == expected_prev
+        return int(meta["event_count"]) == len(rows) and meta["head_hash"] == expected_prev
+
+    @staticmethod
+    def append_in_transaction(db: sqlite3.Connection, event: AuditEvent) -> str:
+        """Append using an existing SQLite transaction without committing it."""
+        if not AuditLog.verify_connection(db):
+            raise RuntimeError("audit log integrity verification failed before append")
+
+        payload_text = _event_payload(event)
+        meta = db.execute(
+            "SELECT head_hash, event_count FROM audit_meta WHERE id=1"
+        ).fetchone()
+        prev_hash = meta["head_hash"]
+        record_hash = hashlib.sha256((prev_hash + payload_text).encode("utf-8")).hexdigest()
+        db.execute(
+            "INSERT INTO audit_events(payload, prev_hash, record_hash) VALUES (?, ?, ?)",
+            (payload_text, prev_hash, record_hash),
         )
+        db.execute(
+            "UPDATE audit_meta SET head_hash=?, event_count=? WHERE id=1",
+            (record_hash, int(meta["event_count"]) + 1),
+        )
+        return record_hash
+
+    def append(self, event: AuditEvent) -> str:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self.append_in_transaction(db, event)
+
+    def verify(self) -> bool:
+        with self._connect() as db:
+            return self.verify_connection(db)
