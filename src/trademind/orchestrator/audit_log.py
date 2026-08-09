@@ -30,35 +30,52 @@ class AuditLog:
 
     def _init_schema(self) -> None:
         with self._connect() as db:
-            db.execute(
+            db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     payload TEXT NOT NULL,
                     prev_hash TEXT NOT NULL,
                     record_hash TEXT NOT NULL UNIQUE
-                )
+                );
+                CREATE TABLE IF NOT EXISTS audit_meta (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    head_hash TEXT NOT NULL,
+                    event_count INTEGER NOT NULL
+                );
                 """
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO audit_meta(id, head_hash, event_count) VALUES (1, ?, 0)",
+                (_GENESIS,),
             )
 
     def append(self, event: AuditEvent) -> str:
+        if not self.verify():
+            raise RuntimeError("audit log integrity verification failed before append")
+
         payload = asdict(event)
         for key in ("actor_role", "from_state", "to_state", "policy_result"):
             value = payload.get(key)
             if value is not None:
                 payload[key] = value.value
         payload_text = _canonical(payload)
+
         with self._connect() as db:
-            row = db.execute(
-                "SELECT record_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+            meta = db.execute(
+                "SELECT head_hash, event_count FROM audit_meta WHERE id=1"
             ).fetchone()
-            prev_hash = row["record_hash"] if row else _GENESIS
+            prev_hash = meta["head_hash"]
             record_hash = hashlib.sha256(
                 (prev_hash + payload_text).encode("utf-8")
             ).hexdigest()
             db.execute(
                 "INSERT INTO audit_events(payload, prev_hash, record_hash) VALUES (?, ?, ?)",
                 (payload_text, prev_hash, record_hash),
+            )
+            db.execute(
+                "UPDATE audit_meta SET head_hash=?, event_count=? WHERE id=1",
+                (record_hash, int(meta["event_count"]) + 1),
             )
         return record_hash
 
@@ -68,6 +85,12 @@ class AuditLog:
             rows = db.execute(
                 "SELECT payload, prev_hash, record_hash FROM audit_events ORDER BY id ASC"
             ).fetchall()
+            meta = db.execute(
+                "SELECT head_hash, event_count FROM audit_meta WHERE id=1"
+            ).fetchone()
+
+        if meta is None:
+            return False
         for row in rows:
             if row["prev_hash"] != expected_prev:
                 return False
@@ -77,4 +100,8 @@ class AuditLog:
             if row["record_hash"] != expected_hash:
                 return False
             expected_prev = row["record_hash"]
-        return True
+
+        return (
+            int(meta["event_count"]) == len(rows)
+            and meta["head_hash"] == expected_prev
+        )
