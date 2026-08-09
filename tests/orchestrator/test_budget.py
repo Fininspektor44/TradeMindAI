@@ -48,9 +48,18 @@ def test_per_task_limit_and_persistence(tmp_path):
     assert not result.allowed
 
 
-def test_cache_deduplicates_identical_request(tmp_path):
+def test_cache_deduplicates_and_restores_identical_result(tmp_path):
     manager = make_manager(tmp_path)
     request_hash = manager.request_hash({"goal": "same"})
+    payload = {
+        "success": True,
+        "summary": "cached answer",
+        "artifact_refs": [],
+        "output_schema": "result-v1",
+        "tokens": 10,
+        "cost": 0.1,
+        "error": None,
+    }
     manager.record(
         task_id="T",
         role=Role.ARCHITECT,
@@ -59,11 +68,15 @@ def test_cache_deduplicates_identical_request(tmp_path):
         tokens=10,
         success=True,
         cacheable=True,
+        cache_payload=payload,
     )
-    result = manager.check(
+
+    reopened = make_manager(tmp_path)
+    result = reopened.check(
         task_id="OTHER", role=Role.ARCHITECT, request_hash=request_hash
     )
     assert result.allowed and result.cached
+    assert reopened.cached_result(request_hash) == payload
 
 
 def test_projected_cost_and_token_usage_cannot_overshoot_ceiling(tmp_path):
