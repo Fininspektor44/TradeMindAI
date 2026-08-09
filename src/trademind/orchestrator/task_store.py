@@ -52,30 +52,39 @@ class TaskStore:
                 """
             )
 
-    def save(self, task: Task) -> None:
-        """Insert a new immutable revision. Existing revisions cannot be replaced."""
+    @staticmethod
+    def _validate_new_revision(task: Task) -> None:
         if (
             task.state is not TaskState.NEW
             or task.assigned_role is not Role.OPERATOR
             or task.resume_state is not None
         ):
             raise RevisionConflict("new task revisions must be inserted in pristine NEW state")
+
+    @classmethod
+    def insert_in_transaction(cls, db: sqlite3.Connection, task: Task) -> None:
+        """Insert one pristine revision without committing the caller's transaction."""
+        cls._validate_new_revision(task)
         try:
-            with self._connect() as db:
-                db.execute(
-                    """
-                    INSERT INTO tasks (
-                        task_id, revision, parent_task_id, created_at, goal, scope_json,
-                        risk_class, state, assigned_role, allowed_tools_json, budget_limit,
-                        acceptance_criteria_json, artifact_refs_json, priority, resume_state
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    self._values(task),
-                )
+            db.execute(
+                """
+                INSERT INTO tasks (
+                    task_id, revision, parent_task_id, created_at, goal, scope_json,
+                    risk_class, state, assigned_role, allowed_tools_json, budget_limit,
+                    acceptance_criteria_json, artifact_refs_json, priority, resume_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                cls._values(task),
+            )
         except sqlite3.IntegrityError as exc:
             raise RevisionConflict(
                 f"task revision already exists: {task.task_id}@{task.revision}"
             ) from exc
+
+    def save(self, task: Task) -> None:
+        """Insert a new immutable revision. Existing revisions cannot be replaced."""
+        with self._connect() as db:
+            self.insert_in_transaction(db, task)
 
     def advance(
         self,
