@@ -93,9 +93,12 @@ class BudgetManager:
         now: datetime | None = None,
         estimated_cost: float = 0.0,
         estimated_tokens: int = 0,
+        task_cost_ceiling: float | None = None,
     ) -> BudgetCheck:
         if estimated_cost < 0 or estimated_tokens < 0:
             raise ValueError("estimated cost and tokens must be non-negative")
+        if task_cost_ceiling is not None and task_cost_ceiling < 0:
+            raise ValueError("task_cost_ceiling must be non-negative")
 
         current = now or datetime.now(timezone.utc)
         day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -121,12 +124,20 @@ class BudgetManager:
                 if current < failed_at + timedelta(seconds=self.failure_cooldown_seconds):
                     return BudgetCheck(False, "failure cooldown is active")
 
-            task_calls = db.execute(
-                "SELECT COUNT(*) AS n FROM model_usage WHERE task_id=?",
+            task_row = db.execute(
+                """
+                SELECT COUNT(*) AS calls, COALESCE(SUM(cost), 0) AS cost
+                FROM model_usage WHERE task_id=?
+                """,
                 (task_id,),
-            ).fetchone()["n"]
-            if task_calls >= self.per_task_call_limit:
+            ).fetchone()
+            if int(task_row["calls"]) >= self.per_task_call_limit:
                 return BudgetCheck(False, "per-task model call limit exhausted")
+            if (
+                task_cost_ceiling is not None
+                and float(task_row["cost"]) + estimated_cost > task_cost_ceiling
+            ):
+                return BudgetCheck(False, "task model cost ceiling would be exceeded")
 
             # Role limits are a daily throttle. A lifetime counter would permanently
             # disable a role after enough successful days, which is unsafe for a 24/7 service.
