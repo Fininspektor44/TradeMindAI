@@ -70,19 +70,24 @@ class MockRunReport:
 
 
 def _default_state_dir(run_id: str) -> Path:
-    return Path(tempfile.gettempdir()) / "trademind-orchestrator-mock" / run_id
+    # Keep this intentionally short. Windows installations without long-path
+    # support can otherwise fail while pytest creates nested tmp_path fixtures.
+    return Path(tempfile.gettempdir()) / "tmai-mock" / run_id
 
 
-def _default_test_template(basetemp: Path) -> CommandTemplate:
+def _default_test_template() -> CommandTemplate:
+    basetemp = Path(tempfile.gettempdir()) / f"tmai-inner-{uuid.uuid4().hex[:8]}"
     return CommandTemplate(
         executable=sys.executable,
         args=(
             "-m",
             "pytest",
             "-q",
-            "tests/orchestrator",
+            "-p",
+            "no:cacheprovider",
             "--basetemp",
             str(basetemp),
+            "tests/orchestrator",
         ),
         timeout_seconds=180.0,
     )
@@ -125,10 +130,9 @@ def run_mock_cycle(
         monthly_token_ceiling=10_000,
     )
     artifacts = ArtifactStore(state_root / "artifacts")
-    default_test_template = _default_test_template(state_root / "pytest-basetemp")
     tools = ToolRunner(
         allowed_roots=(root,),
-        templates={"orchestrator-tests": test_template or default_test_template},
+        templates={"orchestrator-tests": test_template or _default_test_template()},
     )
     engine = WorkflowEngine(
         control=control,
