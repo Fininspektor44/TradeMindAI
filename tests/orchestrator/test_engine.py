@@ -139,6 +139,45 @@ def test_zero_task_cost_budget_blocks_spend_even_with_global_budget(tmp_path):
     assert budget.total_calls() == 0
 
 
+def test_cached_result_advances_without_second_provider_call(tmp_path):
+    engine, control, budget, providers = _engine(tmp_path)
+    control.create_task(
+        Task.new(task_id="T-cache", goal="reuse exact request", budget_limit=1.0)
+    )
+    triaged = engine.step("T-cache")
+    envelope = engine.router.envelope_for(
+        triaged,
+        role=Role.ARCHITECT,
+        required_output_schema="architect-spec-v1",
+    )
+    request_hash = budget.request_hash(envelope.to_payload())
+    budget.record(
+        task_id="T-cache",
+        role=Role.ARCHITECT,
+        request_hash=request_hash,
+        cost=0.01,
+        tokens=10,
+        success=True,
+        cacheable=True,
+        cache_payload={
+            "success": True,
+            "summary": "persisted prior result",
+            "artifact_refs": [],
+            "output_schema": "architect-spec-v1",
+            "tokens": 10,
+            "cost": 0.01,
+            "error": None,
+        },
+    )
+
+    advanced = engine.step("T-cache")
+
+    assert advanced.state is TaskState.SPECIFIED
+    assert providers[Role.ARCHITECT].seen == []
+    assert budget.total_calls() == 1
+    assert control.audit_log.verify()
+
+
 def test_failed_operator_tests_fail_closed_and_keep_test_artifact(tmp_path):
     engine, control, _, _ = _engine(tmp_path)
     engine.tools = ToolRunner(
