@@ -85,7 +85,10 @@ def transition(
         return replace(task, state=target, assigned_role=next_role_for_state(target))
 
     if current in _ACTIVE and target in _FAILURE_FROM_ACTIVE:
-        resume_state = expected if target is TaskState.HUMAN_REQUIRED else None
+        # HUMAN_REQUIRED is a pause, not an implicit successful advancement.
+        # After approval the task resumes from the same durable state and the
+        # gated action must be attempted again under the recorded approval.
+        resume_state = current if target is TaskState.HUMAN_REQUIRED else None
         return replace(task, state=target, resume_state=resume_state, assigned_role=None)
 
     raise InvalidTransition(f"illegal transition {current} -> {target}")
