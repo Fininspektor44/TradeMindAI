@@ -282,6 +282,88 @@ class ControlPlane:
             )
             return updated
 
+    def reject_and_create_revision(
+        self,
+        task_id: str,
+        *,
+        revision: int | None = None,
+        actor_role: Role = Role.AUDITOR,
+        action: str = "AUDITOR_REJECT",
+        policy_result: PolicyDecision | None = None,
+        model_provider: str | None = None,
+        model_name: str | None = None,
+        output_artifact_hashes: tuple[str, ...] = (),
+        reason: str = "",
+    ) -> Task:
+        """Reject the current revision and atomically create a pristine successor revision."""
+        self._validate_artifact_hashes(output_artifact_hashes)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = TaskStore._row_to_task(self._task_row(db, task_id, revision))
+            self._validate_actor(
+                current,
+                actor_role=actor_role,
+                approval_available=False,
+                model_provider=model_provider,
+                model_name=model_name,
+            )
+            rejected = transition(current, TaskState.REJECTED)
+            rejected = self._persist_transition(
+                db,
+                current,
+                rejected,
+                output_artifact_hashes,
+            )
+            timestamp = datetime.now(timezone.utc).isoformat()
+            AuditLog.append_in_transaction(
+                db,
+                AuditEvent(
+                    timestamp=timestamp,
+                    task_id=current.task_id,
+                    revision=current.revision,
+                    actor_role=actor_role,
+                    action=action,
+                    model_provider=model_provider,
+                    model_name=model_name,
+                    output_artifact_hashes=output_artifact_hashes,
+                    from_state=current.state,
+                    to_state=TaskState.REJECTED,
+                    policy_result=policy_result,
+                    error=reason or None,
+                ),
+            )
+
+            successor = replace(
+                current,
+                revision=current.revision + 1,
+                parent_task_id=f"{current.task_id}@{current.revision}",
+                created_at=timestamp,
+                state=TaskState.NEW,
+                assigned_role=Role.OPERATOR,
+                artifact_refs=(),
+                resume_state=None,
+            )
+            TaskStore.insert_in_transaction(db, successor)
+            AuditLog.append_in_transaction(
+                db,
+                AuditEvent(
+                    timestamp=timestamp,
+                    task_id=successor.task_id,
+                    revision=successor.revision,
+                    actor_role=Role.OPERATOR,
+                    action="CREATE_REVISION_AFTER_REJECTION",
+                    input_artifact_hashes=output_artifact_hashes,
+                    from_state=None,
+                    to_state=TaskState.NEW,
+                    policy_result=PolicyDecision.AUTO_ALLOWED_WITH_AUDIT,
+                    metadata={
+                        "parent_task_id": successor.parent_task_id,
+                        "rejection_reason": reason,
+                    },
+                ),
+            )
+            return successor
+
     def advance(
         self,
         task_id: str,
