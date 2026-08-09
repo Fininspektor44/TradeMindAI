@@ -73,10 +73,17 @@ def _default_state_dir(run_id: str) -> Path:
     return Path(tempfile.gettempdir()) / "trademind-orchestrator-mock" / run_id
 
 
-def _default_test_template() -> CommandTemplate:
+def _default_test_template(basetemp: Path) -> CommandTemplate:
     return CommandTemplate(
         executable=sys.executable,
-        args=("-m", "pytest", "-q", "tests/orchestrator"),
+        args=(
+            "-m",
+            "pytest",
+            "-q",
+            "tests/orchestrator",
+            "--basetemp",
+            str(basetemp),
+        ),
         timeout_seconds=180.0,
     )
 
@@ -118,9 +125,10 @@ def run_mock_cycle(
         monthly_token_ceiling=10_000,
     )
     artifacts = ArtifactStore(state_root / "artifacts")
+    default_test_template = _default_test_template(state_root / "pytest-basetemp")
     tools = ToolRunner(
         allowed_roots=(root,),
-        templates={"orchestrator-tests": test_template or _default_test_template()},
+        templates={"orchestrator-tests": test_template or default_test_template},
     )
     engine = WorkflowEngine(
         control=control,
