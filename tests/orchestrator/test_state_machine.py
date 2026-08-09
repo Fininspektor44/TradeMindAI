@@ -25,6 +25,7 @@ def test_happy_path_and_completed_is_immutable():
 
 def test_roles_are_separated_across_author_review_implementation_and_audit():
     task = Task.new(task_id="T-role", goal="separate duties")
+    assert task.assigned_role is Role.OPERATOR
 
     task = transition(task, TaskState.TRIAGED)
     assert task.assigned_role is Role.ARCHITECT
@@ -33,7 +34,7 @@ def test_roles_are_separated_across_author_review_implementation_and_audit():
     assert task.assigned_role is Role.AUDITOR
 
     task = transition(task, TaskState.ARCH_REVIEWED)
-    assert task.assigned_role is Role.DEVELOPER
+    assert task.assigned_role is Role.OPERATOR
 
     task = transition(task, TaskState.IMPLEMENTING)
     assert task.assigned_role is Role.DEVELOPER
