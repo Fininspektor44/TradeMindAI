@@ -92,7 +92,7 @@ class Task:
             scope=tuple(scope),
             risk_class=risk_class,
             state=TaskState.NEW,
-            assigned_role=None,
+            assigned_role=Role.OPERATOR,
             allowed_tools=tuple(allowed_tools),
             budget_limit=float(budget_limit),
             acceptance_criteria=tuple(acceptance_criteria),
