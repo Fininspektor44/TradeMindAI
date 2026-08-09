@@ -11,6 +11,10 @@ from .models import Role
 SCHEMA_VERSION = "orchestrator-agent-v1"
 
 
+class AgentProtocolError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class AgentEnvelope:
     task_id: str
@@ -23,6 +27,16 @@ class AgentEnvelope:
     artifact_refs: tuple[str, ...]
     required_output_schema: str
     schema_version: str = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.task_id.strip():
+            raise ValueError("task_id must not be empty")
+        if self.revision < 1:
+            raise ValueError("revision must be positive")
+        if not self.goal.strip():
+            raise ValueError("goal must not be empty")
+        if not self.required_output_schema.strip():
+            raise ValueError("required_output_schema must not be empty")
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -54,6 +68,10 @@ class AgentResult:
             raise ValueError("agent usage must be non-negative")
         if self.success and self.error:
             raise ValueError("successful agent result cannot contain an error")
+        if self.success and not self.output_schema.strip():
+            raise ValueError("successful agent result must declare output_schema")
+        if not self.success and not self.error:
+            raise ValueError("failed agent result must contain an error")
 
 
 class AgentProvider(Protocol):
@@ -66,3 +84,13 @@ class AgentProvider(Protocol):
     def model_name(self) -> str: ...
 
     def execute(self, envelope: AgentEnvelope) -> AgentResult: ...
+
+
+def validate_result(envelope: AgentEnvelope, result: AgentResult) -> AgentResult:
+    """Reject a successful response whose schema does not match the frozen request."""
+    if result.success and result.output_schema != envelope.required_output_schema:
+        raise AgentProtocolError(
+            "agent output schema mismatch: "
+            f"expected {envelope.required_output_schema}, got {result.output_schema}"
+        )
+    return result
