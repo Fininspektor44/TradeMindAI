@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 
@@ -118,9 +119,13 @@ def test_complete_mock_cycle_separates_roles_and_preserves_evidence(tmp_path):
     assert control.audit_log.verify()
 
     with sqlite3.connect(control.path) as db:
-        events = db.execute(
-            "SELECT COUNT(*) FROM audit_events WHERE task_id='T-cycle'"
-        ).fetchone()[0]
+        payloads = [
+            row[0]
+            for row in db.execute("SELECT payload FROM audit_events").fetchall()
+        ]
+    events = sum(
+        1 for payload in payloads if json.loads(payload)["task_id"] == "T-cycle"
+    )
     assert events == 9
 
 
