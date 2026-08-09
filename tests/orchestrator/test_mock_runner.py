@@ -5,15 +5,14 @@ from trademind.orchestrator.mock_runner import run_mock_cycle
 from trademind.orchestrator.tool_runner import CommandTemplate
 
 
-def _repo(tmp_path):
-    (tmp_path / "pyproject.toml").write_text("[project]\nname='mock'\n", encoding="utf-8")
-    return tmp_path
+def _repo(path):
+    path.mkdir()
+    (path / "pyproject.toml").write_text("[project]\nname='mock'\n", encoding="utf-8")
+    return path
 
 
 def test_mock_runner_completes_with_local_deterministic_providers(tmp_path):
     repo = _repo(tmp_path / "repo")
-    repo.mkdir(exist_ok=True)
-    (repo / "pyproject.toml").write_text("[project]\nname='mock'\n", encoding="utf-8")
     state_dir = tmp_path / "state"
     report = run_mock_cycle(
         repo_root=repo,
@@ -37,9 +36,7 @@ def test_mock_runner_completes_with_local_deterministic_providers(tmp_path):
 
 
 def test_mock_runner_fails_closed_when_operator_test_command_fails(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "pyproject.toml").write_text("[project]\nname='mock'\n", encoding="utf-8")
+    repo = _repo(tmp_path / "repo")
 
     report = run_mock_cycle(
         repo_root=repo,
