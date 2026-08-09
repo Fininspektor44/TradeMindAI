@@ -55,6 +55,27 @@ class ControlPlane:
                 """
             )
 
+    def create_task(self, task: Task) -> Task:
+        """Persist a pristine task and its creation audit in one transaction."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            TaskStore.insert_in_transaction(db, task)
+            AuditLog.append_in_transaction(
+                db,
+                AuditEvent(
+                    timestamp=timestamp,
+                    task_id=task.task_id,
+                    revision=task.revision,
+                    actor_role=Role.OPERATOR,
+                    action="CREATE_TASK",
+                    from_state=None,
+                    to_state=TaskState.NEW,
+                    policy_result=PolicyDecision.AUTO_ALLOWED_WITH_AUDIT,
+                ),
+            )
+        return task
+
     @staticmethod
     def _validate_actor(
         current: Task,
