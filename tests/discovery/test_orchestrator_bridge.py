@@ -6,6 +6,7 @@ from trademind.discovery.orchestrator_bridge import (
     DiscoveryBridgeError,
     DiscoveryOrchestratorBridge,
 )
+from trademind.orchestrator.artifact_store import ArtifactStore
 from trademind.orchestrator.control_plane import ControlPlane
 from trademind.orchestrator.models import Role, TaskState
 
@@ -43,31 +44,50 @@ def _frozen_case(tmp_path):
     manifest_hash = manifest.freeze(frozen_path)
     registry.freeze(manifest.hypothesis_id, manifest_hash=manifest_hash)
     control = ControlPlane(tmp_path / "orchestrator.db")
-    bridge = DiscoveryOrchestratorBridge(registry=registry, control=control)
-    return dataset, frozen_path, manifest, registry, control, bridge
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    bridge = DiscoveryOrchestratorBridge(
+        registry=registry,
+        control=control,
+        artifacts=artifacts,
+    )
+    return dataset, frozen_path, manifest, registry, control, artifacts, bridge
 
 
 def test_frozen_hypothesis_creates_zero_budget_bounded_task(tmp_path):
-    _, frozen_path, manifest, registry, control, bridge = _frozen_case(tmp_path)
+    dataset, frozen_path, manifest, registry, control, artifacts, bridge = _frozen_case(tmp_path)
 
     task = bridge.submit_frozen_hypothesis(
         manifest.hypothesis_id,
         manifest_path=frozen_path,
     )
 
-    assert task.task_id == "discovery:H-BRIDGE"
+    assert task.task_id.startswith("discovery-")
+    assert ":" not in task.task_id
     assert task.state is TaskState.NEW
     assert task.assigned_role is Role.OPERATOR
     assert task.budget_limit == 0.0
+    assert task.scope == ("src/trademind/discovery",)
+    assert str(frozen_path) not in task.scope
     assert "Final-holdout access is forbidden" in task.goal
     assert any("manifest_sha256=" in item for item in task.acceptance_criteria)
+    assert len(task.artifact_refs) == 1
     assert registry.get(manifest.hypothesis_id).state is HypothesisState.FROZEN
     assert registry.family_status(manifest.hypothesis_family_id)["holdout_consumed"] is False
     assert control.audit_log.verify()
 
+    brief_files = list(artifacts.root.rglob("*research-brief*.json"))
+    assert len(brief_files) == 1
+    brief_text = brief_files[0].read_text(encoding="utf-8")
+    brief = json.loads(brief_text)
+    assert "datasets" not in brief
+    assert str(dataset) not in brief_text
+    assert str(frozen_path) not in brief_text
+    assert brief["hypothesis_family_id"] == manifest.hypothesis_family_id
+    assert brief["content_hash"] == manifest.content_hash
+
 
 def test_positive_budget_is_explicit_opt_in(tmp_path):
-    _, frozen_path, manifest, _, _, bridge = _frozen_case(tmp_path)
+    _, frozen_path, manifest, _, _, _, bridge = _frozen_case(tmp_path)
     task = bridge.submit_frozen_hypothesis(
         manifest.hypothesis_id,
         manifest_path=frozen_path,
@@ -77,7 +97,7 @@ def test_positive_budget_is_explicit_opt_in(tmp_path):
 
 
 def test_unfrozen_hypothesis_is_rejected(tmp_path):
-    _, frozen_path, manifest, registry, _, bridge = _frozen_case(tmp_path)
+    _, frozen_path, manifest, registry, _, _, bridge = _frozen_case(tmp_path)
     registry.transition(manifest.hypothesis_id, HypothesisState.TRAIN_TESTED)
 
     try:
@@ -89,7 +109,7 @@ def test_unfrozen_hypothesis_is_rejected(tmp_path):
 
 
 def test_manifest_or_dataset_tamper_is_rejected(tmp_path):
-    dataset, frozen_path, manifest, _, _, bridge = _frozen_case(tmp_path)
+    dataset, frozen_path, manifest, _, _, _, bridge = _frozen_case(tmp_path)
     dataset.write_text("tampered\n", encoding="utf-8")
 
     try:
@@ -101,7 +121,7 @@ def test_manifest_or_dataset_tamper_is_rejected(tmp_path):
 
 
 def test_registry_manifest_identity_mismatch_is_rejected(tmp_path):
-    _, frozen_path, manifest, _, _, bridge = _frozen_case(tmp_path)
+    _, frozen_path, manifest, _, _, _, bridge = _frozen_case(tmp_path)
     document = json.loads(frozen_path.read_text(encoding="utf-8"))
     document["manifest"]["hypothesis_id"] = "RENAMED"
     frozen_path.write_text(json.dumps(document), encoding="utf-8")
@@ -115,7 +135,7 @@ def test_registry_manifest_identity_mismatch_is_rejected(tmp_path):
 
 
 def test_same_frozen_hypothesis_cannot_be_submitted_twice(tmp_path):
-    _, frozen_path, manifest, _, _, bridge = _frozen_case(tmp_path)
+    _, frozen_path, manifest, _, _, _, bridge = _frozen_case(tmp_path)
     bridge.submit_frozen_hypothesis(manifest.hypothesis_id, manifest_path=frozen_path)
 
     try:
