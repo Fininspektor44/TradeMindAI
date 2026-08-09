@@ -13,7 +13,9 @@ Write-Host "[1/3] Ruff: Orchestrator v1"
 if ($LASTEXITCODE -ne 0) { throw "Orchestrator ruff gate failed with exit code $LASTEXITCODE" }
 
 Write-Host "[2/3] Pytest: focused Orchestrator suite"
-& $Python -m pytest -q tests\orchestrator
+$FocusedBaseTemp = Join-Path $RepoRoot (".orchestrator_pytest\focused-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $FocusedBaseTemp) | Out-Null
+& $Python -m pytest -q tests\orchestrator --basetemp $FocusedBaseTemp
 if ($LASTEXITCODE -ne 0) { throw "Orchestrator pytest gate failed with exit code $LASTEXITCODE" }
 
 Write-Host "[3/3] End-to-end deterministic mock cycle"
