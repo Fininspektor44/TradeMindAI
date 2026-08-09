@@ -419,7 +419,17 @@ Build only the control skeleton:
 7. `dispatcher.py`
 8. synthetic tests for state, policy, persistence and budget behavior
 
-Do not integrate OpenAI, Anthropic, brokers, Telegram or market data in this slice.
+## 13. Current implementation checkpoint
 
-The first slice proves that the control plane is deterministic and restart-safe before external agents
-are allowed to act through it.
+The active development branch additionally contains a bounded implementation slice for local validation:
+
+- `WorkflowEngine` for the role-separated mock lifecycle;
+- deterministic mock `AgentProvider` implementations for validation only;
+- a content-addressed artifact store and allow-listed local tool runner;
+- durable `HUMAN_REQUIRED` approval records;
+- local JSONL notification sink and long-running service loop primitives;
+- `trademind-orchestrator-mock` plus `scripts/run_orchestrator_mock.ps1` for a one-command SER8 validation;
+- synthetic tests covering idle operation with zero engine/model work and human/failure escalation.
+
+This checkpoint still contains **no real OpenAI/Anthropic adapter and no broker or market execution path**.
+The mock runner is intended to establish a local evidence baseline before any external model API is enabled.
