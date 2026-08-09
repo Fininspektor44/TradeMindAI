@@ -1,15 +1,18 @@
 """Protective bridge from frozen Discovery hypotheses into Orchestrator tasks.
 
 The bridge is deliberately narrow: it may submit work for a hypothesis only after
-its manifest is frozen and externally anchored in the hypothesis registry. It
-never exposes, consumes, or authorizes final-holdout data.
+its manifest is frozen and externally anchored in the hypothesis registry. Raw
+dataset paths are used locally for verification but are never exposed in the task
+envelope or research brief, because the source artifact may contain final holdout.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from trademind.orchestrator.artifact_store import ArtifactStore
 from trademind.orchestrator.control_plane import ControlPlane
 from trademind.orchestrator.models import RiskClass, Task
 
@@ -29,6 +32,12 @@ class DiscoveryTaskBinding:
     orchestrator_task_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedFrozenHypothesis:
+    binding: DiscoveryTaskBinding
+    manifest_payload: dict
+
+
 class DiscoveryOrchestratorBridge:
     """Validate a frozen hypothesis and create one bounded Orchestrator task."""
 
@@ -37,16 +46,23 @@ class DiscoveryOrchestratorBridge:
         *,
         registry: HypothesisRegistry,
         control: ControlPlane,
+        artifacts: ArtifactStore,
     ) -> None:
         self.registry = registry
         self.control = control
+        self.artifacts = artifacts
+
+    @staticmethod
+    def _task_id(hypothesis_id: str) -> str:
+        digest = hashlib.sha256(hypothesis_id.encode("utf-8")).hexdigest()[:20]
+        return f"discovery-{digest}"
 
     def validate_frozen_hypothesis(
         self,
         hypothesis_id: str,
         *,
         manifest_path: str | Path,
-    ) -> DiscoveryTaskBinding:
+    ) -> ValidatedFrozenHypothesis:
         record = self.registry.get(hypothesis_id)
         if record.state is not HypothesisState.FROZEN:
             raise DiscoveryBridgeError(
@@ -80,12 +96,34 @@ class DiscoveryOrchestratorBridge:
         if payload.get("content_hash") != record.content_hash:
             raise DiscoveryBridgeError("manifest content identity does not match registry")
 
-        return DiscoveryTaskBinding(
+        binding = DiscoveryTaskBinding(
             hypothesis_id=record.hypothesis_id,
             hypothesis_family_id=record.hypothesis_family_id,
             manifest_hash=record.manifest_hash,
-            orchestrator_task_id=f"discovery:{record.hypothesis_id}",
+            orchestrator_task_id=self._task_id(record.hypothesis_id),
         )
+        return ValidatedFrozenHypothesis(binding=binding, manifest_payload=dict(payload))
+
+    @staticmethod
+    def _safe_research_brief(validated: ValidatedFrozenHypothesis) -> dict:
+        payload = validated.manifest_payload
+        return {
+            "schema_version": "discovery-orchestrator-bridge-v1",
+            "hypothesis_id": validated.binding.hypothesis_id,
+            "hypothesis_family_id": validated.binding.hypothesis_family_id,
+            "content_hash": payload["content_hash"],
+            "manifest_hash": validated.binding.manifest_hash,
+            "family_definition": payload["family_definition"],
+            "parameters": payload["parameters"],
+            "test_family": payload["test_family"],
+            "primary_metric": payload["primary_metric"],
+            "alpha": payload["alpha"],
+            "q": payload["q"],
+            "minimum_effect_size": payload["minimum_effect_size"],
+            "max_hypotheses_tests": payload["max_hypotheses_tests"],
+            "manifest_schema_version": payload["schema_version"],
+            "git_commit": payload["git_commit"],
+        }
 
     def submit_frozen_hypothesis(
         self,
@@ -103,12 +141,20 @@ class DiscoveryOrchestratorBridge:
         if budget_limit < 0:
             raise ValueError("budget_limit must not be negative")
 
-        binding = self.validate_frozen_hypothesis(
+        validated = self.validate_frozen_hypothesis(
             hypothesis_id,
             manifest_path=manifest_path,
         )
+        binding = validated.binding
         if self.control.task_store.get(binding.orchestrator_task_id) is not None:
             raise DiscoveryBridgeError("frozen hypothesis already has an Orchestrator task")
+
+        brief = self.artifacts.store_json(
+            task_id=binding.orchestrator_task_id,
+            revision=1,
+            kind="research-brief",
+            payload=self._safe_research_brief(validated),
+        )
 
         task = Task.new(
             task_id=binding.orchestrator_task_id,
@@ -116,19 +162,18 @@ class DiscoveryOrchestratorBridge:
                 "Implement and validate the frozen Discovery hypothesis using only "
                 "discovery and validation data. Final-holdout access is forbidden."
             ),
-            scope=(
-                "src/trademind/discovery",
-                str(Path(manifest_path)),
-            ),
+            scope=("src/trademind/discovery",),
             risk_class=RiskClass.LOW,
             budget_limit=budget_limit,
             acceptance_criteria=(
                 f"manifest_sha256={binding.manifest_hash}",
                 f"hypothesis_family_id={binding.hypothesis_family_id}",
+                "research brief contains no raw dataset paths",
                 "frozen manifest and dataset hashes remain valid",
                 "no final-holdout data is read, returned, or consumed",
                 "no broker order or live trading side effect is allowed",
             ),
             priority=priority,
         )
+        task = replace(task, artifact_refs=(brief.hash_ref,))
         return self.control.create_task(task)
