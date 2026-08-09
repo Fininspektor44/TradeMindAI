@@ -1,4 +1,4 @@
-from trademind.orchestrator.models import Task, TaskState
+from trademind.orchestrator.models import Role, Task, TaskState
 from trademind.orchestrator.state_machine import InvalidTransition, transition
 
 
@@ -23,6 +23,34 @@ def test_happy_path_and_completed_is_immutable():
         raise AssertionError("COMPLETED must be immutable")
 
 
+def test_roles_are_separated_across_author_review_implementation_and_audit():
+    task = Task.new(task_id="T-role", goal="separate duties")
+
+    task = transition(task, TaskState.TRIAGED)
+    assert task.assigned_role is Role.ARCHITECT
+
+    task = transition(task, TaskState.SPECIFIED)
+    assert task.assigned_role is Role.AUDITOR
+
+    task = transition(task, TaskState.ARCH_REVIEWED)
+    assert task.assigned_role is Role.DEVELOPER
+
+    task = transition(task, TaskState.IMPLEMENTING)
+    assert task.assigned_role is Role.DEVELOPER
+
+    task = transition(task, TaskState.TESTING)
+    assert task.assigned_role is Role.OPERATOR
+
+    task = transition(task, TaskState.AUDITING)
+    assert task.assigned_role is Role.AUDITOR
+
+    task = transition(task, TaskState.READY)
+    assert task.assigned_role is Role.OPERATOR
+
+    task = transition(task, TaskState.COMPLETED)
+    assert task.assigned_role is None
+
+
 def test_human_required_pauses_and_resumes_same_state_only_after_approval():
     task = Task.new(task_id="T2", goal="change")
     task = transition(task, TaskState.TRIAGED)
@@ -45,3 +73,4 @@ def test_human_required_pauses_and_resumes_same_state_only_after_approval():
     resumed = transition(task, TaskState.TRIAGED, human_approval_recorded=True)
     assert resumed.state is TaskState.TRIAGED
     assert resumed.resume_state is None
+    assert resumed.assigned_role is Role.ARCHITECT
