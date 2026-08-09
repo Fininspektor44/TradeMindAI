@@ -1,14 +1,15 @@
 from dataclasses import replace
 
-from trademind.orchestrator.agent_protocol import AgentEnvelope, AgentResult
+from trademind.orchestrator.agent_protocol import AgentEnvelope, AgentProtocolError, AgentResult
 from trademind.orchestrator.models import Role, Task
 from trademind.orchestrator.policy import FORBIDDEN_ACTIONS
 from trademind.orchestrator.role_router import RoleRouter, RoleRoutingError
 
 
 class MockProvider:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, output_schema: str | None = None) -> None:
         self._name = name
+        self._output_schema = output_schema
         self.seen: list[AgentEnvelope] = []
 
     @property
@@ -24,7 +25,7 @@ class MockProvider:
         return AgentResult(
             success=True,
             summary=f"handled by {self._name}",
-            output_schema=envelope.required_output_schema,
+            output_schema=self._output_schema or envelope.required_output_schema,
         )
 
 
@@ -89,6 +90,16 @@ def test_missing_provider_hard_fails():
         pass
     else:
         raise AssertionError("missing provider must not silently fall back")
+
+
+def test_mismatched_output_schema_is_rejected():
+    router = RoleRouter({Role.AUDITOR: MockProvider("bad", output_schema="wrong-v9")})
+    try:
+        router.execute(_task(), role=Role.AUDITOR, required_output_schema="audit-v1")
+    except AgentProtocolError:
+        pass
+    else:
+        raise AssertionError("mismatched model output schema must be rejected")
 
 
 def test_envelope_contains_only_structured_task_metadata_and_policy_boundary():
