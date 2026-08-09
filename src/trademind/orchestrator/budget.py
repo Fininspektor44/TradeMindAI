@@ -74,15 +74,36 @@ class BudgetManager:
                 );
                 CREATE TABLE IF NOT EXISTS request_cache (
                     request_hash TEXT PRIMARY KEY,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    result_json TEXT
                 );
                 """
             )
+            columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(request_cache)").fetchall()
+            }
+            if "result_json" not in columns:
+                db.execute("ALTER TABLE request_cache ADD COLUMN result_json TEXT")
 
     @staticmethod
     def request_hash(payload: dict) -> str:
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def cached_result(self, request_hash: str) -> dict | None:
+        """Return a previously persisted successful result for this exact request."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT result_json FROM request_cache WHERE request_hash=?",
+                (request_hash,),
+            ).fetchone()
+        if row is None or row["result_json"] is None:
+            return None
+        payload = json.loads(row["result_json"])
+        if not isinstance(payload, dict):
+            raise RuntimeError("cached model result must be a JSON object")
+        return payload
 
     def check(
         self,
@@ -105,10 +126,11 @@ class BudgetManager:
         month_start = day_start.replace(day=1)
 
         with self._connect() as db:
-            if db.execute(
-                "SELECT 1 FROM request_cache WHERE request_hash=?",
+            cached = db.execute(
+                "SELECT result_json FROM request_cache WHERE request_hash=?",
                 (request_hash,),
-            ).fetchone():
+            ).fetchone()
+            if cached is not None and cached["result_json"] is not None:
                 return BudgetCheck(True, "materially identical request is cached", cached=True)
 
             last_failure = db.execute(
@@ -139,8 +161,6 @@ class BudgetManager:
             ):
                 return BudgetCheck(False, "task model cost ceiling would be exceeded")
 
-            # Role limits are a daily throttle. A lifetime counter would permanently
-            # disable a role after enough successful days, which is unsafe for a 24/7 service.
             role_calls = db.execute(
                 "SELECT COUNT(*) AS n FROM model_usage WHERE role=? AND timestamp>=?",
                 (role.value, day_start.isoformat()),
@@ -190,10 +210,15 @@ class BudgetManager:
         tokens: int,
         success: bool,
         cacheable: bool = False,
+        cache_payload: dict | None = None,
         now: datetime | None = None,
     ) -> None:
         if cost < 0 or tokens < 0:
             raise ValueError("cost and tokens must be non-negative")
+        if cache_payload is not None and not cacheable:
+            raise ValueError("cache_payload requires cacheable=True")
+        if cacheable and success and cache_payload is None:
+            raise ValueError("successful cacheable result requires cache_payload")
         timestamp = (now or datetime.now(timezone.utc)).isoformat()
         with self._connect() as db:
             db.execute(
@@ -213,9 +238,18 @@ class BudgetManager:
                 ),
             )
             if success and cacheable:
+                result_json = json.dumps(
+                    cache_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
                 db.execute(
-                    "INSERT OR IGNORE INTO request_cache(request_hash, created_at) VALUES (?, ?)",
-                    (request_hash, timestamp),
+                    """
+                    INSERT OR IGNORE INTO request_cache(request_hash, created_at, result_json)
+                    VALUES (?, ?, ?)
+                    """,
+                    (request_hash, timestamp, result_json),
                 )
 
     def total_calls(self) -> int:
