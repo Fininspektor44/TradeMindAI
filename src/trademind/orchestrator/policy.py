@@ -1,4 +1,4 @@
-"""Deterministic action policy for Orchestrator v1."""
+"""Deterministic, default-deny action policy for Orchestrator v1."""
 
 from __future__ import annotations
 
@@ -45,6 +45,19 @@ AUDITED_ACTIONS = frozenset(
     }
 )
 
+SAFE_ACTIONS = frozenset(
+    {
+        "READ_TASK",
+        "WRITE_TASK_METADATA",
+        "CREATE_REVISION",
+        "DISPATCH_TASK",
+        "CACHE_LOOKUP",
+        "LOCAL_HEALTH_CHECK",
+        "WRITE_AUDIT_EVENT",
+        "CREATE_IMPLEMENTATION_TASK",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PolicyResult:
@@ -54,6 +67,8 @@ class PolicyResult:
 
 def classify_action(action: str, *, risk_class: RiskClass = RiskClass.LOW) -> PolicyResult:
     normalized = action.strip().upper()
+    if not normalized:
+        return PolicyResult(PolicyDecision.FORBIDDEN, "empty action is forbidden")
     if normalized in FORBIDDEN_ACTIONS:
         return PolicyResult(PolicyDecision.FORBIDDEN, f"{normalized} is forbidden in v1")
     if normalized in HUMAN_REQUIRED_ACTIONS or risk_class is RiskClass.ARCHITECTURE_BREAKING:
@@ -66,4 +81,9 @@ def classify_action(action: str, *, risk_class: RiskClass = RiskClass.LOW) -> Po
             PolicyDecision.AUTO_ALLOWED_WITH_AUDIT,
             f"{normalized} is allowed with durable audit evidence",
         )
-    return PolicyResult(PolicyDecision.AUTO_ALLOWED, f"{normalized} is auto-allowed")
+    if normalized in SAFE_ACTIONS and risk_class in {RiskClass.LOW, RiskClass.MEDIUM}:
+        return PolicyResult(PolicyDecision.AUTO_ALLOWED, f"{normalized} is explicitly auto-allowed")
+    return PolicyResult(
+        PolicyDecision.HUMAN_REQUIRED,
+        f"{normalized} is not on the v1 allow-list",
+    )
