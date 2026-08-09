@@ -5,7 +5,7 @@ from trademind.orchestrator.agent_protocol import AgentEnvelope, AgentResult
 from trademind.orchestrator.artifact_store import ArtifactStore
 from trademind.orchestrator.budget import BudgetManager
 from trademind.orchestrator.control_plane import ControlPlane
-from trademind.orchestrator.engine import WorkflowBudgetError, WorkflowEngine
+from trademind.orchestrator.engine import WorkflowEngine
 from trademind.orchestrator.models import Role, Task, TaskState
 from trademind.orchestrator.role_router import RoleRouter
 from trademind.orchestrator.tool_runner import CommandTemplate, ToolRunner
@@ -86,6 +86,7 @@ def test_complete_mock_cycle_separates_roles_and_preserves_evidence(tmp_path):
             task_id="T-cycle",
             goal="prove the bounded mock orchestration cycle",
             scope=("src/trademind/orchestrator",),
+            budget_limit=1.0,
             acceptance_criteria=("mock cycle reaches COMPLETED",),
         )
     )
@@ -108,23 +109,34 @@ def test_complete_mock_cycle_separates_roles_and_preserves_evidence(tmp_path):
     assert events == 9
 
 
-def test_budget_gate_stops_before_model_call(tmp_path):
+def test_budget_gate_halts_durably_before_model_call(tmp_path):
     engine, control, budget, providers = _engine(tmp_path, per_task_call_limit=0)
-    control.create_task(Task.new(task_id="T-budget", goal="respect budget"))
+    control.create_task(
+        Task.new(task_id="T-budget", goal="respect budget", budget_limit=1.0)
+    )
 
     triaged = engine.step("T-budget")
     assert triaged.state is TaskState.TRIAGED
 
-    try:
-        engine.step("T-budget")
-    except WorkflowBudgetError:
-        pass
-    else:
-        raise AssertionError("budget exhaustion must block the model call")
-
+    halted = engine.step("T-budget")
+    assert halted.state is TaskState.HUMAN_REQUIRED
+    assert halted.resume_state is TaskState.TRIAGED
+    assert len(halted.artifact_refs) == 1
     assert providers[Role.ARCHITECT].seen == []
     assert budget.total_calls() == 0
-    assert control.task_store.get("T-budget").state is TaskState.TRIAGED
+    assert control.audit_log.verify()
+
+
+def test_zero_task_cost_budget_blocks_spend_even_with_global_budget(tmp_path):
+    engine, control, budget, providers = _engine(tmp_path)
+    control.create_task(Task.new(task_id="T-zero", goal="zero spend by default"))
+
+    engine.step("T-zero")
+    halted = engine.step("T-zero")
+
+    assert halted.state is TaskState.HUMAN_REQUIRED
+    assert providers[Role.ARCHITECT].seen == []
+    assert budget.total_calls() == 0
 
 
 def test_failed_operator_tests_fail_closed_and_keep_test_artifact(tmp_path):
@@ -139,7 +151,9 @@ def test_failed_operator_tests_fail_closed_and_keep_test_artifact(tmp_path):
             )
         },
     )
-    control.create_task(Task.new(task_id="T-fail", goal="fail closed"))
+    control.create_task(
+        Task.new(task_id="T-fail", goal="fail closed", budget_limit=1.0)
+    )
 
     task = control.task_store.get("T-fail")
     for _ in range(5):
