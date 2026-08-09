@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from .agent_protocol import AgentResult
+from .agent_protocol import AgentDecision, AgentResult
 from .artifact_store import ArtifactStore
 from .budget import BudgetManager
 from .control_plane import ControlPlane
@@ -131,6 +131,7 @@ class WorkflowEngine:
                 "provider": provider_name,
                 "model": model_name,
                 "success": result.success,
+                "decision": result.decision.value,
                 "summary": result.summary,
                 "output_schema": result.output_schema,
                 "tokens": result.tokens,
@@ -151,6 +152,82 @@ class WorkflowEngine:
             tokens=int(payload.get("tokens", 0)),
             cost=float(payload.get("cost", 0.0)),
             error=payload.get("error"),
+            decision=AgentDecision(payload.get("decision", AgentDecision.CONTINUE.value)),
+        )
+
+    def _apply_agent_result(
+        self,
+        task: Task,
+        spec: StageSpec,
+        *,
+        role: Role,
+        provider_name: str,
+        model_name: str,
+        result: AgentResult,
+        artifact_hash: str,
+        policy: PolicyDecision,
+    ) -> Task:
+        if not result.success:
+            return self.control.advance(
+                task.task_id,
+                TaskState.FAILED,
+                revision=task.revision,
+                actor_role=role,
+                action=spec.action,
+                policy_result=policy,
+                model_provider=provider_name,
+                model_name=model_name,
+                output_artifact_hashes=(artifact_hash,),
+            )
+
+        if role is Role.AUDITOR:
+            if result.decision is AgentDecision.REJECT:
+                return self.control.reject_and_create_revision(
+                    task.task_id,
+                    revision=task.revision,
+                    actor_role=role,
+                    action="AUDITOR_REJECT",
+                    policy_result=policy,
+                    model_provider=provider_name,
+                    model_name=model_name,
+                    output_artifact_hashes=(artifact_hash,),
+                    reason=result.summary,
+                )
+            if result.decision is not AgentDecision.APPROVE:
+                return self.control.system_halt(
+                    task.task_id,
+                    TaskState.FAILED,
+                    revision=task.revision,
+                    action="INVALID_AUDITOR_DECISION",
+                    policy_result=policy,
+                    error="auditor must explicitly APPROVE or REJECT",
+                    model_provider=provider_name,
+                    model_name=model_name,
+                    output_artifact_hashes=(artifact_hash,),
+                )
+        elif result.decision is not AgentDecision.CONTINUE:
+            return self.control.system_halt(
+                task.task_id,
+                TaskState.FAILED,
+                revision=task.revision,
+                action="INVALID_NON_AUDITOR_DECISION",
+                policy_result=policy,
+                error=f"{role.value} may not issue {result.decision.value}",
+                model_provider=provider_name,
+                model_name=model_name,
+                output_artifact_hashes=(artifact_hash,),
+            )
+
+        return self.control.advance(
+            task.task_id,
+            spec.target,
+            revision=task.revision,
+            actor_role=role,
+            action=spec.action,
+            policy_result=policy,
+            model_provider=provider_name,
+            model_name=model_name,
+            output_artifact_hashes=(artifact_hash,),
         )
 
     def _run_ai_stage(self, task: Task, spec: StageSpec) -> Task:
@@ -180,16 +257,15 @@ class WorkflowEngine:
                 model_name=provider.model_name,
                 result=result,
             )
-            return self.control.advance(
-                task.task_id,
-                spec.target,
-                revision=task.revision,
-                actor_role=role,
-                action=spec.action,
-                policy_result=policy,
-                model_provider=cached_provider,
+            return self._apply_agent_result(
+                task,
+                spec,
+                role=role,
+                provider_name=cached_provider,
                 model_name=provider.model_name,
-                output_artifact_hashes=(artifact_hash,),
+                result=result,
+                artifact_hash=artifact_hash,
+                policy=policy,
             )
 
         check = self.budget.check(
@@ -286,18 +362,15 @@ class WorkflowEngine:
             model_name=provider.model_name,
             result=result,
         )
-
-        target = spec.target if result.success else TaskState.FAILED
-        return self.control.advance(
-            task.task_id,
-            target,
-            revision=task.revision,
-            actor_role=role,
-            action=spec.action,
-            policy_result=policy,
-            model_provider=provider.provider_name,
+        return self._apply_agent_result(
+            task,
+            spec,
+            role=role,
+            provider_name=provider.provider_name,
             model_name=provider.model_name,
-            output_artifact_hashes=(artifact_hash,),
+            result=result,
+            artifact_hash=artifact_hash,
+            policy=policy,
         )
 
     def _run_operator_stage(self, task: Task, spec: StageSpec) -> Task:
@@ -348,8 +421,9 @@ class WorkflowEngine:
         task = self.control.task_store.get(task_id)
         if task is None:
             raise KeyError(task_id)
+        starting_revision = task.revision
         for _ in range(max_steps):
-            if task.state in _STOPPED:
+            if task.state in _STOPPED or task.revision != starting_revision:
                 return task
             task = self.step(task_id)
         raise WorkflowError(f"workflow exceeded max_steps={max_steps}")
