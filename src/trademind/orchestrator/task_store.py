@@ -54,7 +54,11 @@ class TaskStore:
 
     def save(self, task: Task) -> None:
         """Insert a new immutable revision. Existing revisions cannot be replaced."""
-        if task.state is not TaskState.NEW or task.assigned_role is not None or task.resume_state is not None:
+        if (
+            task.state is not TaskState.NEW
+            or task.assigned_role is not Role.OPERATOR
+            or task.resume_state is not None
+        ):
             raise RevisionConflict("new task revisions must be inserted in pristine NEW state")
         try:
             with self._connect() as db:
@@ -81,7 +85,7 @@ class TaskStore:
         revision: int | None = None,
         human_approval_recorded: bool = False,
     ) -> Task:
-        """Persist a state change only through the canonical state machine."""
+        """Low-level state mutation for deterministic tests; runtime uses ControlPlane."""
         current = self.get(task_id, revision)
         if current is None:
             raise KeyError(task_id)
@@ -152,7 +156,7 @@ class TaskStore:
             created_at=datetime.now(timezone.utc).isoformat(),
             goal=goal if goal is not None else previous.goal,
             state=TaskState.NEW,
-            assigned_role=None,
+            assigned_role=Role.OPERATOR,
             artifact_refs=(),
             resume_state=None,
         )
