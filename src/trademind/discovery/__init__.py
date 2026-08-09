@@ -12,6 +12,8 @@ from .hypothesis_registry import (
     HypothesisRegistry,
     HypothesisState,
     RegistryError,
+    derive_content_hash,
+    derive_hypothesis_family_id,
 )
 from .manifest import DatasetArtifact, ExperimentManifest, ManifestIntegrityError
 from .result_ledger import LedgerIntegrityError, ResultLedger
@@ -34,4 +36,6 @@ __all__ = [
     "ResultLedger",
     "SplitPlan",
     "chronological_split",
+    "derive_content_hash",
+    "derive_hypothesis_family_id",
 ]
