@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .agent_protocol import AgentEnvelope, AgentResult
+from .agent_protocol import AgentDecision, AgentEnvelope, AgentResult
 from .artifact_store import ArtifactStore
 from .budget import BudgetManager
 from .control_plane import ControlPlane
@@ -44,12 +44,14 @@ class DeterministicMockProvider:
                 error=f"expected {self.role.value}, got {envelope.role.value}",
             )
         self.calls += 1
+        decision = AgentDecision.APPROVE if self.role is Role.AUDITOR else AgentDecision.CONTINUE
         return AgentResult(
             success=True,
             summary=f"{self.role.value} completed {envelope.required_output_schema}",
             output_schema=envelope.required_output_schema,
             tokens=1,
             cost=0.0,
+            decision=decision,
         )
 
 
