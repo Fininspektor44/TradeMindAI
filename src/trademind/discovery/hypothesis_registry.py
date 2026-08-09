@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 
 class RegistryError(RuntimeError):
@@ -15,6 +19,37 @@ class RegistryError(RuntimeError):
 
 class DuplicateHypothesis(RegistryError):
     pass
+
+
+def _canonical(payload: Mapping[str, Any]) -> str:
+    if not isinstance(payload, Mapping) or not payload:
+        raise ValueError("hypothesis definitions must be non-empty mappings")
+    try:
+        return json.dumps(
+            dict(payload),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("hypothesis definitions must be canonical JSON data") from exc
+
+
+def derive_hypothesis_family_id(family_definition: Mapping[str, Any]) -> str:
+    """Derive the family identity from immutable semantic family content.
+
+    Tunable thresholds belong in the full content definition, not in this family
+    definition. That way a threshold/window tweak cannot create a fresh final
+    holdout entitlement for the same underlying hypothesis family.
+    """
+    digest = hashlib.sha256(_canonical(family_definition).encode("utf-8")).hexdigest()
+    return f"hf_{digest}"
+
+
+def derive_content_hash(content_definition: Mapping[str, Any]) -> str:
+    """Fingerprint the exact registered hypothesis content."""
+    return hashlib.sha256(_canonical(content_definition).encode("utf-8")).hexdigest()
 
 
 class HypothesisState(StrEnum):
@@ -69,6 +104,7 @@ class HypothesisRegistry:
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
         return db
 
     def _init_schema(self) -> None:
@@ -77,6 +113,7 @@ class HypothesisRegistry:
                 """
                 CREATE TABLE IF NOT EXISTS hypothesis_families (
                     family_id TEXT PRIMARY KEY,
+                    definition_json TEXT NOT NULL,
                     holdout_consumed INTEGER NOT NULL DEFAULT 0,
                     terminal_state TEXT,
                     updated_at TEXT NOT NULL
@@ -85,6 +122,7 @@ class HypothesisRegistry:
                     hypothesis_id TEXT PRIMARY KEY,
                     family_id TEXT NOT NULL,
                     content_hash TEXT NOT NULL UNIQUE,
+                    content_definition_json TEXT NOT NULL,
                     manifest_hash TEXT,
                     state TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -93,6 +131,17 @@ class HypothesisRegistry:
                 );
                 """
             )
+            family_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(hypothesis_families)").fetchall()
+            }
+            if "definition_json" not in family_columns:
+                db.execute("ALTER TABLE hypothesis_families ADD COLUMN definition_json TEXT")
+            hypothesis_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(hypotheses)").fetchall()
+            }
+            if "content_definition_json" not in hypothesis_columns:
+                db.execute("ALTER TABLE hypotheses ADD COLUMN content_definition_json TEXT")
 
     @staticmethod
     def _validate_nonempty(value: str, label: str) -> str:
@@ -101,16 +150,25 @@ class HypothesisRegistry:
             raise ValueError(f"{label} must not be empty")
         return cleaned
 
+    @staticmethod
+    def _validate_sha256(value: str, label: str) -> str:
+        cleaned = value.strip().lower()
+        if len(cleaned) != 64 or any(char not in "0123456789abcdef" for char in cleaned):
+            raise ValueError(f"{label} must be a SHA-256 hex digest")
+        return cleaned
+
     def register(
         self,
         *,
         hypothesis_id: str,
-        hypothesis_family_id: str,
-        content_hash: str,
+        family_definition: Mapping[str, Any],
+        content_definition: Mapping[str, Any],
     ) -> HypothesisRecord:
         hypothesis_id = self._validate_nonempty(hypothesis_id, "hypothesis_id")
-        family_id = self._validate_nonempty(hypothesis_family_id, "hypothesis_family_id")
-        content_hash = self._validate_nonempty(content_hash, "content_hash")
+        family_json = _canonical(family_definition)
+        content_json = _canonical(content_definition)
+        family_id = derive_hypothesis_family_id(family_definition)
+        content_hash = derive_content_hash(content_definition)
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -126,6 +184,13 @@ class HypothesisRegistry:
                 (family_id,),
             ).fetchone()
             if family is not None:
+                stored_definition = family["definition_json"]
+                if stored_definition is None:
+                    raise RegistryError(
+                        "legacy family row has no immutable definition fingerprint; migrate explicitly"
+                    )
+                if stored_definition != family_json:
+                    raise RegistryError("family identity collision or definition mismatch")
                 if int(family["holdout_consumed"]):
                     raise RegistryError("hypothesis family has already consumed final holdout")
                 if family["terminal_state"]:
@@ -136,24 +201,25 @@ class HypothesisRegistry:
                 db.execute(
                     """
                     INSERT INTO hypothesis_families(
-                        family_id, holdout_consumed, terminal_state, updated_at
-                    ) VALUES (?, 0, NULL, ?)
+                        family_id, definition_json, holdout_consumed, terminal_state, updated_at
+                    ) VALUES (?, ?, 0, NULL, ?)
                     """,
-                    (family_id, now),
+                    (family_id, family_json, now),
                 )
 
             try:
                 db.execute(
                     """
                     INSERT INTO hypotheses(
-                        hypothesis_id, family_id, content_hash, manifest_hash,
-                        state, created_at, updated_at
-                    ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+                        hypothesis_id, family_id, content_hash, content_definition_json,
+                        manifest_hash, state, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
                     """,
                     (
                         hypothesis_id,
                         family_id,
                         content_hash,
+                        content_json,
                         HypothesisState.PROPOSED.value,
                         now,
                         now,
@@ -186,7 +252,7 @@ class HypothesisRegistry:
         return self._row(row)
 
     def freeze(self, hypothesis_id: str, *, manifest_hash: str) -> HypothesisRecord:
-        manifest_hash = self._validate_nonempty(manifest_hash, "manifest_hash")
+        manifest_hash = self._validate_sha256(manifest_hash, "manifest_hash")
         return self.transition(
             hypothesis_id,
             HypothesisState.FROZEN,
@@ -200,6 +266,8 @@ class HypothesisRegistry:
         *,
         manifest_hash: str | None = None,
     ) -> HypothesisRecord:
+        if manifest_hash is not None:
+            manifest_hash = self._validate_sha256(manifest_hash, "manifest_hash")
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
