@@ -66,6 +66,7 @@ class PolicyResult:
 
 
 def classify_action(action: str, *, risk_class: RiskClass = RiskClass.LOW) -> PolicyResult:
+    """Classify one named action using an explicit allow-list and default deny."""
     normalized = action.strip().upper()
     if not normalized:
         return PolicyResult(PolicyDecision.FORBIDDEN, "empty action is forbidden")
@@ -76,13 +77,22 @@ def classify_action(action: str, *, risk_class: RiskClass = RiskClass.LOW) -> Po
             PolicyDecision.HUMAN_REQUIRED,
             f"{normalized} requires explicit user approval",
         )
-    if normalized in AUDITED_ACTIONS or risk_class is RiskClass.HIGH:
+
+    # Risk may strengthen the handling of an already-known action, but it must
+    # never turn an unknown action into an auto-allowed one.
+    if normalized in AUDITED_ACTIONS:
         return PolicyResult(
             PolicyDecision.AUTO_ALLOWED_WITH_AUDIT,
             f"{normalized} is allowed with durable audit evidence",
         )
-    if normalized in SAFE_ACTIONS and risk_class in {RiskClass.LOW, RiskClass.MEDIUM}:
+    if normalized in SAFE_ACTIONS:
+        if risk_class is RiskClass.HIGH:
+            return PolicyResult(
+                PolicyDecision.AUTO_ALLOWED_WITH_AUDIT,
+                f"{normalized} is high-risk and requires durable audit evidence",
+            )
         return PolicyResult(PolicyDecision.AUTO_ALLOWED, f"{normalized} is explicitly auto-allowed")
+
     return PolicyResult(
         PolicyDecision.HUMAN_REQUIRED,
         f"{normalized} is not on the v1 allow-list",
