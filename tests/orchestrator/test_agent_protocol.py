@@ -25,15 +25,36 @@ def test_agent_envelope_payload_is_versioned_and_structured():
 
 def test_agent_result_rejects_invalid_usage_and_success_error_mix():
     try:
-        AgentResult(success=True, summary="bad", tokens=-1)
+        AgentResult(success=True, summary="bad", output_schema="result-v1", tokens=-1)
     except ValueError:
         pass
     else:
         raise AssertionError("negative token usage must be rejected")
 
     try:
-        AgentResult(success=True, summary="bad", error="should not coexist")
+        AgentResult(
+            success=True,
+            summary="bad",
+            output_schema="result-v1",
+            error="should not coexist",
+        )
     except ValueError:
         pass
     else:
         raise AssertionError("successful result cannot contain an error")
+
+
+def test_agent_result_requires_schema_on_success_and_error_on_failure():
+    try:
+        AgentResult(success=True, summary="missing schema")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("successful result must declare output schema")
+
+    try:
+        AgentResult(success=False, summary="failed")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("failed result must explain its error")
