@@ -71,10 +71,11 @@ trademind-breakeven-stats = "trademind.breakeven_stat_monitor:main"
 trademind-breakeven-counterfactual = "trademind.breakeven_counterfactual:main"
 trademind-breakeven-runtime = "trademind.breakeven_runtime:main"
 trademind-breakeven-report = "trademind.breakeven_decision_report:main"
+trademind-orchestrator-mock = "trademind.orchestrator.mock_runner:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["trademind", "trademind.market", "trademind.signals", "trademind.structure"]
+packages = ["trademind", "trademind.market", "trademind.signals", "trademind.structure", "trademind.orchestrator"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

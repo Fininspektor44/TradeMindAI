@@ -1,0 +1,48 @@
+name: Orchestrator v1 CI
+
+on:
+  pull_request:
+    paths:
+      - "src/trademind/orchestrator/**"
+      - "tests/orchestrator/**"
+      - "pyproject.toml"
+      - ".github/workflows/orchestrator-v1-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  orchestrator-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+      - name: Ruff orchestrator
+        run: python -m ruff check src/trademind/orchestrator tests/orchestrator
+      - name: Orchestrator tests
+        run: python -m pytest -q tests/orchestrator
+
+  full-repository-baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+      - name: Observe full repository baseline
+        run: python -m pytest -q

@@ -1,0 +1,25 @@
+param(
+    [string]$Python = ".\.venv\Scripts\python.exe"
+)
+
+$ErrorActionPreference = "Stop"
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $RepoRoot
+
+if (-not (Test-Path $Python)) { throw "Python not found: $Python" }
+
+Write-Host "[1/3] Ruff: Orchestrator v1"
+& $Python -m ruff check src\trademind\orchestrator tests\orchestrator
+if ($LASTEXITCODE -ne 0) { throw "Orchestrator ruff gate failed with exit code $LASTEXITCODE" }
+
+Write-Host "[2/3] Pytest: focused Orchestrator suite"
+$FocusedBaseTemp = Join-Path $env:TEMP ("tmai-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $FocusedBaseTemp | Out-Null
+& $Python -m pytest -q -p no:cacheprovider --basetemp $FocusedBaseTemp tests\orchestrator
+if ($LASTEXITCODE -ne 0) { throw "Orchestrator pytest gate failed with exit code $LASTEXITCODE" }
+
+Write-Host "[3/3] End-to-end deterministic mock cycle"
+& $Python -m trademind.orchestrator.mock_runner --repo-root $RepoRoot
+if ($LASTEXITCODE -ne 0) { throw "Orchestrator mock gate failed with exit code $LASTEXITCODE" }
+
+Write-Host "ORCHESTRATOR_V1_LOCAL_GATE=PASS"
