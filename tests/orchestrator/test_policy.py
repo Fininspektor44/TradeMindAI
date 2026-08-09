@@ -22,6 +22,16 @@ def test_unknown_action_is_not_silently_allowed():
     assert result.decision is PolicyDecision.HUMAN_REQUIRED
 
 
+def test_unknown_high_risk_action_is_not_auto_allowed():
+    result = classify_action("DELETE_UNCLASSIFIED_DATABASE", risk_class=RiskClass.HIGH)
+    assert result.decision is PolicyDecision.HUMAN_REQUIRED
+
+
 def test_explicit_safe_action_is_auto_allowed():
     result = classify_action("LOCAL_HEALTH_CHECK")
     assert result.decision is PolicyDecision.AUTO_ALLOWED
+
+
+def test_known_safe_high_risk_action_requires_audit():
+    result = classify_action("LOCAL_HEALTH_CHECK", risk_class=RiskClass.HIGH)
+    assert result.decision is PolicyDecision.AUTO_ALLOWED_WITH_AUDIT
