@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .agent_protocol import AgentEnvelope, AgentProvider, AgentResult
+from .agent_protocol import AgentEnvelope, AgentProvider, AgentResult, validate_result
 from .models import Role, Task
 from .policy import FORBIDDEN_ACTIONS
 
@@ -35,8 +35,6 @@ class RoleRouter:
     ) -> AgentEnvelope:
         if role not in _AI_ROLES:
             raise RoleRoutingError(f"{role.value} is deterministic local software in v1")
-        if not required_output_schema.strip():
-            raise ValueError("required_output_schema must not be empty")
         return AgentEnvelope(
             task_id=task.task_id,
             revision=task.revision,
@@ -70,4 +68,4 @@ class RoleRouter:
             role=role,
             required_output_schema=required_output_schema,
         )
-        return provider.execute(envelope)
+        return validate_result(envelope, provider.execute(envelope))
