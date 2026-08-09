@@ -1,7 +1,7 @@
 import sqlite3
 import sys
 
-from trademind.orchestrator.agent_protocol import AgentEnvelope, AgentResult
+from trademind.orchestrator.agent_protocol import AgentDecision, AgentEnvelope, AgentResult
 from trademind.orchestrator.artifact_store import ArtifactStore
 from trademind.orchestrator.budget import BudgetManager
 from trademind.orchestrator.control_plane import ControlPlane
@@ -27,12 +27,27 @@ class MockProvider:
     def execute(self, envelope: AgentEnvelope) -> AgentResult:
         assert envelope.role is self.role
         self.seen.append(envelope)
+        decision = AgentDecision.APPROVE if self.role is Role.AUDITOR else AgentDecision.CONTINUE
         return AgentResult(
             success=True,
             summary=f"{self.role.value} completed {envelope.required_output_schema}",
             output_schema=envelope.required_output_schema,
             tokens=10,
             cost=0.01,
+            decision=decision,
+        )
+
+
+class RejectingAuditor(MockProvider):
+    def execute(self, envelope: AgentEnvelope) -> AgentResult:
+        self.seen.append(envelope)
+        return AgentResult(
+            success=True,
+            summary="specification needs a new revision",
+            output_schema=envelope.required_output_schema,
+            tokens=10,
+            cost=0.01,
+            decision=AgentDecision.REJECT,
         )
 
 
@@ -109,6 +124,27 @@ def test_complete_mock_cycle_separates_roles_and_preserves_evidence(tmp_path):
     assert events == 9
 
 
+def test_auditor_rejection_creates_new_revision_without_overwrite(tmp_path):
+    engine, control, _, providers = _engine(tmp_path)
+    rejecting = RejectingAuditor(Role.AUDITOR)
+    providers[Role.AUDITOR] = rejecting
+    engine.router = RoleRouter(providers)
+    control.create_task(
+        Task.new(task_id="T-reject", goal="force revision", budget_limit=1.0)
+    )
+
+    engine.step("T-reject")
+    engine.step("T-reject")
+    revised = engine.step("T-reject")
+
+    assert revised.revision == 2
+    assert revised.state is TaskState.NEW
+    assert revised.parent_task_id == "T-reject@1"
+    assert control.task_store.get("T-reject", 1).state is TaskState.REJECTED
+    assert control.task_store.get("T-reject", 2).state is TaskState.NEW
+    assert control.audit_log.verify()
+
+
 def test_budget_gate_halts_durably_before_model_call(tmp_path):
     engine, control, budget, providers = _engine(tmp_path, per_task_call_limit=0)
     control.create_task(
@@ -167,6 +203,7 @@ def test_cached_result_advances_without_second_provider_call(tmp_path):
             "tokens": 10,
             "cost": 0.01,
             "error": None,
+            "decision": "CONTINUE",
         },
     )
 
