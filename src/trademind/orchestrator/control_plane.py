@@ -8,6 +8,7 @@ import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .audit_log import AuditLog
 from .models import AuditEvent, PolicyDecision, Role, Task, TaskState
@@ -25,6 +26,15 @@ class ApprovalRequired(RuntimeError):
 
 _AI_ROLES = frozenset({Role.ARCHITECT, Role.DEVELOPER, Role.AUDITOR})
 _HASH_REF = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SYSTEM_HALT_TARGETS = frozenset(
+    {
+        TaskState.BLOCKED,
+        TaskState.REJECTED,
+        TaskState.FAILED,
+        TaskState.HUMAN_REQUIRED,
+        TaskState.CANCELLED,
+    }
+)
 
 
 class ControlPlane:
@@ -59,8 +69,66 @@ class ControlPlane:
                 """
             )
 
+    @staticmethod
+    def _task_row(
+        db: sqlite3.Connection,
+        task_id: str,
+        revision: int | None,
+    ) -> sqlite3.Row:
+        if revision is None:
+            row = db.execute(
+                "SELECT * FROM tasks WHERE task_id=? ORDER BY revision DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT * FROM tasks WHERE task_id=? AND revision=?",
+                (task_id, revision),
+            ).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        return row
+
+    @staticmethod
+    def _validate_artifact_hashes(values: tuple[str, ...]) -> None:
+        for value in values:
+            if not _HASH_REF.fullmatch(value):
+                raise ValueError(f"invalid artifact hash reference: {value!r}")
+
+    @staticmethod
+    def _persist_transition(
+        db: sqlite3.Connection,
+        current: Task,
+        updated: Task,
+        output_artifact_hashes: tuple[str, ...],
+    ) -> Task:
+        merged_artifacts = tuple(
+            dict.fromkeys((*current.artifact_refs, *output_artifact_hashes))
+        )
+        updated = replace(updated, artifact_refs=merged_artifacts)
+        cursor = db.execute(
+            """
+            UPDATE tasks
+            SET state=?, assigned_role=?, resume_state=?, artifact_refs_json=?
+            WHERE task_id=? AND revision=? AND state=?
+            """,
+            (
+                updated.state.value,
+                updated.assigned_role.value if updated.assigned_role else None,
+                updated.resume_state.value if updated.resume_state else None,
+                json.dumps(merged_artifacts),
+                current.task_id,
+                current.revision,
+                current.state.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RevisionConflict("task state changed concurrently")
+        return updated
+
     def create_task(self, task: Task) -> Task:
         """Persist a pristine task and its creation audit in one transaction."""
+        self._validate_artifact_hashes(task.artifact_refs)
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -107,12 +175,6 @@ class ControlPlane:
         elif model_provider is not None or model_name is not None:
             raise UnauthorizedActor("OPERATOR transitions cannot claim model provider metadata")
 
-    @staticmethod
-    def _validate_artifact_hashes(values: tuple[str, ...]) -> None:
-        for value in values:
-            if not _HASH_REF.fullmatch(value):
-                raise ValueError(f"invalid artifact hash reference: {value!r}")
-
     def record_human_approval(
         self,
         task_id: str,
@@ -127,19 +189,7 @@ class ControlPlane:
         timestamp = datetime.now(timezone.utc).isoformat()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if revision is None:
-                row = db.execute(
-                    "SELECT * FROM tasks WHERE task_id=? ORDER BY revision DESC LIMIT 1",
-                    (task_id,),
-                ).fetchone()
-            else:
-                row = db.execute(
-                    "SELECT * FROM tasks WHERE task_id=? AND revision=?",
-                    (task_id, revision),
-                ).fetchone()
-            if row is None:
-                raise KeyError(task_id)
-            task = TaskStore._row_to_task(row)
+            task = TaskStore._row_to_task(self._task_row(db, task_id, revision))
             if task.state is not TaskState.HUMAN_REQUIRED or task.resume_state is None:
                 raise ApprovalRequired("approval may be recorded only for HUMAN_REQUIRED task")
 
@@ -184,6 +234,54 @@ class ControlPlane:
                 ),
             )
 
+    def system_halt(
+        self,
+        task_id: str,
+        target: TaskState,
+        *,
+        revision: int | None = None,
+        action: str = "SYSTEM_HALT",
+        policy_result: PolicyDecision | None = None,
+        error: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        model_provider: str | None = None,
+        model_name: str | None = None,
+        output_artifact_hashes: tuple[str, ...] = (),
+    ) -> Task:
+        """Let deterministic OPERATOR stop active work without impersonating an AI role."""
+        if target not in _SYSTEM_HALT_TARGETS:
+            raise UnauthorizedActor(f"OPERATOR system halt cannot advance work to {target.value}")
+        self._validate_artifact_hashes(output_artifact_hashes)
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = TaskStore._row_to_task(self._task_row(db, task_id, revision))
+            updated = transition(current, target)
+            updated = self._persist_transition(
+                db,
+                current,
+                updated,
+                output_artifact_hashes,
+            )
+            AuditLog.append_in_transaction(
+                db,
+                AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    task_id=current.task_id,
+                    revision=current.revision,
+                    actor_role=Role.OPERATOR,
+                    action=action,
+                    model_provider=model_provider,
+                    model_name=model_name,
+                    output_artifact_hashes=output_artifact_hashes,
+                    from_state=current.state,
+                    to_state=updated.state,
+                    policy_result=policy_result,
+                    error=error,
+                    metadata=dict(metadata or {}),
+                ),
+            )
+            return updated
+
     def advance(
         self,
         task_id: str,
@@ -201,20 +299,7 @@ class ControlPlane:
         self._validate_artifact_hashes(output_artifact_hashes)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if revision is None:
-                row = db.execute(
-                    "SELECT * FROM tasks WHERE task_id=? ORDER BY revision DESC LIMIT 1",
-                    (task_id,),
-                ).fetchone()
-            else:
-                row = db.execute(
-                    "SELECT * FROM tasks WHERE task_id=? AND revision=?",
-                    (task_id, revision),
-                ).fetchone()
-            if row is None:
-                raise KeyError(task_id)
-
-            current = TaskStore._row_to_task(row)
+            current = TaskStore._row_to_task(self._task_row(db, task_id, revision))
             approval_row = None
             if current.state is TaskState.HUMAN_REQUIRED and current.resume_state is not None:
                 approval_row = db.execute(
@@ -239,28 +324,12 @@ class ControlPlane:
                 target,
                 human_approval_recorded=approval_available,
             )
-            merged_artifacts = tuple(
-                dict.fromkeys((*current.artifact_refs, *output_artifact_hashes))
+            updated = self._persist_transition(
+                db,
+                current,
+                updated,
+                output_artifact_hashes,
             )
-            updated = replace(updated, artifact_refs=merged_artifacts)
-            cursor = db.execute(
-                """
-                UPDATE tasks
-                SET state=?, assigned_role=?, resume_state=?, artifact_refs_json=?
-                WHERE task_id=? AND revision=? AND state=?
-                """,
-                (
-                    updated.state.value,
-                    updated.assigned_role.value if updated.assigned_role else None,
-                    updated.resume_state.value if updated.resume_state else None,
-                    json.dumps(merged_artifacts),
-                    current.task_id,
-                    current.revision,
-                    current.state.value,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise RevisionConflict("task state changed concurrently")
 
             timestamp = datetime.now(timezone.utc).isoformat()
             if approval_row is not None:
