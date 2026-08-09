@@ -23,15 +23,25 @@ def test_happy_path_and_completed_is_immutable():
         raise AssertionError("COMPLETED must be immutable")
 
 
-def test_human_required_needs_recorded_approval():
+def test_human_required_pauses_and_resumes_same_state_only_after_approval():
     task = Task.new(task_id="T2", goal="change")
     task = transition(task, TaskState.TRIAGED)
     task = transition(task, TaskState.HUMAN_REQUIRED)
+
     try:
-        transition(task, TaskState.SPECIFIED)
+        transition(task, TaskState.TRIAGED)
     except InvalidTransition:
         pass
     else:
         raise AssertionError("approval must be required")
-    resumed = transition(task, TaskState.SPECIFIED, human_approval_recorded=True)
-    assert resumed.state is TaskState.SPECIFIED
+
+    try:
+        transition(task, TaskState.SPECIFIED, human_approval_recorded=True)
+    except InvalidTransition:
+        pass
+    else:
+        raise AssertionError("approval must not skip the paused state")
+
+    resumed = transition(task, TaskState.TRIAGED, human_approval_recorded=True)
+    assert resumed.state is TaskState.TRIAGED
+    assert resumed.resume_state is None
