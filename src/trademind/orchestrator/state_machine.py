@@ -39,15 +39,24 @@ _FAILURE_FROM_ACTIVE = {
 
 _ACTIVE = set(_FORWARD)
 
+# Role responsible for the work required while a task is in each durable state.
+# This deliberately separates authoring and approval duties:
+# architect specifies -> auditor reviews -> developer implements -> operator tests
+# -> auditor audits -> operator finalizes.
+_ROLE_FOR_STATE = {
+    TaskState.NEW: Role.OPERATOR,
+    TaskState.TRIAGED: Role.ARCHITECT,
+    TaskState.SPECIFIED: Role.AUDITOR,
+    TaskState.ARCH_REVIEWED: Role.DEVELOPER,
+    TaskState.IMPLEMENTING: Role.DEVELOPER,
+    TaskState.TESTING: Role.OPERATOR,
+    TaskState.AUDITING: Role.AUDITOR,
+    TaskState.READY: Role.OPERATOR,
+}
+
 
 def next_role_for_state(state: TaskState) -> Role | None:
-    if state in {TaskState.SPECIFIED, TaskState.ARCH_REVIEWED}:
-        return Role.ARCHITECT
-    if state in {TaskState.IMPLEMENTING, TaskState.TESTING}:
-        return Role.DEVELOPER
-    if state in {TaskState.AUDITING, TaskState.READY}:
-        return Role.AUDITOR
-    return Role.OPERATOR if state in {TaskState.NEW, TaskState.TRIAGED} else None
+    return _ROLE_FOR_STATE.get(state)
 
 
 def transition(
