@@ -40,13 +40,13 @@ _FAILURE_FROM_ACTIVE = {
 _ACTIVE = set(_FORWARD)
 
 # The role assigned to a durable state owns the work needed to leave that state.
-# Operator performs dispatch/test/finalization, while AI-capable roles each own
-# one bounded author/review/implementation/audit stage.
+# Once architecture is reviewed, DEVELOPER owns both the bounded implementation
+# plan and implementation result. OPERATOR owns dispatch, tests and finalization.
 _ROLE_FOR_STATE = {
     TaskState.NEW: Role.OPERATOR,
     TaskState.TRIAGED: Role.ARCHITECT,
     TaskState.SPECIFIED: Role.AUDITOR,
-    TaskState.ARCH_REVIEWED: Role.OPERATOR,
+    TaskState.ARCH_REVIEWED: Role.DEVELOPER,
     TaskState.IMPLEMENTING: Role.DEVELOPER,
     TaskState.TESTING: Role.OPERATOR,
     TaskState.AUDITING: Role.AUDITOR,
