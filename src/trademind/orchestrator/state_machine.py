@@ -39,15 +39,14 @@ _FAILURE_FROM_ACTIVE = {
 
 _ACTIVE = set(_FORWARD)
 
-# Role responsible for the work required while a task is in each durable state.
-# This deliberately separates authoring and approval duties:
-# architect specifies -> auditor reviews -> developer implements -> operator tests
-# -> auditor audits -> operator finalizes.
+# The role assigned to a durable state owns the work needed to leave that state.
+# Operator performs dispatch/test/finalization, while AI-capable roles each own
+# one bounded author/review/implementation/audit stage.
 _ROLE_FOR_STATE = {
     TaskState.NEW: Role.OPERATOR,
     TaskState.TRIAGED: Role.ARCHITECT,
     TaskState.SPECIFIED: Role.AUDITOR,
-    TaskState.ARCH_REVIEWED: Role.DEVELOPER,
+    TaskState.ARCH_REVIEWED: Role.OPERATOR,
     TaskState.IMPLEMENTING: Role.DEVELOPER,
     TaskState.TESTING: Role.OPERATOR,
     TaskState.AUDITING: Role.AUDITOR,
