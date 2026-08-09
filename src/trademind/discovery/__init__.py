@@ -16,12 +16,20 @@ from .hypothesis_registry import (
     derive_hypothesis_family_id,
 )
 from .manifest import DatasetArtifact, ExperimentManifest, ManifestIntegrityError
+from .orchestrator_bridge import (
+    DiscoveryBridgeError,
+    DiscoveryOrchestratorBridge,
+    DiscoveryTaskBinding,
+)
 from .result_ledger import LedgerIntegrityError, ResultLedger
 from .split_engine import SplitPlan, chronological_split
 
 __all__ = [
     "DatasetArtifact",
     "DatasetIntegrityError",
+    "DiscoveryBridgeError",
+    "DiscoveryOrchestratorBridge",
+    "DiscoveryTaskBinding",
     "DuplicateHypothesis",
     "ExperimentManifest",
     "HypothesisRecord",
