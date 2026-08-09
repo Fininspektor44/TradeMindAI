@@ -135,6 +135,13 @@ def test_human_required_needs_durable_approval_that_survives_restart(tmp_path):
 
     control.record_human_approval("T1", approved_by="user", note="approved test gate")
 
+    try:
+        control.record_human_approval("T1", approved_by="user", note="duplicate")
+    except ApprovalRequired:
+        pass
+    else:
+        raise AssertionError("a human gate may have only one unused approval")
+
     restarted = ControlPlane(path)
     resumed = restarted.advance("T1", TaskState.NEW, actor_role=Role.OPERATOR)
     assert resumed.state is TaskState.NEW
@@ -157,3 +164,36 @@ def test_approval_cannot_be_pre_recorded_for_non_paused_task(tmp_path):
         pass
     else:
         raise AssertionError("approval must be tied to an active HUMAN_REQUIRED gate")
+
+
+def test_transition_atomically_persists_evidence_hashes(tmp_path):
+    control = ControlPlane(tmp_path / "orchestrator.db")
+    control.create_task(Task.new(task_id="T1", goal="evidence"))
+    artifact = "sha256:" + ("a" * 64)
+
+    updated = control.advance(
+        "T1",
+        TaskState.TRIAGED,
+        actor_role=Role.OPERATOR,
+        output_artifact_hashes=(artifact,),
+    )
+    assert updated.artifact_refs == (artifact,)
+    assert control.task_store.get("T1").artifact_refs == (artifact,)
+    assert control.audit_log.verify()
+
+
+def test_invalid_evidence_hash_is_rejected_before_state_change(tmp_path):
+    control = ControlPlane(tmp_path / "orchestrator.db")
+    control.create_task(Task.new(task_id="T1", goal="bad evidence"))
+    try:
+        control.advance(
+            "T1",
+            TaskState.TRIAGED,
+            actor_role=Role.OPERATOR,
+            output_artifact_hashes=("not-a-hash",),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("only canonical sha256 evidence references are accepted")
+    assert control.task_store.get("T1").state is TaskState.NEW
