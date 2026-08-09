@@ -1,0 +1,17 @@
+from trademind.orchestrator.models import PolicyDecision, RiskClass
+from trademind.orchestrator.policy import classify_action
+
+
+def test_forbidden_trade_action():
+    result = classify_action("BROKER_ORDER_PLACE")
+    assert result.decision is PolicyDecision.FORBIDDEN
+
+
+def test_architecture_breaking_requires_human():
+    result = classify_action("UPDATE_DOCUMENTATION", risk_class=RiskClass.ARCHITECTURE_BREAKING)
+    assert result.decision is PolicyDecision.HUMAN_REQUIRED
+
+
+def test_routine_tests_are_auto_allowed_with_audit():
+    result = classify_action("RUN_TESTS")
+    assert result.decision is PolicyDecision.AUTO_ALLOWED_WITH_AUDIT
