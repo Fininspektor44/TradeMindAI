@@ -21,15 +21,23 @@ class BudgetManager:
         per_task_call_limit: int,
         per_role_call_limit: int,
         failure_cooldown_seconds: int = 300,
+        daily_token_ceiling: int | None = None,
+        monthly_token_ceiling: int | None = None,
     ) -> None:
-        if min(
+        numeric_limits = (
             daily_cost_ceiling,
             monthly_cost_ceiling,
             per_task_call_limit,
             per_role_call_limit,
             failure_cooldown_seconds,
-        ) < 0:
+        )
+        if min(numeric_limits) < 0:
             raise ValueError("budget limits must be non-negative")
+        if daily_token_ceiling is not None and daily_token_ceiling < 0:
+            raise ValueError("daily_token_ceiling must be non-negative")
+        if monthly_token_ceiling is not None and monthly_token_ceiling < 0:
+            raise ValueError("monthly_token_ceiling must be non-negative")
+
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.daily_cost_ceiling = float(daily_cost_ceiling)
@@ -37,6 +45,12 @@ class BudgetManager:
         self.per_task_call_limit = int(per_task_call_limit)
         self.per_role_call_limit = int(per_role_call_limit)
         self.failure_cooldown_seconds = int(failure_cooldown_seconds)
+        self.daily_token_ceiling = (
+            int(daily_token_ceiling) if daily_token_ceiling is not None else None
+        )
+        self.monthly_token_ceiling = (
+            int(monthly_token_ceiling) if monthly_token_ceiling is not None else None
+        )
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -77,7 +91,12 @@ class BudgetManager:
         role: Role,
         request_hash: str,
         now: datetime | None = None,
+        estimated_cost: float = 0.0,
+        estimated_tokens: int = 0,
     ) -> BudgetCheck:
+        if estimated_cost < 0 or estimated_tokens < 0:
+            raise ValueError("estimated cost and tokens must be non-negative")
+
         current = now or datetime.now(timezone.utc)
         day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
         month_start = day_start.replace(day=1)
@@ -109,26 +128,44 @@ class BudgetManager:
             if task_calls >= self.per_task_call_limit:
                 return BudgetCheck(False, "per-task model call limit exhausted")
 
+            # Role limits are a daily throttle. A lifetime counter would permanently
+            # disable a role after enough successful days, which is unsafe for a 24/7 service.
             role_calls = db.execute(
-                "SELECT COUNT(*) AS n FROM model_usage WHERE role=?",
-                (role.value,),
+                "SELECT COUNT(*) AS n FROM model_usage WHERE role=? AND timestamp>=?",
+                (role.value, day_start.isoformat()),
             ).fetchone()["n"]
             if role_calls >= self.per_role_call_limit:
-                return BudgetCheck(False, "per-role model call limit exhausted")
+                return BudgetCheck(False, "daily per-role model call limit exhausted")
 
-            daily_cost = db.execute(
-                "SELECT COALESCE(SUM(cost), 0) AS total FROM model_usage WHERE timestamp>=?",
+            day_row = db.execute(
+                """
+                SELECT COALESCE(SUM(cost), 0) AS cost, COALESCE(SUM(tokens), 0) AS tokens
+                FROM model_usage WHERE timestamp>=?
+                """,
                 (day_start.isoformat(),),
-            ).fetchone()["total"]
-            if float(daily_cost) >= self.daily_cost_ceiling:
-                return BudgetCheck(False, "daily model cost ceiling exhausted")
+            ).fetchone()
+            if float(day_row["cost"]) + estimated_cost > self.daily_cost_ceiling:
+                return BudgetCheck(False, "daily model cost ceiling would be exceeded")
+            if (
+                self.daily_token_ceiling is not None
+                and int(day_row["tokens"]) + estimated_tokens > self.daily_token_ceiling
+            ):
+                return BudgetCheck(False, "daily model token ceiling would be exceeded")
 
-            monthly_cost = db.execute(
-                "SELECT COALESCE(SUM(cost), 0) AS total FROM model_usage WHERE timestamp>=?",
+            month_row = db.execute(
+                """
+                SELECT COALESCE(SUM(cost), 0) AS cost, COALESCE(SUM(tokens), 0) AS tokens
+                FROM model_usage WHERE timestamp>=?
+                """,
                 (month_start.isoformat(),),
-            ).fetchone()["total"]
-            if float(monthly_cost) >= self.monthly_cost_ceiling:
-                return BudgetCheck(False, "monthly model cost ceiling exhausted")
+            ).fetchone()
+            if float(month_row["cost"]) + estimated_cost > self.monthly_cost_ceiling:
+                return BudgetCheck(False, "monthly model cost ceiling would be exceeded")
+            if (
+                self.monthly_token_ceiling is not None
+                and int(month_row["tokens"]) + estimated_tokens > self.monthly_token_ceiling
+            ):
+                return BudgetCheck(False, "monthly model token ceiling would be exceeded")
 
         return BudgetCheck(True, "budget available")
 
