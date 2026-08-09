@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from .models import Role
@@ -13,6 +14,12 @@ SCHEMA_VERSION = "orchestrator-agent-v1"
 
 class AgentProtocolError(RuntimeError):
     pass
+
+
+class AgentDecision(StrEnum):
+    CONTINUE = "CONTINUE"
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +69,7 @@ class AgentResult:
     tokens: int = 0
     cost: float = 0.0
     error: str | None = None
+    decision: AgentDecision = AgentDecision.CONTINUE
 
     def __post_init__(self) -> None:
         if self.tokens < 0 or self.cost < 0:
@@ -72,6 +80,8 @@ class AgentResult:
             raise ValueError("successful agent result must declare output_schema")
         if not self.success and not self.error:
             raise ValueError("failed agent result must contain an error")
+        if not self.success and self.decision is not AgentDecision.CONTINUE:
+            raise ValueError("failed transport/result cannot carry approve/reject decision")
 
 
 class AgentProvider(Protocol):
