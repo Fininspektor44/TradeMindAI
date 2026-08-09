@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import RiskClass, Role, Task, TaskState
@@ -53,6 +54,8 @@ class TaskStore:
 
     def save(self, task: Task) -> None:
         """Insert a new immutable revision. Existing revisions cannot be replaced."""
+        if task.state is not TaskState.NEW or task.assigned_role is not None or task.resume_state is not None:
+            raise RevisionConflict("new task revisions must be inserted in pristine NEW state")
         try:
             with self._connect() as db:
                 db.execute(
@@ -146,6 +149,7 @@ class TaskStore:
             previous,
             revision=previous.revision + 1,
             parent_task_id=f"{previous.task_id}@{previous.revision}",
+            created_at=datetime.now(timezone.utc).isoformat(),
             goal=goal if goal is not None else previous.goal,
             state=TaskState.NEW,
             assigned_role=None,
