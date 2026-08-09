@@ -16,6 +16,10 @@ class UnauthorizedActor(RuntimeError):
     pass
 
 
+class ApprovalRequired(RuntimeError):
+    pass
+
+
 _AI_ROLES = frozenset({Role.ARCHITECT, Role.DEVELOPER, Role.AUDITOR})
 
 
@@ -26,24 +30,43 @@ class ControlPlane:
         self.path = Path(path)
         self.task_store = TaskStore(self.path)
         self.audit_log = AuditLog(self.path)
+        self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         return connection
 
+    def _init_schema(self) -> None:
+        with self._connect() as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS human_approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    resume_state TEXT NOT NULL,
+                    approved_at TEXT NOT NULL,
+                    approved_by TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    consumed_at TEXT,
+                    UNIQUE(task_id, revision, resume_state, approved_at)
+                )
+                """
+            )
+
     @staticmethod
     def _validate_actor(
         current: Task,
         *,
         actor_role: Role,
-        human_approval_recorded: bool,
+        approval_available: bool,
         model_provider: str | None,
         model_name: str | None,
     ) -> None:
         if current.state is TaskState.HUMAN_REQUIRED:
-            if not human_approval_recorded:
-                return
+            if not approval_available:
+                raise ApprovalRequired("HUMAN_REQUIRED needs a durable unused approval record")
             if actor_role is not Role.OPERATOR:
                 raise UnauthorizedActor("recorded human approval may be resumed only by OPERATOR")
         elif current.assigned_role is not actor_role:
@@ -58,6 +81,66 @@ class ControlPlane:
         elif model_provider is not None or model_name is not None:
             raise UnauthorizedActor("OPERATOR transitions cannot claim model provider metadata")
 
+    def record_human_approval(
+        self,
+        task_id: str,
+        *,
+        revision: int | None = None,
+        approved_by: str,
+        note: str = "",
+    ) -> None:
+        """Record one explicit human approval for a currently paused task."""
+        if not approved_by.strip():
+            raise ValueError("approved_by must not be empty")
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if revision is None:
+                row = db.execute(
+                    "SELECT * FROM tasks WHERE task_id=? ORDER BY revision DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    "SELECT * FROM tasks WHERE task_id=? AND revision=?",
+                    (task_id, revision),
+                ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            task = TaskStore._row_to_task(row)
+            if task.state is not TaskState.HUMAN_REQUIRED or task.resume_state is None:
+                raise ApprovalRequired("approval may be recorded only for HUMAN_REQUIRED task")
+
+            db.execute(
+                """
+                INSERT INTO human_approvals(
+                    task_id, revision, resume_state, approved_at, approved_by, note, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    task.task_id,
+                    task.revision,
+                    task.resume_state.value,
+                    timestamp,
+                    approved_by.strip(),
+                    note,
+                ),
+            )
+            AuditLog.append_in_transaction(
+                db,
+                AuditEvent(
+                    timestamp=timestamp,
+                    task_id=task.task_id,
+                    revision=task.revision,
+                    actor_role=None,
+                    action="HUMAN_APPROVAL_RECORDED",
+                    from_state=task.state,
+                    to_state=task.state,
+                    policy_result=PolicyDecision.HUMAN_REQUIRED,
+                    metadata={"approved_by": approved_by.strip(), "note": note},
+                ),
+            )
+
     def advance(
         self,
         task_id: str,
@@ -67,7 +150,6 @@ class ControlPlane:
         actor_role: Role = Role.OPERATOR,
         action: str = "STATE_TRANSITION",
         policy_result: PolicyDecision | None = None,
-        human_approval_recorded: bool = False,
         model_provider: str | None = None,
         model_name: str | None = None,
     ) -> Task:
@@ -88,17 +170,29 @@ class ControlPlane:
                 raise KeyError(task_id)
 
             current = TaskStore._row_to_task(row)
+            approval_row = None
+            if current.state is TaskState.HUMAN_REQUIRED and current.resume_state is not None:
+                approval_row = db.execute(
+                    """
+                    SELECT id FROM human_approvals
+                    WHERE task_id=? AND revision=? AND resume_state=? AND consumed_at IS NULL
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (current.task_id, current.revision, current.resume_state.value),
+                ).fetchone()
+
+            approval_available = approval_row is not None
             self._validate_actor(
                 current,
                 actor_role=actor_role,
-                human_approval_recorded=human_approval_recorded,
+                approval_available=approval_available,
                 model_provider=model_provider,
                 model_name=model_name,
             )
             updated = transition(
                 current,
                 target,
-                human_approval_recorded=human_approval_recorded,
+                human_approval_recorded=approval_available,
             )
             cursor = db.execute(
                 """
@@ -118,10 +212,17 @@ class ControlPlane:
             if cursor.rowcount != 1:
                 raise RevisionConflict("task state changed concurrently")
 
+            timestamp = datetime.now(timezone.utc).isoformat()
+            if approval_row is not None:
+                db.execute(
+                    "UPDATE human_approvals SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
+                    (timestamp, int(approval_row["id"])),
+                )
+
             AuditLog.append_in_transaction(
                 db,
                 AuditEvent(
-                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    timestamp=timestamp,
                     task_id=current.task_id,
                     revision=current.revision,
                     actor_role=actor_role,
