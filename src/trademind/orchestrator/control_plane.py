@@ -12,6 +12,13 @@ from .state_machine import transition
 from .task_store import RevisionConflict, TaskStore
 
 
+class UnauthorizedActor(RuntimeError):
+    pass
+
+
+_AI_ROLES = frozenset({Role.ARCHITECT, Role.DEVELOPER, Role.AUDITOR})
+
+
 class ControlPlane:
     """Own persistent task mutation and audit it in the same SQLite transaction."""
 
@@ -24,6 +31,32 @@ class ControlPlane:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @staticmethod
+    def _validate_actor(
+        current: Task,
+        *,
+        actor_role: Role,
+        human_approval_recorded: bool,
+        model_provider: str | None,
+        model_name: str | None,
+    ) -> None:
+        if current.state is TaskState.HUMAN_REQUIRED:
+            if not human_approval_recorded:
+                return
+            if actor_role is not Role.OPERATOR:
+                raise UnauthorizedActor("recorded human approval may be resumed only by OPERATOR")
+        elif current.assigned_role is not actor_role:
+            expected = current.assigned_role.value if current.assigned_role else "NONE"
+            raise UnauthorizedActor(
+                f"{actor_role.value} cannot advance {current.state.value}; assigned role is {expected}"
+            )
+
+        if actor_role in _AI_ROLES:
+            if not (model_provider and model_provider.strip() and model_name and model_name.strip()):
+                raise UnauthorizedActor("AI role transitions require provider and model audit metadata")
+        elif model_provider is not None or model_name is not None:
+            raise UnauthorizedActor("OPERATOR transitions cannot claim model provider metadata")
 
     def advance(
         self,
@@ -55,6 +88,13 @@ class ControlPlane:
                 raise KeyError(task_id)
 
             current = TaskStore._row_to_task(row)
+            self._validate_actor(
+                current,
+                actor_role=actor_role,
+                human_approval_recorded=human_approval_recorded,
+                model_provider=model_provider,
+                model_name=model_name,
+            )
             updated = transition(
                 current,
                 target,
