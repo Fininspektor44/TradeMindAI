@@ -1,4 +1,9 @@
-from trademind.orchestrator.agent_protocol import AgentEnvelope, AgentResult, SCHEMA_VERSION
+from trademind.orchestrator.agent_protocol import (
+    AgentDecision,
+    AgentEnvelope,
+    AgentResult,
+    SCHEMA_VERSION,
+)
 from trademind.orchestrator.models import Role
 
 
@@ -58,3 +63,17 @@ def test_agent_result_requires_schema_on_success_and_error_on_failure():
         pass
     else:
         raise AssertionError("failed result must explain its error")
+
+
+def test_failed_transport_result_cannot_fake_auditor_rejection():
+    try:
+        AgentResult(
+            success=False,
+            summary="transport failed",
+            error="timeout",
+            decision=AgentDecision.REJECT,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("failed provider call cannot masquerade as an auditor decision")
