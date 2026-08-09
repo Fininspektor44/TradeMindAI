@@ -7,14 +7,6 @@ on:
       - "tests/orchestrator/**"
       - "pyproject.toml"
       - ".github/workflows/orchestrator-v1-ci.yml"
-  push:
-    branches:
-      - "feature/orchestrator-v1-skeleton"
-    paths:
-      - "src/trademind/orchestrator/**"
-      - "tests/orchestrator/**"
-      - "pyproject.toml"
-      - ".github/workflows/orchestrator-v1-ci.yml"
 
 permissions:
   contents: read
