@@ -113,6 +113,23 @@ class WorkflowEngine:
             raise WorkflowPolicyError(result.reason)
         return result.decision
 
+    @staticmethod
+    def _model_request_hash(
+        budget: BudgetManager,
+        *,
+        provider_name: str,
+        model_name: str,
+        envelope_payload: dict[str, object],
+    ) -> str:
+        """Bind cache identity to both request contents and model provenance."""
+        return budget.request_hash(
+            {
+                "provider": provider_name,
+                "model": model_name,
+                "envelope": envelope_payload,
+            }
+        )
+
     def _store_agent_result(
         self,
         task: Task,
@@ -242,7 +259,12 @@ class WorkflowEngine:
             role=role,
             required_output_schema=spec.output_schema,
         )
-        request_hash = self.budget.request_hash(envelope.to_payload())
+        request_hash = self._model_request_hash(
+            self.budget,
+            provider_name=provider.provider_name,
+            model_name=provider.model_name,
+            envelope_payload=envelope.to_payload(),
+        )
 
         cached_payload = self.budget.cached_result(request_hash)
         if cached_payload is not None:
