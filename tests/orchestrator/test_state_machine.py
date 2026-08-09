@@ -34,7 +34,7 @@ def test_roles_are_separated_across_author_review_implementation_and_audit():
     assert task.assigned_role is Role.AUDITOR
 
     task = transition(task, TaskState.ARCH_REVIEWED)
-    assert task.assigned_role is Role.OPERATOR
+    assert task.assigned_role is Role.DEVELOPER
 
     task = transition(task, TaskState.IMPLEMENTING)
     assert task.assigned_role is Role.DEVELOPER
