@@ -8,6 +8,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from .models import RiskClass, Role, Task, TaskState
+from .state_machine import transition
+
+
+class RevisionConflict(RuntimeError):
+    pass
 
 
 class TaskStore:
@@ -47,33 +52,60 @@ class TaskStore:
             )
 
     def save(self, task: Task) -> None:
+        """Insert a new immutable revision. Existing revisions cannot be replaced."""
+        try:
+            with self._connect() as db:
+                db.execute(
+                    """
+                    INSERT INTO tasks (
+                        task_id, revision, parent_task_id, created_at, goal, scope_json,
+                        risk_class, state, assigned_role, allowed_tools_json, budget_limit,
+                        acceptance_criteria_json, artifact_refs_json, priority, resume_state
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    self._values(task),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise RevisionConflict(
+                f"task revision already exists: {task.task_id}@{task.revision}"
+            ) from exc
+
+    def advance(
+        self,
+        task_id: str,
+        target: TaskState,
+        *,
+        revision: int | None = None,
+        human_approval_recorded: bool = False,
+    ) -> Task:
+        """Persist a state change only through the canonical state machine."""
+        current = self.get(task_id, revision)
+        if current is None:
+            raise KeyError(task_id)
+        updated = transition(
+            current,
+            target,
+            human_approval_recorded=human_approval_recorded,
+        )
         with self._connect() as db:
-            db.execute(
+            cursor = db.execute(
                 """
-                INSERT OR REPLACE INTO tasks (
-                    task_id, revision, parent_task_id, created_at, goal, scope_json,
-                    risk_class, state, assigned_role, allowed_tools_json, budget_limit,
-                    acceptance_criteria_json, artifact_refs_json, priority, resume_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE tasks
+                SET state=?, assigned_role=?, resume_state=?
+                WHERE task_id=? AND revision=? AND state=?
                 """,
                 (
-                    task.task_id,
-                    task.revision,
-                    task.parent_task_id,
-                    task.created_at,
-                    task.goal,
-                    json.dumps(task.scope),
-                    task.risk_class.value,
-                    task.state.value,
-                    task.assigned_role.value if task.assigned_role else None,
-                    json.dumps(task.allowed_tools),
-                    task.budget_limit,
-                    json.dumps(task.acceptance_criteria),
-                    json.dumps(task.artifact_refs),
-                    task.priority,
-                    task.resume_state.value if task.resume_state else None,
+                    updated.state.value,
+                    updated.assigned_role.value if updated.assigned_role else None,
+                    updated.resume_state.value if updated.resume_state else None,
+                    current.task_id,
+                    current.revision,
+                    current.state.value,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise RevisionConflict("task state changed concurrently")
+        return updated
 
     def get(self, task_id: str, revision: int | None = None) -> Task | None:
         with self._connect() as db:
@@ -122,6 +154,26 @@ class TaskStore:
         )
         self.save(revised)
         return revised
+
+    @staticmethod
+    def _values(task: Task) -> tuple:
+        return (
+            task.task_id,
+            task.revision,
+            task.parent_task_id,
+            task.created_at,
+            task.goal,
+            json.dumps(task.scope),
+            task.risk_class.value,
+            task.state.value,
+            task.assigned_role.value if task.assigned_role else None,
+            json.dumps(task.allowed_tools),
+            task.budget_limit,
+            json.dumps(task.acceptance_criteria),
+            json.dumps(task.artifact_refs),
+            task.priority,
+            task.resume_state.value if task.resume_state else None,
+        )
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> Task:
