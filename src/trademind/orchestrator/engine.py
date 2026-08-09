@@ -141,6 +141,18 @@ class WorkflowEngine:
         )
         return artifact.hash_ref
 
+    @staticmethod
+    def _cached_agent_result(payload: dict) -> AgentResult:
+        return AgentResult(
+            success=bool(payload["success"]),
+            summary=str(payload["summary"]),
+            artifact_refs=tuple(payload.get("artifact_refs", ())),
+            output_schema=str(payload.get("output_schema", "")),
+            tokens=int(payload.get("tokens", 0)),
+            cost=float(payload.get("cost", 0.0)),
+            error=payload.get("error"),
+        )
+
     def _run_ai_stage(self, task: Task, spec: StageSpec) -> Task:
         role = task.assigned_role
         if role not in _AI_ROLES or spec.output_schema is None:
@@ -154,6 +166,32 @@ class WorkflowEngine:
             required_output_schema=spec.output_schema,
         )
         request_hash = self.budget.request_hash(envelope.to_payload())
+
+        cached_payload = self.budget.cached_result(request_hash)
+        if cached_payload is not None:
+            result = self._cached_agent_result(cached_payload)
+            if result.output_schema != spec.output_schema:
+                raise WorkflowError("cached model result schema does not match requested stage")
+            cached_provider = f"cache:{provider.provider_name}"
+            artifact_hash = self._store_agent_result(
+                task,
+                role=role,
+                provider_name=cached_provider,
+                model_name=provider.model_name,
+                result=result,
+            )
+            return self.control.advance(
+                task.task_id,
+                spec.target,
+                revision=task.revision,
+                actor_role=role,
+                action=spec.action,
+                policy_result=policy,
+                model_provider=cached_provider,
+                model_name=provider.model_name,
+                output_artifact_hashes=(artifact_hash,),
+            )
+
         check = self.budget.check(
             task_id=task.task_id,
             role=role,
@@ -238,6 +276,8 @@ class WorkflowEngine:
             cost=result.cost,
             tokens=result.tokens,
             success=result.success,
+            cacheable=result.success,
+            cache_payload=asdict(result) if result.success else None,
         )
         artifact_hash = self._store_agent_result(
             task,
