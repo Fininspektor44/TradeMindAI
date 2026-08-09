@@ -22,10 +22,6 @@ class WorkflowPolicyError(WorkflowError):
     pass
 
 
-class WorkflowBudgetError(WorkflowError):
-    pass
-
-
 @dataclass(frozen=True, slots=True)
 class StageSpec:
     target: TaskState
@@ -164,9 +160,36 @@ class WorkflowEngine:
             request_hash=request_hash,
             estimated_cost=self.estimated_model_cost,
             estimated_tokens=self.estimated_model_tokens,
+            task_cost_ceiling=task.budget_limit,
         )
         if not check.allowed:
-            raise WorkflowBudgetError(check.reason)
+            artifact = self.artifacts.store_json(
+                task_id=task.task_id,
+                revision=task.revision,
+                kind=f"{task.state.value.lower()}-budget-gate",
+                payload={
+                    "role": role.value,
+                    "reason": check.reason,
+                    "request_hash": request_hash,
+                    "estimated_cost": self.estimated_model_cost,
+                    "estimated_tokens": self.estimated_model_tokens,
+                    "task_cost_ceiling": task.budget_limit,
+                },
+            )
+            return self.control.system_halt(
+                task.task_id,
+                TaskState.HUMAN_REQUIRED,
+                revision=task.revision,
+                action="MODEL_BUDGET_GATE",
+                policy_result=PolicyDecision.HUMAN_REQUIRED,
+                error=check.reason,
+                metadata={
+                    "requested_role": role.value,
+                    "configured_provider": provider.provider_name,
+                    "configured_model": provider.model_name,
+                },
+                output_artifact_hashes=(artifact.hash_ref,),
+            )
 
         try:
             result = self.router.execute(
@@ -174,7 +197,7 @@ class WorkflowEngine:
                 role=role,
                 required_output_schema=spec.output_schema,
             )
-        except Exception:
+        except Exception as exc:
             self.budget.record(
                 task_id=task.task_id,
                 role=role,
@@ -183,7 +206,30 @@ class WorkflowEngine:
                 tokens=0,
                 success=False,
             )
-            raise
+            artifact = self.artifacts.store_json(
+                task_id=task.task_id,
+                revision=task.revision,
+                kind=f"{task.state.value.lower()}-provider-error",
+                payload={
+                    "role": role.value,
+                    "provider": provider.provider_name,
+                    "model": provider.model_name,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "request_hash": request_hash,
+                },
+            )
+            return self.control.system_halt(
+                task.task_id,
+                TaskState.FAILED,
+                revision=task.revision,
+                action="MODEL_PROVIDER_FAILURE",
+                policy_result=policy,
+                error=str(exc),
+                model_provider=provider.provider_name,
+                model_name=provider.model_name,
+                output_artifact_hashes=(artifact.hash_ref,),
+            )
 
         self.budget.record(
             task_id=task.task_id,
@@ -220,11 +266,9 @@ class WorkflowEngine:
         policy = self._policy(task, spec.action)
         artifact_hashes: tuple[str, ...] = ()
         target = spec.target
-        exit_code: int | None = None
 
         if spec.tool_template is not None:
             result = self.tools.run(spec.tool_template, cwd=self.working_directory)
-            exit_code = result.exit_code
             artifact = self.artifacts.store_json(
                 task_id=task.task_id,
                 revision=task.revision,
@@ -235,7 +279,7 @@ class WorkflowEngine:
             if not result.success:
                 target = TaskState.FAILED
 
-        updated = self.control.advance(
+        return self.control.advance(
             task.task_id,
             target,
             revision=task.revision,
@@ -244,11 +288,6 @@ class WorkflowEngine:
             policy_result=policy,
             output_artifact_hashes=artifact_hashes,
         )
-
-        # Exit code is preserved inside the immutable tool artifact. ControlPlane
-        # intentionally owns state/audit writes and never executes commands itself.
-        _ = exit_code
-        return updated
 
     def step(self, task_id: str) -> Task:
         task = self.control.task_store.get(task_id)
