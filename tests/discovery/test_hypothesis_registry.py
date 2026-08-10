@@ -13,6 +13,9 @@ from trademind.discovery.hypothesis_registry import (
 HOLDOUT_ENVELOPE_HASH = hashlib.sha256(b"registry-holdout").hexdigest()
 EVALUATOR_HASH = hashlib.sha256(b"registry-evaluator").hexdigest()
 ISOLATION_HASH = hashlib.sha256(b"registry-isolation").hexdigest()
+PUBLIC_MAX_TIME = "2026-01-02T00:00:00+00:00"
+HOLDOUT_START_TIME = "2026-01-03T00:00:00+00:00"
+HOLDOUT_END_TIME = "2026-01-04T00:00:00+00:00"
 
 
 def _family():
@@ -48,6 +51,11 @@ def _attest_holdout(registry: HypothesisRegistry, hypothesis_id: str) -> Holdout
     seals.mark_isolated(
         hypothesis_id,
         isolation_receipt_hash=ISOLATION_HASH,
+        public_max_time=PUBLIC_MAX_TIME,
+        holdout_start_time=HOLDOUT_START_TIME,
+        holdout_end_time=HOLDOUT_END_TIME,
+        public_row_count=2,
+        holdout_row_count=2,
     )
     return seals
 
@@ -94,7 +102,7 @@ def test_train_state_cannot_advance_without_isolated_holdout(tmp_path):
     try:
         registry.transition("H1", HypothesisState.TRAIN_TESTED)
     except RegistryError as exc:
-        assert "isolation" in str(exc).lower()
+        assert "holdout" in str(exc).lower()
     else:
         raise AssertionError("research must not advance before final-holdout isolation")
 
