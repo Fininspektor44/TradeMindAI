@@ -1,5 +1,7 @@
+import hashlib
 import json
 
+from trademind.discovery.holdout_store import HoldoutSealStore
 from trademind.discovery.hypothesis_registry import HypothesisRegistry, HypothesisState
 from trademind.discovery.manifest import DatasetArtifact, ExperimentManifest
 from trademind.discovery.orchestrator_bridge import (
@@ -11,7 +13,17 @@ from trademind.orchestrator.control_plane import ControlPlane
 from trademind.orchestrator.models import Role, TaskState
 
 
-def _frozen_case(tmp_path, *, leak_dataset_path_in_parameters: bool = False):
+BRIDGE_ENVELOPE_HASH = hashlib.sha256(b"bridge-envelope").hexdigest()
+BRIDGE_EVALUATOR_HASH = hashlib.sha256(b"bridge-evaluator").hexdigest()
+BRIDGE_ISOLATION_HASH = hashlib.sha256(b"bridge-isolation").hexdigest()
+
+
+def _frozen_case(
+    tmp_path,
+    *,
+    leak_dataset_path_in_parameters: bool = False,
+    attest_holdout: bool = True,
+):
     dataset = tmp_path / "market.csv"
     dataset.write_text("symbol,timeframe,time,open,high,low,close\n", encoding="utf-8")
     family_definition = {
@@ -45,10 +57,26 @@ def _frozen_case(tmp_path, *, leak_dataset_path_in_parameters: bool = False):
     frozen_path = tmp_path / "manifest.json"
     manifest_hash = manifest.freeze(frozen_path)
     registry.freeze(manifest.hypothesis_id, manifest_hash=manifest_hash)
+
+    holdout_seals = HoldoutSealStore(registry)
+    holdout_seals.register(
+        hypothesis_id=manifest.hypothesis_id,
+        envelope_hash=BRIDGE_ENVELOPE_HASH,
+        key_id="bridge-key-v1",
+        evaluator_id="bridge-tests-v1",
+        evaluator_hash=BRIDGE_EVALUATOR_HASH,
+    )
+    if attest_holdout:
+        holdout_seals.mark_isolated(
+            manifest.hypothesis_id,
+            isolation_receipt_hash=BRIDGE_ISOLATION_HASH,
+        )
+
     control = ControlPlane(tmp_path / "orchestrator.db")
     artifacts = ArtifactStore(tmp_path / "artifacts")
     bridge = DiscoveryOrchestratorBridge(
         registry=registry,
+        holdout_seals=holdout_seals,
         control=control,
         artifacts=artifacts,
     )
@@ -72,6 +100,7 @@ def test_frozen_hypothesis_creates_zero_budget_bounded_task(tmp_path):
     assert str(frozen_path) not in task.scope
     assert "Final-holdout exposure to Orchestrator agents is forbidden" in task.goal
     assert any("manifest_sha256=" in item for item in task.acceptance_criteria)
+    assert any("holdout_isolation_sha256=" in item for item in task.acceptance_criteria)
     assert len(task.artifact_refs) == 1
     assert registry.get(manifest.hypothesis_id).state is HypothesisState.FROZEN
     assert registry.family_status(manifest.hypothesis_family_id)["holdout_consumed"] is False
@@ -86,6 +115,23 @@ def test_frozen_hypothesis_creates_zero_budget_bounded_task(tmp_path):
     assert str(frozen_path) not in brief_text
     assert brief["hypothesis_family_id"] == manifest.hypothesis_family_id
     assert brief["content_hash"] == manifest.content_hash
+    assert brief["holdout_isolation_receipt_hash"] == BRIDGE_ISOLATION_HASH
+
+
+def test_bridge_rejects_unattested_final_holdout(tmp_path):
+    _, frozen_path, manifest, registry, _, _, bridge = _frozen_case(
+        tmp_path,
+        attest_holdout=False,
+    )
+
+    try:
+        bridge.submit_frozen_hypothesis(manifest.hypothesis_id, manifest_path=frozen_path)
+    except DiscoveryBridgeError:
+        pass
+    else:
+        raise AssertionError("Orchestrator bridge must require final-holdout isolation attestation")
+
+    assert registry.get(manifest.hypothesis_id).state is HypothesisState.FROZEN
 
 
 def test_positive_budget_is_explicit_opt_in(tmp_path):
