@@ -84,6 +84,8 @@ def seal_bytes(
     key_id: str,
     hypothesis_family_id: str,
     manifest_hash: str,
+    evaluator_id: str,
+    evaluator_hash: str,
 ) -> dict[str, Any]:
     """Encrypt final-holdout bytes with AES-256-GCM and authenticated metadata."""
     if not isinstance(plaintext, bytes) or not plaintext:
@@ -92,6 +94,8 @@ def seal_bytes(
     key_id = _validate_nonempty(key_id, "key_id")
     family_id = _validate_nonempty(hypothesis_family_id, "hypothesis_family_id")
     manifest_hash = _validate_sha256(manifest_hash, "manifest_hash")
+    evaluator_id = _validate_nonempty(evaluator_id, "evaluator_id")
+    evaluator_hash = _validate_sha256(evaluator_hash, "evaluator_hash")
 
     header = {
         "schema_version": _SCHEMA_VERSION,
@@ -99,6 +103,8 @@ def seal_bytes(
         "key_id": key_id,
         "hypothesis_family_id": family_id,
         "manifest_hash": manifest_hash,
+        "evaluator_id": evaluator_id,
+        "evaluator_hash": evaluator_hash,
         "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
         "plaintext_size": len(plaintext),
         "sealed_at": datetime.now(timezone.utc).isoformat(),
@@ -128,17 +134,20 @@ def verify_envelope(document: dict[str, Any]) -> dict[str, Any]:
 
     key_id = header.get("key_id")
     family_id = header.get("hypothesis_family_id")
-    manifest_hash = header.get("manifest_hash")
-    plaintext_hash = header.get("plaintext_sha256")
-    plaintext_size = header.get("plaintext_size")
+    evaluator_id = header.get("evaluator_id")
     sealed_at = header.get("sealed_at")
-    if not all(isinstance(value, str) and value.strip() for value in (key_id, family_id, sealed_at)):
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (key_id, family_id, evaluator_id, sealed_at)
+    ):
         raise HoldoutCryptoError("holdout envelope identity fields are invalid")
     try:
-        _validate_sha256(str(manifest_hash), "manifest_hash")
-        _validate_sha256(str(plaintext_hash), "plaintext_sha256")
+        _validate_sha256(str(header.get("manifest_hash")), "manifest_hash")
+        _validate_sha256(str(header.get("evaluator_hash")), "evaluator_hash")
+        _validate_sha256(str(header.get("plaintext_sha256")), "plaintext_sha256")
     except ValueError as exc:
         raise HoldoutCryptoError("holdout envelope hash fields are invalid") from exc
+    plaintext_size = header.get("plaintext_size")
     if not isinstance(plaintext_size, int) or plaintext_size <= 0:
         raise HoldoutCryptoError("holdout plaintext_size is invalid")
 
