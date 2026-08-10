@@ -326,6 +326,11 @@ class FinalHoldoutSealer:
             stored = self.seals.mark_isolated(
                 hypothesis_id,
                 isolation_receipt_hash=isolation_hash,
+                public_max_time=str(boundary["public_max_time"]),
+                holdout_start_time=str(boundary["holdout_start_time"]),
+                holdout_end_time=str(boundary["holdout_end_time"]),
+                public_row_count=int(boundary["public_row_count"]),
+                holdout_row_count=int(boundary["holdout_row_count"]),
             )
             if not stored.isolated:
                 raise HoldoutSealerError("final holdout isolation attestation was not persisted")
