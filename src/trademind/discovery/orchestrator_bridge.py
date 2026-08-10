@@ -2,13 +2,15 @@
 
 The bridge is deliberately narrow: it may submit work for a hypothesis only after
 its manifest is frozen and externally anchored in the hypothesis registry. Raw
-dataset paths are used locally for verification but are never exposed in the task
-envelope or research brief, because the source artifact may contain final holdout.
+dataset paths are used locally for deterministic integrity verification but are
+never exposed in the task envelope or research brief, because a source artifact
+may contain final-holdout rows.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -125,6 +127,32 @@ class DiscoveryOrchestratorBridge:
             "git_commit": payload["git_commit"],
         }
 
+    @classmethod
+    def _assert_brief_has_no_raw_paths(
+        cls,
+        validated: ValidatedFrozenHypothesis,
+        *,
+        manifest_path: str | Path,
+    ) -> dict:
+        brief = cls._safe_research_brief(validated)
+        encoded = json.dumps(
+            brief,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        forbidden = {str(Path(manifest_path)), str(Path(manifest_path).resolve())}
+        datasets = validated.manifest_payload.get("datasets", [])
+        if isinstance(datasets, list):
+            for raw in datasets:
+                if isinstance(raw, dict) and raw.get("file_path"):
+                    raw_path = str(raw["file_path"])
+                    forbidden.add(raw_path)
+                    forbidden.add(str(Path(raw_path).resolve()))
+        if any(path and path in encoded for path in forbidden):
+            raise DiscoveryBridgeError("research brief metadata contains a raw artifact path")
+        return brief
+
     def submit_frozen_hypothesis(
         self,
         hypothesis_id: str,
@@ -149,18 +177,22 @@ class DiscoveryOrchestratorBridge:
         if self.control.task_store.get(binding.orchestrator_task_id) is not None:
             raise DiscoveryBridgeError("frozen hypothesis already has an Orchestrator task")
 
+        brief_payload = self._assert_brief_has_no_raw_paths(
+            validated,
+            manifest_path=manifest_path,
+        )
         brief = self.artifacts.store_json(
             task_id=binding.orchestrator_task_id,
             revision=1,
             kind="research-brief",
-            payload=self._safe_research_brief(validated),
+            payload=brief_payload,
         )
 
         task = Task.new(
             task_id=binding.orchestrator_task_id,
             goal=(
-                "Implement and validate the frozen Discovery hypothesis using only "
-                "discovery and validation data. Final-holdout access is forbidden."
+                "Prepare bounded implementation and validation work for the frozen Discovery "
+                "hypothesis. Final-holdout exposure to Orchestrator agents is forbidden."
             ),
             scope=("src/trademind/discovery",),
             risk_class=RiskClass.LOW,
@@ -168,9 +200,9 @@ class DiscoveryOrchestratorBridge:
             acceptance_criteria=(
                 f"manifest_sha256={binding.manifest_hash}",
                 f"hypothesis_family_id={binding.hypothesis_family_id}",
-                "research brief contains no raw dataset paths",
+                "research brief contains no raw manifest or dataset paths",
                 "frozen manifest and dataset hashes remain valid",
-                "no final-holdout data is read, returned, or consumed",
+                "no final-holdout rows are exposed to Orchestrator agents or consumed by lifecycle",
                 "no broker order or live trading side effect is allowed",
             ),
             priority=priority,
