@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +73,38 @@ def _validated_metrics(
             continue
         raise HoldoutRunError("holdout evaluator may return only scalar numeric/bool metrics")
     return cleaned
+
+
+class _RunLock:
+    """Cross-process fail-closed lock for one result ledger."""
+
+    def __init__(self, ledger_path: Path) -> None:
+        self.path = ledger_path.with_suffix(ledger_path.suffix + ".holdout-run.lock")
+        self.fd: int | None = None
+
+    def __enter__(self) -> "_RunLock":
+        try:
+            self.fd = os.open(
+                self.path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError as exc:
+            raise HoldoutRunError(
+                "final-holdout runner lock already exists; refuse concurrent or stale run"
+            ) from exc
+        os.write(self.fd, f"pid={os.getpid()}\n".encode("ascii"))
+        os.fsync(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class FinalHoldoutRunner:
@@ -152,6 +185,8 @@ class FinalHoldoutRunner:
             raise HoldoutRunError("result ledger already contains final-holdout claim for family")
 
         seal = self.seals.get(hypothesis_id)
+        if not seal.isolated:
+            raise HoldoutRunError("final holdout has no persisted plaintext-isolation attestation")
         if seal.hypothesis_family_id != record.hypothesis_family_id:
             raise HoldoutRunError("sealed holdout family does not match hypothesis registry")
         if seal.manifest_hash != record.manifest_hash:
@@ -200,67 +235,68 @@ class FinalHoldoutRunner:
         state is committed, and only then may plaintext be decrypted. Any failure
         after the ledger claim is terminal for this family and cannot be retried.
         """
-        document = self._load_envelope(sealed_path)
-        key, family_id, envelope_hash = self._preflight(hypothesis_id, document)
+        with _RunLock(self.ledger.path):
+            document = self._load_envelope(sealed_path)
+            key, family_id, envelope_hash = self._preflight(hypothesis_id, document)
 
-        claim_hash = self.ledger.append(
-            {
-                "record_type": "FINAL_HOLDOUT_CLAIM",
-                "hypothesis_id": hypothesis_id,
-                "hypothesis_family_id": family_id,
-                "envelope_hash": envelope_hash,
-                "evaluator_id": self.evaluator.evaluator_id,
-                "evaluator_hash": self.evaluator_hash,
-            }
-        )
-        try:
-            self.registry.transition(hypothesis_id, HypothesisState.HOLDOUT_CONSUMED)
-        except RegistryError as exc:
-            raise HoldoutRunError(
-                f"final-holdout claim recorded but registry claim failed; ledger={claim_hash}"
-            ) from exc
-
-        try:
-            plaintext = decrypt_bytes(document, key)
-            metrics = _validated_metrics(self.evaluator.evaluate(plaintext))
-        except Exception as exc:
-            failure_hash = self.ledger.append(
+            claim_hash = self.ledger.append(
                 {
-                    "record_type": "FINAL_HOLDOUT_RUN_FAILED",
+                    "record_type": "FINAL_HOLDOUT_CLAIM",
+                    "hypothesis_id": hypothesis_id,
+                    "hypothesis_family_id": family_id,
+                    "envelope_hash": envelope_hash,
+                    "evaluator_id": self.evaluator.evaluator_id,
+                    "evaluator_hash": self.evaluator_hash,
+                }
+            )
+            try:
+                self.registry.transition(hypothesis_id, HypothesisState.HOLDOUT_CONSUMED)
+            except RegistryError as exc:
+                raise HoldoutRunError(
+                    f"final-holdout claim recorded but registry claim failed; ledger={claim_hash}"
+                ) from exc
+
+            try:
+                plaintext = decrypt_bytes(document, key)
+                metrics = _validated_metrics(self.evaluator.evaluate(plaintext))
+            except Exception as exc:
+                failure_hash = self.ledger.append(
+                    {
+                        "record_type": "FINAL_HOLDOUT_RUN_FAILED",
+                        "hypothesis_id": hypothesis_id,
+                        "hypothesis_family_id": family_id,
+                        "envelope_hash": envelope_hash,
+                        "evaluator_id": self.evaluator.evaluator_id,
+                        "evaluator_hash": self.evaluator_hash,
+                        "claim_record_hash": claim_hash,
+                        "error_type": type(exc).__name__,
+                        "holdout_consumed": True,
+                    }
+                )
+                raise HoldoutRunError(
+                    f"final holdout failed after one-shot consumption; ledger={failure_hash}"
+                ) from exc
+
+            ledger_hash = self.ledger.append(
+                {
+                    "record_type": "FINAL_HOLDOUT_RESULT",
                     "hypothesis_id": hypothesis_id,
                     "hypothesis_family_id": family_id,
                     "envelope_hash": envelope_hash,
                     "evaluator_id": self.evaluator.evaluator_id,
                     "evaluator_hash": self.evaluator_hash,
                     "claim_record_hash": claim_hash,
-                    "error_type": type(exc).__name__,
+                    "aggregate_metrics": metrics,
                     "holdout_consumed": True,
                 }
             )
-            raise HoldoutRunError(
-                f"final holdout failed after one-shot consumption; ledger={failure_hash}"
-            ) from exc
-
-        ledger_hash = self.ledger.append(
-            {
-                "record_type": "FINAL_HOLDOUT_RESULT",
-                "hypothesis_id": hypothesis_id,
-                "hypothesis_family_id": family_id,
-                "envelope_hash": envelope_hash,
-                "evaluator_id": self.evaluator.evaluator_id,
-                "evaluator_hash": self.evaluator_hash,
-                "claim_record_hash": claim_hash,
-                "aggregate_metrics": metrics,
-                "holdout_consumed": True,
-            }
-        )
-        return HoldoutRunReceipt(
-            hypothesis_id=hypothesis_id,
-            hypothesis_family_id=family_id,
-            envelope_hash=envelope_hash,
-            evaluator_id=self.evaluator.evaluator_id,
-            evaluator_hash=self.evaluator_hash,
-            aggregate_metrics=metrics,
-            claim_record_hash=claim_hash,
-            ledger_record_hash=ledger_hash,
-        )
+            return HoldoutRunReceipt(
+                hypothesis_id=hypothesis_id,
+                hypothesis_family_id=family_id,
+                envelope_hash=envelope_hash,
+                evaluator_id=self.evaluator.evaluator_id,
+                evaluator_hash=self.evaluator_hash,
+                aggregate_metrics=metrics,
+                claim_record_hash=claim_hash,
+                ledger_record_hash=ledger_hash,
+            )
