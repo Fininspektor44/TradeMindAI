@@ -21,7 +21,7 @@ def _frozen_case(tmp_path, *, leak_dataset_path_in_parameters: bool = False):
     }
     parameters = {"window": 20}
     if leak_dataset_path_in_parameters:
-        parameters["note"] = str(dataset)
+        parameters["note"] = f"source={dataset}"
     manifest = ExperimentManifest.new(
         hypothesis_id="H-BRIDGE",
         family_definition=family_definition,
