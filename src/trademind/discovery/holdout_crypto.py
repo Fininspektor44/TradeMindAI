@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
 class HoldoutCryptoError(RuntimeError):
@@ -23,6 +25,7 @@ _SCHEMA_VERSION = "trademind-final-holdout-v1"
 _CIPHER = "AES-256-GCM"
 _NONCE_BYTES = 12
 _KEY_BYTES = 32
+_KEY_CHECK_INFO = b"TRADEMIND_FINAL_HOLDOUT_KEY_CHECK_HKDF_V1"
 _KEY_CHECK_DOMAIN = b"TRADEMIND_FINAL_HOLDOUT_KEY_CHECK_V1\x00"
 
 
@@ -54,6 +57,16 @@ def _validate_key(key: bytes) -> bytes:
     if not isinstance(key, bytes) or len(key) != _KEY_BYTES:
         raise ValueError("holdout encryption key must be exactly 32 bytes")
     return key
+
+
+def _derive_key_check_key(key: bytes) -> bytes:
+    """Derive a domain-separated HMAC key from the AES master key."""
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=_KEY_BYTES,
+        salt=None,
+        info=_KEY_CHECK_INFO,
+    ).derive(_validate_key(key))
 
 
 def _b64encode(value: bytes) -> str:
@@ -92,7 +105,8 @@ def _key_check(
     ciphertext_b64: str,
 ) -> str:
     payload = _key_check_payload(header, nonce_b64, ciphertext_b64)
-    return hmac.new(key, _KEY_CHECK_DOMAIN + _canonical(payload), hashlib.sha256).hexdigest()
+    mac_key = _derive_key_check_key(key)
+    return hmac.new(mac_key, _KEY_CHECK_DOMAIN + _canonical(payload), hashlib.sha256).hexdigest()
 
 
 def seal_bytes(
