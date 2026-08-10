@@ -1,10 +1,10 @@
 """Protective bridge from frozen Discovery hypotheses into Orchestrator tasks.
 
 The bridge is deliberately narrow: it may submit work for a hypothesis only after
-its manifest is frozen and externally anchored in the hypothesis registry. Raw
-dataset paths are used locally for deterministic integrity verification but are
-never exposed in the task envelope or research brief, because a source artifact
-may contain final-holdout rows.
+its manifest is frozen and externally anchored, and after the final holdout has a
+persisted plaintext-isolation attestation. Raw dataset paths are used locally for
+deterministic integrity verification but are never exposed in the task envelope or
+research brief.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from trademind.orchestrator.artifact_store import ArtifactStore
 from trademind.orchestrator.control_plane import ControlPlane
 from trademind.orchestrator.models import RiskClass, Task
 
+from .holdout_store import HoldoutSealStore
 from .hypothesis_registry import HypothesisRegistry, HypothesisState
 from .manifest import ManifestIntegrityError, verify_frozen_manifest
 
@@ -31,6 +32,7 @@ class DiscoveryTaskBinding:
     hypothesis_id: str
     hypothesis_family_id: str
     manifest_hash: str
+    holdout_isolation_receipt_hash: str
     orchestrator_task_id: str
 
 
@@ -47,10 +49,12 @@ class DiscoveryOrchestratorBridge:
         self,
         *,
         registry: HypothesisRegistry,
+        holdout_seals: HoldoutSealStore,
         control: ControlPlane,
         artifacts: ArtifactStore,
     ) -> None:
         self.registry = registry
+        self.holdout_seals = holdout_seals
         self.control = control
         self.artifacts = artifacts
 
@@ -82,6 +86,21 @@ class DiscoveryOrchestratorBridge:
             )
 
         try:
+            holdout = self.holdout_seals.get(hypothesis_id)
+        except KeyError as exc:
+            raise DiscoveryBridgeError(
+                "frozen hypothesis has no registered protected final holdout"
+            ) from exc
+        if not holdout.isolated or holdout.isolation_receipt_hash is None:
+            raise DiscoveryBridgeError(
+                "final holdout plaintext isolation must be attested before orchestration"
+            )
+        if holdout.hypothesis_family_id != record.hypothesis_family_id:
+            raise DiscoveryBridgeError("protected holdout family does not match hypothesis")
+        if holdout.manifest_hash != record.manifest_hash:
+            raise DiscoveryBridgeError("protected holdout manifest does not match hypothesis")
+
+        try:
             document = verify_frozen_manifest(
                 manifest_path,
                 expected_manifest_hash=record.manifest_hash,
@@ -102,6 +121,7 @@ class DiscoveryOrchestratorBridge:
             hypothesis_id=record.hypothesis_id,
             hypothesis_family_id=record.hypothesis_family_id,
             manifest_hash=record.manifest_hash,
+            holdout_isolation_receipt_hash=holdout.isolation_receipt_hash,
             orchestrator_task_id=self._task_id(record.hypothesis_id),
         )
         return ValidatedFrozenHypothesis(binding=binding, manifest_payload=dict(payload))
@@ -115,6 +135,7 @@ class DiscoveryOrchestratorBridge:
             "hypothesis_family_id": validated.binding.hypothesis_family_id,
             "content_hash": payload["content_hash"],
             "manifest_hash": validated.binding.manifest_hash,
+            "holdout_isolation_receipt_hash": validated.binding.holdout_isolation_receipt_hash,
             "family_definition": payload["family_definition"],
             "parameters": payload["parameters"],
             "test_family": payload["test_family"],
@@ -184,11 +205,7 @@ class DiscoveryOrchestratorBridge:
         budget_limit: float = 0.0,
         priority: int = 0,
     ) -> Task:
-        """Create exactly one Orchestrator task for a verified frozen hypothesis.
-
-        A zero budget is intentional and safe by default. Enabling paid AI calls
-        requires the caller to opt in by passing a positive task budget.
-        """
+        """Create exactly one Orchestrator task for a verified frozen hypothesis."""
         if budget_limit < 0:
             raise ValueError("budget_limit must not be negative")
 
@@ -223,6 +240,7 @@ class DiscoveryOrchestratorBridge:
             acceptance_criteria=(
                 f"manifest_sha256={binding.manifest_hash}",
                 f"hypothesis_family_id={binding.hypothesis_family_id}",
+                f"holdout_isolation_sha256={binding.holdout_isolation_receipt_hash}",
                 "research brief contains no raw manifest or dataset paths",
                 "frozen manifest and dataset hashes remain valid",
                 "no final-holdout rows are exposed to Orchestrator agents or consumed by lifecycle",

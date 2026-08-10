@@ -12,6 +12,7 @@ authors = [
   { name = "TradeMind AI" }
 ]
 dependencies = [
+  "cryptography>=42",
   "websockets==16.1.1"
 ]
 
