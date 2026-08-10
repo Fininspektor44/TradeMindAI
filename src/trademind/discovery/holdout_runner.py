@@ -7,14 +7,21 @@ holdout was sealed. Research agents never receive plaintext rows or the key.
 
 from __future__ import annotations
 
+import builtins
 import inspect
+import io
 import json
+import logging
 import math
 import os
 import re
+import socket
+import subprocess
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
+from unittest.mock import patch
 
 from .data_layer import sha256_file
 from .holdout_crypto import HoldoutCryptoError, decrypt_bytes, verify_envelope, verify_key
@@ -73,6 +80,65 @@ def _validated_metrics(
             continue
         raise HoldoutRunError("holdout evaluator may return only scalar numeric/bool metrics")
     return cleaned
+
+
+def _blocked_evaluator_side_effect(*args, **kwargs):
+    del args, kwargs
+    raise HoldoutRunError("final-holdout evaluator attempted a forbidden side effect")
+
+
+def _evaluate_with_side_effect_guard(
+    evaluator: HoldoutEvaluator,
+    plaintext: bytes,
+) -> Mapping[str, int | float | bool | None]:
+    """Block routine stdout/file/process/network side effects during evaluation.
+
+    This is a defense against accidental leakage by trusted evaluator code, not a
+    security sandbox for hostile Python. Production deployment still requires a
+    separately constrained runner process/account/container.
+    """
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(redirect_stdout(captured_stdout))
+            stack.enter_context(redirect_stderr(captured_stderr))
+            for target in (
+                "builtins.open",
+                "io.open",
+                "os.open",
+                "os.system",
+                "socket.socket",
+                "socket.create_connection",
+                "subprocess.Popen",
+                "subprocess.run",
+                "subprocess.call",
+                "subprocess.check_call",
+                "subprocess.check_output",
+            ):
+                stack.enter_context(patch(target, _blocked_evaluator_side_effect))
+            for method_name in (
+                "open",
+                "write_text",
+                "write_bytes",
+                "touch",
+                "mkdir",
+                "unlink",
+                "rename",
+                "replace",
+            ):
+                stack.enter_context(
+                    patch.object(Path, method_name, _blocked_evaluator_side_effect)
+                )
+            result = evaluator.evaluate(plaintext)
+    finally:
+        logging.disable(previous_logging_disable)
+
+    if captured_stdout.getvalue() or captured_stderr.getvalue():
+        raise HoldoutRunError("final-holdout evaluator attempted stdout/stderr output")
+    return result
 
 
 class _RunLock:
@@ -342,7 +408,9 @@ class FinalHoldoutRunner:
 
             try:
                 plaintext = decrypt_bytes(document, key)
-                metrics = _validated_metrics(self.evaluator.evaluate(plaintext))
+                metrics = _validated_metrics(
+                    _evaluate_with_side_effect_guard(self.evaluator, plaintext)
+                )
             except Exception as exc:
                 failure_hash = self.ledger.append(
                     {
