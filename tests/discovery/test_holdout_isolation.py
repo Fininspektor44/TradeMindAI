@@ -32,6 +32,7 @@ OTHER_KEY = bytes(reversed(range(32)))
 MANIFEST_HASH = hashlib.sha256(b"manifest-v1").hexdigest()
 EVALUATOR_ARTIFACT = Path(__file__).resolve()
 EVALUATOR_HASH = hashlib.sha256(EVALUATOR_ARTIFACT.read_bytes()).hexdigest()
+PLAINTEXT_TEXT = "time,return\n1,0.1\n2,-0.2\n"
 
 
 class StaticKeys:
@@ -79,18 +80,23 @@ def _sealed_case(tmp_path):
     seals = HoldoutSealStore(registry)
     keys = StaticKeys()
     sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=keys)
-    plaintext = tmp_path / "final.csv"
-    plaintext.write_text("time,return\n1,0.1\n2,-0.2\n", encoding="utf-8")
-    sealed = tmp_path / "protected" / "final.holdout.json"
-    receipt = sealer.seal_file(
+    research_root = tmp_path / "research"
+    research_root.mkdir()
+    plaintext = research_root / "final.csv"
+    plaintext.write_text(PLAINTEXT_TEXT, encoding="utf-8")
+    sealed = research_root / "protected" / "final.holdout.json"
+    quarantine = tmp_path / "quarantine"
+    receipt = sealer.seal_and_quarantine(
         hypothesis_id="H-FINAL",
         plaintext_path=plaintext,
         destination_path=sealed,
+        research_root=research_root,
+        quarantine_directory=quarantine,
         key_id="holdout-key-v1",
         evaluator_id="aggregate-v1",
         evaluator_hash=EVALUATOR_HASH,
     )
-    return registry, seals, keys, plaintext, sealed, receipt
+    return registry, seals, keys, plaintext, sealed, quarantine, receipt
 
 
 def _validation_passed(registry):
@@ -167,12 +173,18 @@ def test_orchestrator_policy_forbids_protected_holdout_read():
     assert result.decision is PolicyDecision.FORBIDDEN
 
 
-def test_sealer_encrypts_and_registers_without_embedding_plaintext_path(tmp_path):
-    registry, seals, _, plaintext, sealed, receipt = _sealed_case(tmp_path)
+def test_sealer_encrypts_quarantines_and_attests_without_path_leak(tmp_path):
+    registry, seals, _, plaintext, sealed, quarantine, receipt = _sealed_case(tmp_path)
 
     document_text = sealed.read_text(encoding="utf-8")
-    assert plaintext.read_text(encoding="utf-8") not in document_text
+    assert PLAINTEXT_TEXT not in document_text
     assert str(plaintext) not in document_text
+    assert not plaintext.exists()
+    quarantined = list(quarantine.glob("*.holdout-source"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == PLAINTEXT_TEXT
+    assert receipt.isolated is True
+    assert receipt.isolation_receipt_hash is not None
     assert receipt.hypothesis_family_id == registry.get("H-FINAL").hypothesis_family_id
     assert receipt.manifest_hash == MANIFEST_HASH
     assert receipt.evaluator_id == "aggregate-v1"
@@ -180,16 +192,42 @@ def test_sealer_encrypts_and_registers_without_embedding_plaintext_path(tmp_path
     stored = seals.get("H-FINAL")
     assert stored.envelope_hash == receipt.envelope_hash
     assert stored.key_id == "holdout-key-v1"
+    assert stored.isolated is True
+
+
+def test_quarantine_must_be_disjoint_from_research_root(tmp_path):
+    registry = _frozen_registry(tmp_path)
+    seals = HoldoutSealStore(registry)
+    sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=StaticKeys())
+    research_root = tmp_path / "research"
+    research_root.mkdir()
+    plaintext = research_root / "final.csv"
+    plaintext.write_text(PLAINTEXT_TEXT, encoding="utf-8")
+
+    with pytest.raises(HoldoutSealerError, match="disjoint"):
+        sealer.seal_and_quarantine(
+            hypothesis_id="H-FINAL",
+            plaintext_path=plaintext,
+            destination_path=research_root / "protected.json",
+            research_root=research_root,
+            quarantine_directory=research_root / "quarantine",
+            key_id="holdout-key-v1",
+            evaluator_id="aggregate-v1",
+            evaluator_hash=EVALUATOR_HASH,
+        )
+    assert plaintext.exists()
 
 
 def test_sealer_refuses_duplicate_or_post_freeze_redefinition(tmp_path):
-    registry, seals, keys, plaintext, _, _ = _sealed_case(tmp_path)
+    registry, seals, keys, _, _, _, _ = _sealed_case(tmp_path)
     sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=keys)
+    duplicate_plaintext = tmp_path / "duplicate-source.csv"
+    duplicate_plaintext.write_text(PLAINTEXT_TEXT, encoding="utf-8")
 
     with pytest.raises(HoldoutSealError):
         sealer.seal_file(
             hypothesis_id="H-FINAL",
-            plaintext_path=plaintext,
+            plaintext_path=duplicate_plaintext,
             destination_path=tmp_path / "duplicate.json",
             key_id="holdout-key-v1",
             evaluator_id="aggregate-v2",
@@ -198,10 +236,12 @@ def test_sealer_refuses_duplicate_or_post_freeze_redefinition(tmp_path):
     assert not (tmp_path / "duplicate.json").exists()
 
     registry.transition("H-FINAL", HypothesisState.TRAIN_TESTED)
+    late_plaintext = tmp_path / "late-source.csv"
+    late_plaintext.write_text(PLAINTEXT_TEXT, encoding="utf-8")
     with pytest.raises(HoldoutSealerError):
         sealer.seal_file(
             hypothesis_id="H-FINAL",
-            plaintext_path=plaintext,
+            plaintext_path=late_plaintext,
             destination_path=tmp_path / "late.json",
             key_id="holdout-key-v1",
             evaluator_id="aggregate-v1",
@@ -209,8 +249,38 @@ def test_sealer_refuses_duplicate_or_post_freeze_redefinition(tmp_path):
         )
 
 
+def test_low_level_seal_without_quarantine_cannot_run(tmp_path):
+    registry = _frozen_registry(tmp_path)
+    seals = HoldoutSealStore(registry)
+    keys = StaticKeys()
+    sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=keys)
+    plaintext = tmp_path / "final.csv"
+    plaintext.write_text(PLAINTEXT_TEXT, encoding="utf-8")
+    sealed = tmp_path / "final.holdout.json"
+    sealer.seal_file(
+        hypothesis_id="H-FINAL",
+        plaintext_path=plaintext,
+        destination_path=sealed,
+        key_id="holdout-key-v1",
+        evaluator_id="aggregate-v1",
+        evaluator_hash=EVALUATOR_HASH,
+    )
+    _validation_passed(registry)
+    runner = _runner(
+        registry,
+        seals,
+        keys,
+        ResultLedger(tmp_path / "results.jsonl"),
+        CountingEvaluator(),
+    )
+
+    with pytest.raises(HoldoutRunError, match="isolation attestation"):
+        runner.run_once(hypothesis_id="H-FINAL", sealed_path=sealed)
+    assert registry.get("H-FINAL").state is HypothesisState.VALIDATION_PASSED
+
+
 def test_runner_success_consumes_once_and_emits_only_aggregate_metrics(tmp_path):
-    registry, seals, keys, _, sealed, receipt = _sealed_case(tmp_path)
+    registry, seals, keys, _, sealed, _, receipt = _sealed_case(tmp_path)
     _validation_passed(registry)
     ledger = ResultLedger(tmp_path / "results.jsonl")
     runner = _runner(registry, seals, keys, ledger, CountingEvaluator())
@@ -233,7 +303,7 @@ def test_runner_success_consumes_once_and_emits_only_aggregate_metrics(tmp_path)
 
 
 def test_wrong_key_or_evaluator_fails_preflight_without_consuming_holdout(tmp_path):
-    registry, seals, _, _, sealed, _ = _sealed_case(tmp_path)
+    registry, seals, _, _, sealed, _, _ = _sealed_case(tmp_path)
     _validation_passed(registry)
     ledger = ResultLedger(tmp_path / "results.jsonl")
 
@@ -264,7 +334,7 @@ def test_wrong_key_or_evaluator_fails_preflight_without_consuming_holdout(tmp_pa
 
 
 def test_evaluator_source_hash_is_computed_not_trusted_from_object(tmp_path):
-    registry, seals, keys, _, _, _ = _sealed_case(tmp_path)
+    registry, seals, keys, _, _, _, _ = _sealed_case(tmp_path)
     ledger = ResultLedger(tmp_path / "results.jsonl")
     fake_artifact = tmp_path / "fake_evaluator.py"
     fake_artifact.write_text("# not the evaluator source\n", encoding="utf-8")
@@ -281,7 +351,7 @@ def test_evaluator_source_hash_is_computed_not_trusted_from_object(tmp_path):
 
 
 def test_evaluator_failure_burns_one_shot_and_is_recorded_without_error_text(tmp_path):
-    registry, seals, keys, _, sealed, receipt = _sealed_case(tmp_path)
+    registry, seals, keys, _, sealed, _, receipt = _sealed_case(tmp_path)
     _validation_passed(registry)
     ledger_path = tmp_path / "results.jsonl"
     ledger = ResultLedger(ledger_path)
@@ -299,7 +369,7 @@ def test_evaluator_failure_burns_one_shot_and_is_recorded_without_error_text(tmp
 
 
 def test_non_scalar_evaluator_output_is_blocked_after_one_shot_claim(tmp_path):
-    registry, seals, keys, _, sealed, _ = _sealed_case(tmp_path)
+    registry, seals, keys, _, sealed, _, _ = _sealed_case(tmp_path)
     _validation_passed(registry)
     ledger = ResultLedger(tmp_path / "results.jsonl")
     runner = _runner(registry, seals, keys, ledger, LeakingEvaluator())
@@ -310,7 +380,7 @@ def test_non_scalar_evaluator_output_is_blocked_after_one_shot_claim(tmp_path):
 
 
 def test_ledger_claim_blocks_rerun_even_after_adversarial_sqlite_reset(tmp_path):
-    registry, seals, keys, _, sealed, receipt = _sealed_case(tmp_path)
+    registry, seals, keys, _, sealed, _, receipt = _sealed_case(tmp_path)
     _validation_passed(registry)
     ledger = ResultLedger(tmp_path / "results.jsonl")
     runner = _runner(registry, seals, keys, ledger, CountingEvaluator())
@@ -330,3 +400,16 @@ def test_ledger_claim_blocks_rerun_even_after_adversarial_sqlite_reset(tmp_path)
     assert registry.family_status(receipt.hypothesis_family_id)["holdout_consumed"] is False
     with pytest.raises(HoldoutRunError, match="ledger already contains"):
         runner.run_once(hypothesis_id="H-FINAL", sealed_path=sealed)
+
+
+def test_existing_runner_lock_blocks_concurrent_run_without_consuming(tmp_path):
+    registry, seals, keys, _, sealed, _, _ = _sealed_case(tmp_path)
+    _validation_passed(registry)
+    ledger = ResultLedger(tmp_path / "results.jsonl")
+    runner = _runner(registry, seals, keys, ledger, CountingEvaluator())
+    lock_path = ledger.path.with_suffix(ledger.path.suffix + ".holdout-run.lock")
+    lock_path.write_text("stale-or-active\n", encoding="utf-8")
+
+    with pytest.raises(HoldoutRunError, match="runner lock already exists"):
+        runner.run_once(hypothesis_id="H-FINAL", sealed_path=sealed)
+    assert registry.get("H-FINAL").state is HypothesisState.VALIDATION_PASSED
