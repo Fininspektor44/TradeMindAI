@@ -21,7 +21,11 @@ from trademind.discovery.holdout_keys import (
 from trademind.discovery.holdout_runner import FinalHoldoutRunner, HoldoutRunError
 from trademind.discovery.holdout_sealer import FinalHoldoutSealer, HoldoutSealerError
 from trademind.discovery.holdout_store import HoldoutSealError, HoldoutSealStore
-from trademind.discovery.hypothesis_registry import HypothesisRegistry, HypothesisState
+from trademind.discovery.hypothesis_registry import (
+    HypothesisRegistry,
+    HypothesisState,
+    RegistryError,
+)
 from trademind.discovery.result_ledger import ResultLedger
 from trademind.orchestrator.models import PolicyDecision
 from trademind.orchestrator.policy import classify_action
@@ -249,11 +253,10 @@ def test_sealer_refuses_duplicate_or_post_freeze_redefinition(tmp_path):
         )
 
 
-def test_low_level_seal_without_quarantine_cannot_run(tmp_path):
+def test_low_level_seal_without_quarantine_blocks_registry_progress(tmp_path):
     registry = _frozen_registry(tmp_path)
     seals = HoldoutSealStore(registry)
-    keys = StaticKeys()
-    sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=keys)
+    sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=StaticKeys())
     plaintext = tmp_path / "final.csv"
     plaintext.write_text(PLAINTEXT_TEXT, encoding="utf-8")
     sealed = tmp_path / "final.holdout.json"
@@ -265,18 +268,11 @@ def test_low_level_seal_without_quarantine_cannot_run(tmp_path):
         evaluator_id="aggregate-v1",
         evaluator_hash=EVALUATOR_HASH,
     )
-    _validation_passed(registry)
-    runner = _runner(
-        registry,
-        seals,
-        keys,
-        ResultLedger(tmp_path / "results.jsonl"),
-        CountingEvaluator(),
-    )
 
-    with pytest.raises(HoldoutRunError, match="isolation attestation"):
-        runner.run_once(hypothesis_id="H-FINAL", sealed_path=sealed)
-    assert registry.get("H-FINAL").state is HypothesisState.VALIDATION_PASSED
+    with pytest.raises(RegistryError, match="isolation"):
+        registry.transition("H-FINAL", HypothesisState.TRAIN_TESTED)
+    assert registry.get("H-FINAL").state is HypothesisState.FROZEN
+    assert plaintext.exists()
 
 
 def test_runner_success_consumes_once_and_emits_only_aggregate_metrics(tmp_path):
