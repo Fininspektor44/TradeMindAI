@@ -14,6 +14,16 @@ class HoldoutSealError(RuntimeError):
     """Raised when a final-holdout seal cannot be registered safely."""
 
 
+def _utc_iso(value: str, label: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{label} must be timezone-aware")
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
 @dataclass(frozen=True, slots=True)
 class HoldoutSealRecord:
     hypothesis_id: str
@@ -26,10 +36,26 @@ class HoldoutSealRecord:
     created_at: str
     isolated_at: str | None
     isolation_receipt_hash: str | None
+    public_max_time: str | None
+    holdout_start_time: str | None
+    holdout_end_time: str | None
+    public_row_count: int | None
+    holdout_row_count: int | None
 
     @property
     def isolated(self) -> bool:
-        return self.isolated_at is not None and self.isolation_receipt_hash is not None
+        return all(
+            value is not None
+            for value in (
+                self.isolated_at,
+                self.isolation_receipt_hash,
+                self.public_max_time,
+                self.holdout_start_time,
+                self.holdout_end_time,
+                self.public_row_count,
+                self.holdout_row_count,
+            )
+        )
 
 
 class HoldoutSealStore:
@@ -61,6 +87,11 @@ class HoldoutSealStore:
                     created_at TEXT NOT NULL,
                     isolated_at TEXT,
                     isolation_receipt_hash TEXT,
+                    public_max_time TEXT,
+                    holdout_start_time TEXT,
+                    holdout_end_time TEXT,
+                    public_row_count INTEGER,
+                    holdout_row_count INTEGER,
                     FOREIGN KEY(hypothesis_id) REFERENCES hypotheses(hypothesis_id),
                     FOREIGN KEY(family_id) REFERENCES hypothesis_families(family_id)
                 )
@@ -81,6 +112,11 @@ class HoldoutSealStore:
                 "created_at",
                 "isolated_at",
                 "isolation_receipt_hash",
+                "public_max_time",
+                "holdout_start_time",
+                "holdout_end_time",
+                "public_row_count",
+                "holdout_row_count",
             }
             if not required.issubset(columns):
                 raise HoldoutSealError(
@@ -151,8 +187,9 @@ class HoldoutSealStore:
                     INSERT INTO final_holdout_seals(
                         hypothesis_id, family_id, manifest_hash, envelope_hash, key_id,
                         evaluator_id, evaluator_hash, created_at, isolated_at,
-                        isolation_receipt_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                        isolation_receipt_hash, public_max_time, holdout_start_time,
+                        holdout_end_time, public_row_count, holdout_row_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
                     """,
                     (
                         hypothesis_id,
@@ -176,9 +213,24 @@ class HoldoutSealStore:
         hypothesis_id: str,
         *,
         isolation_receipt_hash: str,
+        public_max_time: str,
+        holdout_start_time: str,
+        holdout_end_time: str,
+        public_row_count: int,
+        holdout_row_count: int,
     ) -> HoldoutSealRecord:
         hypothesis_id = self._nonempty(hypothesis_id, "hypothesis_id")
         receipt_hash = self._sha256(isolation_receipt_hash, "isolation_receipt_hash")
+        public_max = _utc_iso(public_max_time, "public_max_time")
+        holdout_start = _utc_iso(holdout_start_time, "holdout_start_time")
+        holdout_end = _utc_iso(holdout_end_time, "holdout_end_time")
+        if datetime.fromisoformat(public_max) >= datetime.fromisoformat(holdout_start):
+            raise HoldoutSealError("public data must end before final holdout begins")
+        if datetime.fromisoformat(holdout_start) > datetime.fromisoformat(holdout_end):
+            raise HoldoutSealError("holdout_start_time must not be after holdout_end_time")
+        if public_row_count < 1 or holdout_row_count < 1:
+            raise HoldoutSealError("isolation attestation row counts must be positive")
+
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -202,10 +254,21 @@ class HoldoutSealStore:
             cursor = db.execute(
                 """
                 UPDATE final_holdout_seals
-                SET isolated_at=?, isolation_receipt_hash=?
+                SET isolated_at=?, isolation_receipt_hash=?, public_max_time=?,
+                    holdout_start_time=?, holdout_end_time=?, public_row_count=?,
+                    holdout_row_count=?
                 WHERE hypothesis_id=? AND isolated_at IS NULL AND isolation_receipt_hash IS NULL
                 """,
-                (now, receipt_hash, hypothesis_id),
+                (
+                    now,
+                    receipt_hash,
+                    public_max,
+                    holdout_start,
+                    holdout_end,
+                    int(public_row_count),
+                    int(holdout_row_count),
+                    hypothesis_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise HoldoutSealError("final holdout isolation attestation changed concurrently")
@@ -224,6 +287,15 @@ class HoldoutSealStore:
             created_at=row["created_at"],
             isolated_at=row["isolated_at"],
             isolation_receipt_hash=row["isolation_receipt_hash"],
+            public_max_time=row["public_max_time"],
+            holdout_start_time=row["holdout_start_time"],
+            holdout_end_time=row["holdout_end_time"],
+            public_row_count=(
+                int(row["public_row_count"]) if row["public_row_count"] is not None else None
+            ),
+            holdout_row_count=(
+                int(row["holdout_row_count"]) if row["holdout_row_count"] is not None else None
+            ),
         )
 
     def get(self, hypothesis_id: str) -> HoldoutSealRecord:
