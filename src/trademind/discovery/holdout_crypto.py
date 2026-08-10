@@ -73,8 +73,26 @@ def _body_hash(body: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical(body)).hexdigest()
 
 
-def _key_check(key: bytes, header: dict[str, Any]) -> str:
-    return hmac.new(key, _KEY_CHECK_DOMAIN + _canonical(header), hashlib.sha256).hexdigest()
+def _key_check_payload(
+    header: dict[str, Any],
+    nonce_b64: str,
+    ciphertext_b64: str,
+) -> dict[str, Any]:
+    return {
+        "header": header,
+        "nonce_b64": nonce_b64,
+        "ciphertext_b64": ciphertext_b64,
+    }
+
+
+def _key_check(
+    key: bytes,
+    header: dict[str, Any],
+    nonce_b64: str,
+    ciphertext_b64: str,
+) -> str:
+    payload = _key_check_payload(header, nonce_b64, ciphertext_b64)
+    return hmac.new(key, _KEY_CHECK_DOMAIN + _canonical(payload), hashlib.sha256).hexdigest()
 
 
 def seal_bytes(
@@ -111,17 +129,19 @@ def seal_bytes(
     }
     nonce = os.urandom(_NONCE_BYTES)
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, _canonical(header))
+    nonce_b64 = _b64encode(nonce)
+    ciphertext_b64 = _b64encode(ciphertext)
     body = {
         "header": header,
-        "nonce_b64": _b64encode(nonce),
-        "ciphertext_b64": _b64encode(ciphertext),
-        "key_check": _key_check(key, header),
+        "nonce_b64": nonce_b64,
+        "ciphertext_b64": ciphertext_b64,
+        "key_check": _key_check(key, header, nonce_b64, ciphertext_b64),
     }
     return {**body, "envelope_hash": _body_hash(body)}
 
 
 def verify_envelope(document: dict[str, Any]) -> dict[str, Any]:
-    """Validate envelope structure and unkeyed integrity before secret access."""
+    """Validate envelope structure and unkeyed artifact identity before secret access."""
     if not isinstance(document, dict):
         raise HoldoutCryptoError("holdout envelope must be a JSON object")
     header = document.get("header")
@@ -176,13 +196,18 @@ def verify_envelope(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def verify_key(document: dict[str, Any], key: bytes) -> None:
-    """Verify the injected key against authenticated public metadata only."""
+    """Authenticate the complete encrypted artifact before one-shot consumption."""
     verify_envelope(document)
     key = _validate_key(key)
     header = document["header"]
-    expected = _key_check(key, header)
+    expected = _key_check(
+        key,
+        header,
+        str(document["nonce_b64"]),
+        str(document["ciphertext_b64"]),
+    )
     if not hmac.compare_digest(str(document["key_check"]), expected):
-        raise HoldoutCryptoError("holdout key does not match sealed artifact")
+        raise HoldoutCryptoError("holdout key or encrypted artifact does not match frozen seal")
 
 
 def decrypt_bytes(document: dict[str, Any], key: bytes) -> bytes:
