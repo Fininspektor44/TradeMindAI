@@ -20,7 +20,7 @@ from .data_layer import sha256_file
 from .holdout_crypto import HoldoutCryptoError, decrypt_bytes, verify_envelope, verify_key
 from .holdout_keys import HoldoutKeyProvider
 from .holdout_store import HoldoutSealStore
-from .hypothesis_registry import HypothesisRegistry, HypothesisState, RegistryError
+from .hypothesis_registry import HypothesisRegistry, HypothesisState
 from .result_ledger import ResultLedger
 
 
@@ -221,6 +221,26 @@ class FinalHoldoutRunner:
             raise HoldoutRunError("external holdout key does not match frozen seal") from exc
         return key, record.hypothesis_family_id, seal.envelope_hash
 
+    def _append_claim(
+        self,
+        *,
+        hypothesis_id: str,
+        family_id: str,
+        envelope_hash: str,
+        intent_hash: str,
+    ) -> str:
+        return self.ledger.append(
+            {
+                "record_type": "FINAL_HOLDOUT_CLAIM",
+                "hypothesis_id": hypothesis_id,
+                "hypothesis_family_id": family_id,
+                "envelope_hash": envelope_hash,
+                "evaluator_id": self.evaluator.evaluator_id,
+                "evaluator_hash": self.evaluator_hash,
+                "intent_record_hash": intent_hash,
+            }
+        )
+
     def run_once(
         self,
         *,
@@ -229,19 +249,22 @@ class FinalHoldoutRunner:
     ) -> HoldoutRunReceipt:
         """Claim one family entitlement, decrypt in memory, and emit aggregates only.
 
-        Key/evaluator/envelope preflight occurs before consumption so deployment
-        mistakes can be corrected without burning the holdout. A tamper-evident
-        ledger claim is appended first, then the irreversible HOLDOUT_CONSUMED
-        state is committed, and only then may plaintext be decrypted. Any failure
-        after the ledger claim is terminal for this family and cannot be retried.
+        Key/evaluator/envelope preflight occurs before any durable claim. The runner
+        first writes a non-consuming intent record, then commits HOLDOUT_CONSUMED in
+        SQLite, then writes the independent FINAL_HOLDOUT_CLAIM ledger anchor. Only
+        after both durable consumption anchors exist may plaintext be decrypted.
+
+        A transient registry failure before HOLDOUT_CONSUMED leaves only an intent
+        record and is retryable after infrastructure recovery. Any failure after
+        registry consumption remains fail-closed and never decrypts plaintext.
         """
         with _RunLock(self.ledger.path):
             document = self._load_envelope(sealed_path)
             key, family_id, envelope_hash = self._preflight(hypothesis_id, document)
 
-            claim_hash = self.ledger.append(
+            intent_hash = self.ledger.append(
                 {
-                    "record_type": "FINAL_HOLDOUT_CLAIM",
+                    "record_type": "FINAL_HOLDOUT_INTENT",
                     "hypothesis_id": hypothesis_id,
                     "hypothesis_family_id": family_id,
                     "envelope_hash": envelope_hash,
@@ -249,11 +272,72 @@ class FinalHoldoutRunner:
                     "evaluator_hash": self.evaluator_hash,
                 }
             )
+
             try:
                 self.registry.transition(hypothesis_id, HypothesisState.HOLDOUT_CONSUMED)
-            except RegistryError as exc:
+            except Exception as exc:
+                try:
+                    state_after = self.registry.get(hypothesis_id).state
+                except Exception as state_exc:
+                    raise HoldoutRunError(
+                        "registry transition outcome is unknown after holdout intent; "
+                        "manual recovery is required and plaintext was not decrypted"
+                    ) from state_exc
+
+                if state_after is HypothesisState.HOLDOUT_CONSUMED:
+                    try:
+                        self._append_claim(
+                            hypothesis_id=hypothesis_id,
+                            family_id=family_id,
+                            envelope_hash=envelope_hash,
+                            intent_hash=intent_hash,
+                        )
+                    except Exception as claim_exc:
+                        raise HoldoutRunError(
+                            "registry consumed final holdout but independent ledger claim could "
+                            "not be recorded; family remains burned and plaintext was not decrypted"
+                        ) from claim_exc
+                    raise HoldoutRunError(
+                        "registry reported a transition failure after durable holdout consumption; "
+                        "family remains burned and plaintext was not decrypted"
+                    ) from exc
+
+                if state_after is not HypothesisState.VALIDATION_PASSED:
+                    raise HoldoutRunError(
+                        "registry state changed unexpectedly after holdout intent; "
+                        "manual recovery is required and plaintext was not decrypted"
+                    ) from exc
+
+                try:
+                    self.ledger.append(
+                        {
+                            "record_type": "FINAL_HOLDOUT_INTENT_ABORTED",
+                            "hypothesis_id": hypothesis_id,
+                            "hypothesis_family_id": family_id,
+                            "envelope_hash": envelope_hash,
+                            "intent_record_hash": intent_hash,
+                            "error_type": type(exc).__name__,
+                            "holdout_consumed": False,
+                        }
+                    )
+                except Exception:
+                    pass
                 raise HoldoutRunError(
-                    f"final-holdout claim recorded but registry claim failed; ledger={claim_hash}"
+                    "registry claim failed before holdout consumption; retry is allowed after "
+                    "infrastructure recovery and plaintext was not decrypted"
+                ) from exc
+
+            try:
+                claim_hash = self._append_claim(
+                    hypothesis_id=hypothesis_id,
+                    family_id=family_id,
+                    envelope_hash=envelope_hash,
+                    intent_hash=intent_hash,
+                )
+            except Exception as exc:
+                raise HoldoutRunError(
+                    "registry holdout consumption committed but independent ledger claim failed; "
+                    "family remains burned and plaintext was not decrypted"
                 ) from exc
 
             try:
