@@ -20,7 +20,7 @@ agent access, repeated holdout probing, and ordinary research-process access.
    - an externally injected AES-256 key;
    - a key id;
    - the frozen evaluator id;
-   - a SHA-256 evaluator/spec hash.
+   - a SHA-256 hash of the evaluator source/spec artifact.
 3. The sealer writes an AES-256-GCM envelope. The envelope contains no plaintext
    file path and no key material.
 4. `HoldoutSealStore` binds exactly one envelope hash, key id, evaluator id/hash,
@@ -30,15 +30,23 @@ agent access, repeated holdout probing, and ordinary research-process access.
    Library code intentionally does not auto-delete source evidence.
 6. Discovery/train/validation work proceeds without final-holdout plaintext.
 7. Only after state `VALIDATION_PASSED` may the isolated runner begin preflight.
-8. Preflight validates the envelope, registered seal, evaluator identity/hash and
-   external key without decrypting final-holdout plaintext.
-9. The runner irreversibly transitions the hypothesis family to
-   `HOLDOUT_CONSUMED` **before** plaintext decryption.
-10. The trusted evaluator runs in the runner process. Only up to 64 scalar numeric,
+8. Preflight validates the envelope, registered seal, the actual evaluator source
+   file hash, the external key, and the absence of any prior family claim without
+   decrypting final-holdout plaintext.
+9. The runner appends `FINAL_HOLDOUT_CLAIM` to the tamper-evident result ledger.
+   This is an independent one-shot anchor in addition to SQLite state.
+10. The runner then irreversibly transitions the hypothesis family to
+    `HOLDOUT_CONSUMED` **before** plaintext decryption.
+11. The trusted evaluator runs in the runner process. Only up to 64 scalar numeric,
     boolean or null aggregate metrics may leave the runner through this API.
-11. Success or post-consumption failure is appended to the tamper-evident
-    Discovery result ledger. A failure after consumption is not retryable for the
-    same hypothesis family.
+12. Success or post-claim failure is appended to the tamper-evident Discovery
+    result ledger. A failure after the ledger claim is not retryable for the same
+    hypothesis family.
+
+The ledger claim deliberately makes the system fail closed. If the claim is
+written and the subsequent SQLite transition or evaluation crashes, the family is
+still considered burned. This is safer than permitting a second peek at the same
+final holdout.
 
 ## Cryptographic envelope
 
@@ -50,10 +58,22 @@ agent access, repeated holdout probing, and ordinary research-process access.
 - a keyed HMAC over public header metadata permits key/evaluator deployment
   preflight before the one-shot claim;
 - ciphertext authentication still occurs only during AES-GCM decryption, after
-  the family entitlement has been consumed.
+  the family entitlement has been claimed.
 
 The unkeyed `envelope_hash` is an immutable artifact identity, not a substitute for
 AES-GCM authentication.
+
+## Dual one-shot boundary
+
+Two independent records block ordinary repeat evaluation:
+
+- `HypothesisRegistry` moves the family to `HOLDOUT_CONSUMED`;
+- `ResultLedger` contains a tamper-evident `FINAL_HOLDOUT_CLAIM` for the family.
+
+The runner checks both. A casual/manual SQLite reset therefore does not create a
+fresh holdout entitlement while the ledger remains intact. An administrator who
+can rewrite both the database and ledger files remains outside this local threat
+model.
 
 ## Key boundary
 
@@ -68,12 +88,23 @@ external secret-manager adapter without changing the runner contract.
 ## Evaluator boundary
 
 The evaluator is frozen before train/validation by `evaluator_id` plus a SHA-256
-`evaluator_hash`. The runner rejects any evaluator that does not match the sealed
-record before consuming the holdout.
+`evaluator_hash`. The isolated runner does not trust a hash declared by the
+evaluator object. It hashes the actual source file defining the evaluator class and
+requires that file to be the configured frozen evaluator artifact.
+
+This binds the evaluator's defining source file, but it does not recursively hash
+all imported dependencies. A later production evaluator package/spec manifest
+should bind the complete dependency set before final-holdout use.
 
 The evaluator itself is trusted code. Python type contracts cannot sandbox a
 malicious evaluator. Process/account/container isolation is therefore an
 operational requirement when this moves beyond local research infrastructure.
+
+## Orchestrator boundary
+
+`READ_PROTECTED_FINAL_HOLDOUT` remains a forbidden Orchestrator action. This slice
+adds no ToolRunner template, agent tool, broker adapter, or model pathway that can
+invoke the protected runner or obtain its external key.
 
 ## Deliberately excluded from v0
 
