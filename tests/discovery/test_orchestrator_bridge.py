@@ -16,6 +16,9 @@ from trademind.orchestrator.models import Role, TaskState
 BRIDGE_ENVELOPE_HASH = hashlib.sha256(b"bridge-envelope").hexdigest()
 BRIDGE_EVALUATOR_HASH = hashlib.sha256(b"bridge-evaluator").hexdigest()
 BRIDGE_ISOLATION_HASH = hashlib.sha256(b"bridge-isolation").hexdigest()
+BRIDGE_PUBLIC_MAX_TIME = "2026-01-02T00:00:00+00:00"
+BRIDGE_HOLDOUT_START_TIME = "2026-01-03T00:00:00+00:00"
+BRIDGE_HOLDOUT_END_TIME = "2026-01-04T00:00:00+00:00"
 
 
 def _frozen_case(
@@ -70,6 +73,11 @@ def _frozen_case(
         holdout_seals.mark_isolated(
             manifest.hypothesis_id,
             isolation_receipt_hash=BRIDGE_ISOLATION_HASH,
+            public_max_time=BRIDGE_PUBLIC_MAX_TIME,
+            holdout_start_time=BRIDGE_HOLDOUT_START_TIME,
+            holdout_end_time=BRIDGE_HOLDOUT_END_TIME,
+            public_row_count=2,
+            holdout_row_count=2,
         )
 
     control = ControlPlane(tmp_path / "orchestrator.db")
