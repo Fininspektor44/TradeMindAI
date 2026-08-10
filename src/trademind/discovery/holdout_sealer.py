@@ -1,20 +1,22 @@
 """Trusted staging sealer for final-holdout plaintext.
 
-The sealer is the only component in this slice that needs plaintext-file access.
-It writes an authenticated encrypted envelope and registers that exact envelope
-against the already-frozen hypothesis manifest. It never deletes the plaintext
-automatically; removal from the research environment is an explicit operational
-step so source evidence cannot be destroyed by library code.
+The low-level seal operation encrypts and registers one final-holdout artifact.
+The production-safe path is ``seal_and_quarantine``: after sealing, it moves the
+plaintext out of the declared research root and records a path-free isolation
+attestation before research may proceed through the protected bridge.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .data_layer import sha256_file
 from .holdout_crypto import seal_bytes, verify_envelope
 from .holdout_keys import HoldoutKeyProvider
 from .holdout_store import HoldoutSealStore
@@ -36,6 +38,8 @@ class HoldoutSealReceipt:
     evaluator_hash: str
     plaintext_sha256: str
     plaintext_size: int
+    isolated: bool = False
+    isolation_receipt_hash: str | None = None
 
 
 class FinalHoldoutSealer:
@@ -91,6 +95,7 @@ class FinalHoldoutSealer:
         evaluator_id: str,
         evaluator_hash: str,
     ) -> HoldoutSealReceipt:
+        """Low-level seal operation. It does not attest plaintext isolation."""
         source = Path(plaintext_path).expanduser().resolve()
         destination = Path(destination_path).expanduser().resolve()
         if not source.is_file():
@@ -150,4 +155,93 @@ class FinalHoldoutSealer:
             evaluator_hash=stored.evaluator_hash,
             plaintext_sha256=str(header["plaintext_sha256"]),
             plaintext_size=int(header["plaintext_size"]),
+        )
+
+    def seal_and_quarantine(
+        self,
+        *,
+        hypothesis_id: str,
+        plaintext_path: str | Path,
+        destination_path: str | Path,
+        research_root: str | Path,
+        quarantine_directory: str | Path,
+        key_id: str,
+        evaluator_id: str,
+        evaluator_hash: str,
+    ) -> HoldoutSealReceipt:
+        """Seal and move plaintext outside the research root before attesting isolation."""
+        source = Path(plaintext_path).expanduser().resolve()
+        root = Path(research_root).expanduser().resolve()
+        quarantine = Path(quarantine_directory).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        if not root.is_dir():
+            raise FileNotFoundError(root)
+        if not source.is_relative_to(root):
+            raise HoldoutSealerError("final holdout plaintext must begin inside research_root")
+        if quarantine.is_relative_to(root) or root.is_relative_to(quarantine):
+            raise HoldoutSealerError("quarantine_directory must be disjoint from research_root")
+
+        source_hash = sha256_file(source)
+        quarantine.mkdir(parents=True, exist_ok=True)
+        quarantine_target = quarantine / f"{source_hash}.holdout-source"
+        if quarantine_target.exists():
+            raise HoldoutSealerError("quarantine target already exists")
+
+        receipt = self.seal_file(
+            hypothesis_id=hypothesis_id,
+            plaintext_path=source,
+            destination_path=destination_path,
+            key_id=key_id,
+            evaluator_id=evaluator_id,
+            evaluator_hash=evaluator_hash,
+        )
+
+        try:
+            shutil.move(str(source), str(quarantine_target))
+            if source.exists() or not quarantine_target.is_file():
+                raise HoldoutSealerError("plaintext quarantine move did not complete")
+            if sha256_file(quarantine_target) != receipt.plaintext_sha256:
+                raise HoldoutSealerError("quarantined plaintext hash mismatch")
+            try:
+                os.chmod(quarantine_target, 0o600)
+            except OSError:
+                pass
+
+            attestation = {
+                "schema_version": "final-holdout-isolation-attestation-v1",
+                "hypothesis_id": receipt.hypothesis_id,
+                "hypothesis_family_id": receipt.hypothesis_family_id,
+                "manifest_hash": receipt.manifest_hash,
+                "envelope_hash": receipt.envelope_hash,
+                "evaluator_id": receipt.evaluator_id,
+                "evaluator_hash": receipt.evaluator_hash,
+                "plaintext_sha256": receipt.plaintext_sha256,
+                "plaintext_size": receipt.plaintext_size,
+                "source_absent_from_research_root": True,
+            }
+            encoded = json.dumps(
+                attestation,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            isolation_hash = hashlib.sha256(encoded).hexdigest()
+            stored = self.seals.mark_isolated(
+                hypothesis_id,
+                isolation_receipt_hash=isolation_hash,
+            )
+            if not stored.isolated:
+                raise HoldoutSealerError("final holdout isolation attestation was not persisted")
+        except Exception as exc:
+            raise HoldoutSealerError(
+                "final holdout was sealed but plaintext isolation did not complete; "
+                "do not advance hypothesis state"
+            ) from exc
+
+        return replace(
+            receipt,
+            isolated=True,
+            isolation_receipt_hash=isolation_hash,
         )
