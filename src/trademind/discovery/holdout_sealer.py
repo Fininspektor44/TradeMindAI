@@ -94,7 +94,7 @@ class FinalHoldoutSealer:
         try:
             with path.open("r", encoding="utf-8", newline="") as handle:
                 reader = csv.DictReader(handle)
-                if "time" not in (reader.fieldnames or ()): 
+                if "time" not in (reader.fieldnames or ()):
                     raise HoldoutSealerError(f"{label} must contain a time column")
                 values: list[datetime] = []
                 for row in reader:
@@ -105,9 +105,9 @@ class FinalHoldoutSealer:
                     if value.tzinfo is None or value.utcoffset() is None:
                         raise HoldoutSealerError(f"{label} time values must be timezone-aware")
                     values.append(value.astimezone(timezone.utc))
+        except HoldoutSealerError:
+            raise
         except (OSError, UnicodeDecodeError, csv.Error, ValueError) as exc:
-            if isinstance(exc, HoldoutSealerError):
-                raise
             raise HoldoutSealerError(f"cannot parse {label} time boundary safely") from exc
         if not values:
             raise HoldoutSealerError(f"{label} must contain at least one data row")
@@ -161,6 +161,13 @@ class FinalHoldoutSealer:
             "holdout_row_count": len(holdout_times),
         }
 
+    @staticmethod
+    def _evaluator_hash(path: str | Path) -> str:
+        artifact = Path(path).expanduser().resolve()
+        if not artifact.is_file():
+            raise FileNotFoundError(artifact)
+        return sha256_file(artifact)
+
     def seal_file(
         self,
         *,
@@ -169,7 +176,7 @@ class FinalHoldoutSealer:
         destination_path: str | Path,
         key_id: str,
         evaluator_id: str,
-        evaluator_hash: str,
+        evaluator_artifact_path: str | Path,
     ) -> HoldoutSealReceipt:
         """Low-level seal operation. It does not attest plaintext isolation."""
         source = Path(plaintext_path).expanduser().resolve()
@@ -193,6 +200,7 @@ class FinalHoldoutSealer:
         plaintext = source.read_bytes()
         if not plaintext:
             raise HoldoutSealerError("final holdout plaintext is empty")
+        evaluator_hash = self._evaluator_hash(evaluator_artifact_path)
         key = self.keys.load_key(key_id)
         document = seal_bytes(
             plaintext,
@@ -244,7 +252,7 @@ class FinalHoldoutSealer:
         quarantine_directory: str | Path,
         key_id: str,
         evaluator_id: str,
-        evaluator_hash: str,
+        evaluator_artifact_path: str | Path,
     ) -> HoldoutSealReceipt:
         """Verify public-only manifest data, seal, quarantine, and attest isolation."""
         source = Path(plaintext_path).expanduser().resolve()
@@ -280,7 +288,7 @@ class FinalHoldoutSealer:
             destination_path=destination_path,
             key_id=key_id,
             evaluator_id=evaluator_id,
-            evaluator_hash=evaluator_hash,
+            evaluator_artifact_path=evaluator_artifact_path,
         )
 
         try:
