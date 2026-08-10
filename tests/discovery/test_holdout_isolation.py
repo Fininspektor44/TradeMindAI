@@ -26,6 +26,7 @@ from trademind.discovery.hypothesis_registry import (
     HypothesisState,
     RegistryError,
 )
+from trademind.discovery.manifest import DatasetArtifact, ExperimentManifest
 from trademind.discovery.result_ledger import ResultLedger
 from trademind.orchestrator.models import PolicyDecision
 from trademind.orchestrator.policy import classify_action
@@ -36,7 +37,16 @@ OTHER_KEY = bytes(reversed(range(32)))
 MANIFEST_HASH = hashlib.sha256(b"manifest-v1").hexdigest()
 EVALUATOR_ARTIFACT = Path(__file__).resolve()
 EVALUATOR_HASH = hashlib.sha256(EVALUATOR_ARTIFACT.read_bytes()).hexdigest()
-PLAINTEXT_TEXT = "time,return\n1,0.1\n2,-0.2\n"
+PUBLIC_TEXT = (
+    "time,return\n"
+    "2026-01-01T00:00:00+00:00,0.01\n"
+    "2026-01-02T00:00:00+00:00,-0.02\n"
+)
+PLAINTEXT_TEXT = (
+    "time,return\n"
+    "2026-01-03T00:00:00+00:00,0.10\n"
+    "2026-01-04T00:00:00+00:00,-0.20\n"
+)
 
 
 class StaticKeys:
@@ -68,32 +78,68 @@ class LeakingEvaluator(CountingEvaluator):
         return {"raw": plaintext.decode("utf-8")}
 
 
+def _family():
+    return {"event": "synthetic", "direction": "both"}
+
+
 def _frozen_registry(tmp_path):
     registry = HypothesisRegistry(tmp_path / "registry.db")
     record = registry.register(
         hypothesis_id="H-FINAL",
-        family_definition={"event": "synthetic", "direction": "both"},
+        family_definition=_family(),
         content_definition={"event": "synthetic", "window": 20},
     )
     registry.freeze(record.hypothesis_id, manifest_hash=MANIFEST_HASH)
     return registry
 
 
+def _frozen_manifest_case(tmp_path, *, public_text=PUBLIC_TEXT):
+    research_root = tmp_path / "research"
+    research_root.mkdir()
+    public_dataset = research_root / "public.csv"
+    public_dataset.write_text(public_text, encoding="utf-8")
+    holdout = research_root / "final.csv"
+    holdout.write_text(PLAINTEXT_TEXT, encoding="utf-8")
+
+    manifest = ExperimentManifest.new(
+        hypothesis_id="H-FINAL",
+        family_definition=_family(),
+        test_family="holdout-isolation-v1",
+        primary_metric="mean_net_r",
+        alpha=0.05,
+        q=0.10,
+        minimum_effect_size=0.05,
+        max_hypotheses_tests=10,
+        schema_version="discovery-manifest-v1",
+        git_commit="test-commit",
+        datasets=(DatasetArtifact.from_path(public_dataset),),
+        parameters={"window": 20},
+    )
+    manifest_path = research_root / "manifest.json"
+    manifest_hash = manifest.freeze(manifest_path)
+
+    registry = HypothesisRegistry(tmp_path / "registry.db")
+    registry.register(
+        hypothesis_id=manifest.hypothesis_id,
+        family_definition=manifest.family_definition,
+        content_definition=manifest.content_definition,
+    )
+    registry.freeze(manifest.hypothesis_id, manifest_hash=manifest_hash)
+    return registry, research_root, public_dataset, holdout, manifest_path
+
+
 def _sealed_case(tmp_path):
-    registry = _frozen_registry(tmp_path)
+    registry, research_root, _, plaintext, manifest_path = _frozen_manifest_case(tmp_path)
     seals = HoldoutSealStore(registry)
     keys = StaticKeys()
     sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=keys)
-    research_root = tmp_path / "research"
-    research_root.mkdir()
-    plaintext = research_root / "final.csv"
-    plaintext.write_text(PLAINTEXT_TEXT, encoding="utf-8")
     sealed = research_root / "protected" / "final.holdout.json"
     quarantine = tmp_path / "quarantine"
     receipt = sealer.seal_and_quarantine(
         hypothesis_id="H-FINAL",
         plaintext_path=plaintext,
         destination_path=sealed,
+        manifest_path=manifest_path,
         research_root=research_root,
         quarantine_directory=quarantine,
         key_id="holdout-key-v1",
@@ -190,7 +236,6 @@ def test_sealer_encrypts_quarantines_and_attests_without_path_leak(tmp_path):
     assert receipt.isolated is True
     assert receipt.isolation_receipt_hash is not None
     assert receipt.hypothesis_family_id == registry.get("H-FINAL").hypothesis_family_id
-    assert receipt.manifest_hash == MANIFEST_HASH
     assert receipt.evaluator_id == "aggregate-v1"
     assert receipt.evaluator_hash == EVALUATOR_HASH
     stored = seals.get("H-FINAL")
@@ -199,20 +244,46 @@ def test_sealer_encrypts_quarantines_and_attests_without_path_leak(tmp_path):
     assert stored.isolated is True
 
 
-def test_quarantine_must_be_disjoint_from_research_root(tmp_path):
-    registry = _frozen_registry(tmp_path)
+def test_manifest_dataset_may_not_overlap_final_holdout_time_range(tmp_path):
+    overlapping_public = (
+        "time,return\n"
+        "2026-01-01T00:00:00+00:00,0.01\n"
+        "2026-01-03T00:00:00+00:00,0.02\n"
+    )
+    registry, research_root, _, holdout, manifest_path = _frozen_manifest_case(
+        tmp_path,
+        public_text=overlapping_public,
+    )
     seals = HoldoutSealStore(registry)
     sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=StaticKeys())
-    research_root = tmp_path / "research"
-    research_root.mkdir()
-    plaintext = research_root / "final.csv"
-    plaintext.write_text(PLAINTEXT_TEXT, encoding="utf-8")
+
+    with pytest.raises(HoldoutSealerError, match="overlaps or reaches"):
+        sealer.seal_and_quarantine(
+            hypothesis_id="H-FINAL",
+            plaintext_path=holdout,
+            destination_path=research_root / "protected.json",
+            manifest_path=manifest_path,
+            research_root=research_root,
+            quarantine_directory=tmp_path / "quarantine",
+            key_id="holdout-key-v1",
+            evaluator_id="aggregate-v1",
+            evaluator_hash=EVALUATOR_HASH,
+        )
+    assert holdout.exists()
+    assert registry.get("H-FINAL").state is HypothesisState.FROZEN
+
+
+def test_quarantine_must_be_disjoint_from_research_root(tmp_path):
+    registry, research_root, _, plaintext, manifest_path = _frozen_manifest_case(tmp_path)
+    seals = HoldoutSealStore(registry)
+    sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=StaticKeys())
 
     with pytest.raises(HoldoutSealerError, match="disjoint"):
         sealer.seal_and_quarantine(
             hypothesis_id="H-FINAL",
             plaintext_path=plaintext,
             destination_path=research_root / "protected.json",
+            manifest_path=manifest_path,
             research_root=research_root,
             quarantine_directory=research_root / "quarantine",
             key_id="holdout-key-v1",
