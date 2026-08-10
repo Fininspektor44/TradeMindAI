@@ -1,19 +1,22 @@
 """Trusted staging sealer for final-holdout plaintext.
 
 The low-level seal operation encrypts and registers one final-holdout artifact.
-The production-safe path is ``seal_and_quarantine``: after sealing, it moves the
-plaintext out of the declared research root and records a path-free isolation
-attestation before research may proceed through the protected bridge.
+The production-safe path is ``seal_and_quarantine``: it verifies that every frozen
+manifest dataset ends before the final holdout begins, seals the holdout, moves its
+plaintext out of the declared research root, and records a path-free isolation
+attestation before research may proceed.
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
 import shutil
 import tempfile
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .data_layer import sha256_file
@@ -21,6 +24,7 @@ from .holdout_crypto import seal_bytes, verify_envelope
 from .holdout_keys import HoldoutKeyProvider
 from .holdout_store import HoldoutSealStore
 from .hypothesis_registry import HypothesisRegistry, HypothesisState
+from .manifest import ManifestIntegrityError, verify_frozen_manifest
 
 
 class HoldoutSealerError(RuntimeError):
@@ -84,6 +88,78 @@ class FinalHoldoutSealer:
         finally:
             if temporary.exists():
                 temporary.unlink()
+
+    @staticmethod
+    def _csv_times(path: Path, *, label: str) -> tuple[datetime, ...]:
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if "time" not in (reader.fieldnames or ()): 
+                    raise HoldoutSealerError(f"{label} must contain a time column")
+                values: list[datetime] = []
+                for row in reader:
+                    raw = (row.get("time") or "").strip()
+                    if not raw:
+                        raise HoldoutSealerError(f"{label} contains an empty time value")
+                    value = datetime.fromisoformat(raw)
+                    if value.tzinfo is None or value.utcoffset() is None:
+                        raise HoldoutSealerError(f"{label} time values must be timezone-aware")
+                    values.append(value.astimezone(timezone.utc))
+        except (OSError, UnicodeDecodeError, csv.Error, ValueError) as exc:
+            if isinstance(exc, HoldoutSealerError):
+                raise
+            raise HoldoutSealerError(f"cannot parse {label} time boundary safely") from exc
+        if not values:
+            raise HoldoutSealerError(f"{label} must contain at least one data row")
+        if values != sorted(values):
+            raise HoldoutSealerError(f"{label} time values must be non-decreasing")
+        return tuple(values)
+
+    def _verify_public_manifest_boundary(
+        self,
+        *,
+        manifest_path: str | Path,
+        expected_manifest_hash: str,
+        holdout_path: Path,
+    ) -> dict[str, object]:
+        try:
+            document = verify_frozen_manifest(
+                manifest_path,
+                expected_manifest_hash=expected_manifest_hash,
+                verify_datasets=True,
+            )
+        except (ManifestIntegrityError, OSError, ValueError) as exc:
+            raise HoldoutSealerError("frozen manifest verification failed before holdout seal") from exc
+
+        datasets = document["manifest"].get("datasets")
+        if not isinstance(datasets, list) or not datasets:
+            raise HoldoutSealerError("frozen manifest has no public datasets")
+        holdout_times = self._csv_times(holdout_path, label="final holdout")
+        holdout_start = min(holdout_times)
+        holdout_end = max(holdout_times)
+
+        public_times: list[datetime] = []
+        for raw in datasets:
+            if not isinstance(raw, dict) or not raw.get("file_path"):
+                raise HoldoutSealerError("frozen manifest contains an invalid dataset artifact")
+            public_times.extend(
+                self._csv_times(Path(str(raw["file_path"])), label="frozen public dataset")
+            )
+        if not public_times:
+            raise HoldoutSealerError("frozen public datasets contain no rows")
+        public_max = max(public_times)
+        if public_max >= holdout_start:
+            raise HoldoutSealerError(
+                "frozen manifest dataset overlaps or reaches into final-holdout time range"
+            )
+
+        return {
+            "public_max_time": public_max.isoformat(),
+            "holdout_start_time": holdout_start.isoformat(),
+            "holdout_end_time": holdout_end.isoformat(),
+            "public_row_count": len(public_times),
+            "holdout_row_count": len(holdout_times),
+        }
 
     def seal_file(
         self,
@@ -163,13 +239,14 @@ class FinalHoldoutSealer:
         hypothesis_id: str,
         plaintext_path: str | Path,
         destination_path: str | Path,
+        manifest_path: str | Path,
         research_root: str | Path,
         quarantine_directory: str | Path,
         key_id: str,
         evaluator_id: str,
         evaluator_hash: str,
     ) -> HoldoutSealReceipt:
-        """Seal and move plaintext outside the research root before attesting isolation."""
+        """Verify public-only manifest data, seal, quarantine, and attest isolation."""
         source = Path(plaintext_path).expanduser().resolve()
         root = Path(research_root).expanduser().resolve()
         quarantine = Path(quarantine_directory).expanduser().resolve()
@@ -181,6 +258,15 @@ class FinalHoldoutSealer:
             raise HoldoutSealerError("final holdout plaintext must begin inside research_root")
         if quarantine.is_relative_to(root) or root.is_relative_to(quarantine):
             raise HoldoutSealerError("quarantine_directory must be disjoint from research_root")
+
+        record = self.registry.get(hypothesis_id)
+        if record.state is not HypothesisState.FROZEN or record.manifest_hash is None:
+            raise HoldoutSealerError("hypothesis must be FROZEN with manifest_hash before isolation")
+        boundary = self._verify_public_manifest_boundary(
+            manifest_path=manifest_path,
+            expected_manifest_hash=record.manifest_hash,
+            holdout_path=source,
+        )
 
         source_hash = sha256_file(source)
         quarantine.mkdir(parents=True, exist_ok=True)
@@ -219,6 +305,7 @@ class FinalHoldoutSealer:
                 "plaintext_sha256": receipt.plaintext_sha256,
                 "plaintext_size": receipt.plaintext_size,
                 "source_absent_from_research_root": True,
+                **boundary,
             }
             encoded = json.dumps(
                 attestation,
