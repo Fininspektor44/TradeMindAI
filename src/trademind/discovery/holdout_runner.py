@@ -7,6 +7,7 @@ holdout was sealed. Research agents never receive plaintext rows or the key.
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import re
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Protocol
 
+from .data_layer import sha256_file
 from .holdout_crypto import HoldoutCryptoError, decrypt_bytes, verify_envelope, verify_key
 from .holdout_keys import HoldoutKeyProvider
 from .holdout_store import HoldoutSealStore
@@ -31,9 +33,6 @@ class HoldoutEvaluator(Protocol):
     @property
     def evaluator_id(self) -> str: ...
 
-    @property
-    def evaluator_hash(self) -> str: ...
-
     def evaluate(self, plaintext: bytes) -> Mapping[str, int | float | bool | None]: ...
 
 
@@ -45,17 +44,11 @@ class HoldoutRunReceipt:
     evaluator_id: str
     evaluator_hash: str
     aggregate_metrics: dict[str, int | float | bool | None]
+    claim_record_hash: str
     ledger_record_hash: str
 
 
 _METRIC_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-
-
-def _sha256(value: str, label: str) -> str:
-    cleaned = value.strip().lower()
-    if len(cleaned) != 64 or any(char not in "0123456789abcdef" for char in cleaned):
-        raise HoldoutRunError(f"{label} must be a SHA-256 hex digest")
-    return cleaned
 
 
 def _validated_metrics(
@@ -90,15 +83,25 @@ class FinalHoldoutRunner:
         keys: HoldoutKeyProvider,
         ledger: ResultLedger,
         evaluator: HoldoutEvaluator,
+        evaluator_artifact_path: str | Path,
     ) -> None:
         if not evaluator.evaluator_id.strip():
             raise ValueError("evaluator_id must not be empty")
-        _sha256(evaluator.evaluator_hash, "evaluator_hash")
+        artifact = Path(evaluator_artifact_path).expanduser().resolve()
+        if not artifact.is_file():
+            raise FileNotFoundError(artifact)
+        source_file = inspect.getsourcefile(type(evaluator))
+        if source_file is None or Path(source_file).resolve() != artifact:
+            raise HoldoutRunError(
+                "evaluator artifact must be the actual source file defining evaluator class"
+            )
         self.registry = registry
         self.seals = seals
         self.keys = keys
         self.ledger = ledger
         self.evaluator = evaluator
+        self.evaluator_artifact_path = artifact
+        self.evaluator_hash = sha256_file(artifact)
 
     @staticmethod
     def _load_envelope(path: str | Path) -> dict:
@@ -110,6 +113,27 @@ class FinalHoldoutRunner:
         if not isinstance(document, dict):
             raise HoldoutRunError("protected final-holdout envelope is not a JSON object")
         return document
+
+    def _ledger_has_claim(self, family_id: str) -> bool:
+        if not self.ledger.verify():
+            raise HoldoutRunError("result ledger integrity failed before final-holdout claim")
+        try:
+            with self.ledger.path.open("r", encoding="utf-8") as handle:
+                for raw in handle:
+                    if not raw.strip():
+                        continue
+                    record = json.loads(raw)
+                    payload = record.get("payload") if isinstance(record, dict) else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if (
+                        payload.get("record_type") == "FINAL_HOLDOUT_CLAIM"
+                        and payload.get("hypothesis_family_id") == family_id
+                    ):
+                        return True
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HoldoutRunError("cannot inspect result ledger for holdout claim") from exc
+        return False
 
     def _preflight(self, hypothesis_id: str, document: dict) -> tuple[bytes, str, str]:
         record = self.registry.get(hypothesis_id)
@@ -124,6 +148,8 @@ class FinalHoldoutRunner:
             raise HoldoutRunError("final holdout already consumed for this hypothesis family")
         if family["terminal_state"]:
             raise HoldoutRunError("hypothesis family is already terminal")
+        if self._ledger_has_claim(record.hypothesis_family_id):
+            raise HoldoutRunError("result ledger already contains final-holdout claim for family")
 
         seal = self.seals.get(hypothesis_id)
         if seal.hypothesis_family_id != record.hypothesis_family_id:
@@ -132,9 +158,8 @@ class FinalHoldoutRunner:
             raise HoldoutRunError("sealed holdout manifest does not match hypothesis registry")
         if seal.evaluator_id != self.evaluator.evaluator_id:
             raise HoldoutRunError("configured evaluator_id does not match frozen holdout seal")
-        evaluator_hash = _sha256(self.evaluator.evaluator_hash, "evaluator_hash")
-        if seal.evaluator_hash != evaluator_hash:
-            raise HoldoutRunError("configured evaluator_hash does not match frozen holdout seal")
+        if seal.evaluator_hash != self.evaluator_hash:
+            raise HoldoutRunError("computed evaluator source hash does not match frozen holdout seal")
 
         try:
             verify_envelope(document)
@@ -167,20 +192,33 @@ class FinalHoldoutRunner:
         hypothesis_id: str,
         sealed_path: str | Path,
     ) -> HoldoutRunReceipt:
-        """Consume one family entitlement, decrypt in memory, and emit aggregates only.
+        """Claim one family entitlement, decrypt in memory, and emit aggregates only.
 
         Key/evaluator/envelope preflight occurs before consumption so deployment
-        mistakes can be corrected without burning the holdout. The irreversible
-        HOLDOUT_CONSUMED transition occurs before plaintext decryption. Any failure
-        after that point is terminal for this family and cannot be retried.
+        mistakes can be corrected without burning the holdout. A tamper-evident
+        ledger claim is appended first, then the irreversible HOLDOUT_CONSUMED
+        state is committed, and only then may plaintext be decrypted. Any failure
+        after the ledger claim is terminal for this family and cannot be retried.
         """
         document = self._load_envelope(sealed_path)
         key, family_id, envelope_hash = self._preflight(hypothesis_id, document)
 
+        claim_hash = self.ledger.append(
+            {
+                "record_type": "FINAL_HOLDOUT_CLAIM",
+                "hypothesis_id": hypothesis_id,
+                "hypothesis_family_id": family_id,
+                "envelope_hash": envelope_hash,
+                "evaluator_id": self.evaluator.evaluator_id,
+                "evaluator_hash": self.evaluator_hash,
+            }
+        )
         try:
             self.registry.transition(hypothesis_id, HypothesisState.HOLDOUT_CONSUMED)
         except RegistryError as exc:
-            raise HoldoutRunError("failed to claim one-shot final-holdout entitlement") from exc
+            raise HoldoutRunError(
+                f"final-holdout claim recorded but registry claim failed; ledger={claim_hash}"
+            ) from exc
 
         try:
             plaintext = decrypt_bytes(document, key)
@@ -193,7 +231,8 @@ class FinalHoldoutRunner:
                     "hypothesis_family_id": family_id,
                     "envelope_hash": envelope_hash,
                     "evaluator_id": self.evaluator.evaluator_id,
-                    "evaluator_hash": self.evaluator.evaluator_hash,
+                    "evaluator_hash": self.evaluator_hash,
+                    "claim_record_hash": claim_hash,
                     "error_type": type(exc).__name__,
                     "holdout_consumed": True,
                 }
@@ -209,7 +248,8 @@ class FinalHoldoutRunner:
                 "hypothesis_family_id": family_id,
                 "envelope_hash": envelope_hash,
                 "evaluator_id": self.evaluator.evaluator_id,
-                "evaluator_hash": self.evaluator.evaluator_hash,
+                "evaluator_hash": self.evaluator_hash,
+                "claim_record_hash": claim_hash,
                 "aggregate_metrics": metrics,
                 "holdout_consumed": True,
             }
@@ -219,7 +259,8 @@ class FinalHoldoutRunner:
             hypothesis_family_id=family_id,
             envelope_hash=envelope_hash,
             evaluator_id=self.evaluator.evaluator_id,
-            evaluator_hash=self.evaluator.evaluator_hash,
+            evaluator_hash=self.evaluator_hash,
             aggregate_metrics=metrics,
+            claim_record_hash=claim_hash,
             ledger_record_hash=ledger_hash,
         )
