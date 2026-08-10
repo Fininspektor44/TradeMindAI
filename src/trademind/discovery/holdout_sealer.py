@@ -32,6 +32,8 @@ class HoldoutSealReceipt:
     manifest_hash: str
     envelope_hash: str
     key_id: str
+    evaluator_id: str
+    evaluator_hash: str
     plaintext_sha256: str
     plaintext_size: int
 
@@ -86,6 +88,8 @@ class FinalHoldoutSealer:
         plaintext_path: str | Path,
         destination_path: str | Path,
         key_id: str,
+        evaluator_id: str,
+        evaluator_hash: str,
     ) -> HoldoutSealReceipt:
         source = Path(plaintext_path).expanduser().resolve()
         destination = Path(destination_path).expanduser().resolve()
@@ -115,6 +119,8 @@ class FinalHoldoutSealer:
             key_id=key_id,
             hypothesis_family_id=record.hypothesis_family_id,
             manifest_hash=record.manifest_hash,
+            evaluator_id=evaluator_id,
+            evaluator_hash=evaluator_hash,
         )
         verify_envelope(document)
         self._write_new_json(destination, document)
@@ -124,6 +130,8 @@ class FinalHoldoutSealer:
                 hypothesis_id=hypothesis_id,
                 envelope_hash=document["envelope_hash"],
                 key_id=key_id,
+                evaluator_id=evaluator_id,
+                evaluator_hash=evaluator_hash,
             )
         except Exception:
             try:
@@ -138,6 +146,8 @@ class FinalHoldoutSealer:
             manifest_hash=stored.manifest_hash,
             envelope_hash=stored.envelope_hash,
             key_id=stored.key_id,
+            evaluator_id=stored.evaluator_id,
+            evaluator_hash=stored.evaluator_hash,
             plaintext_sha256=str(header["plaintext_sha256"]),
             plaintext_size=int(header["plaintext_size"]),
         )
