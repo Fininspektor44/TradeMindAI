@@ -83,6 +83,12 @@ _TERMINAL_FAMILY_STATES = {
     HypothesisState.REJECTED_FINAL,
 }
 
+_HOLDOUT_GUARDED_TRANSITIONS = {
+    (HypothesisState.FROZEN, HypothesisState.TRAIN_TESTED),
+    (HypothesisState.TRAIN_TESTED, HypothesisState.VALIDATION_PASSED),
+    (HypothesisState.VALIDATION_PASSED, HypothesisState.HOLDOUT_CONSUMED),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class HypothesisRecord:
@@ -156,6 +162,35 @@ class HypothesisRegistry:
         if len(cleaned) != 64 or any(char not in "0123456789abcdef" for char in cleaned):
             raise ValueError(f"{label} must be a SHA-256 hex digest")
         return cleaned
+
+    @staticmethod
+    def _require_isolated_holdout(db: sqlite3.Connection, hypothesis_id: str) -> None:
+        table = db.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='final_holdout_seals'
+            """
+        ).fetchone()
+        if table is None:
+            raise RegistryError(
+                "protected final-holdout seal is required before research state may advance"
+            )
+        seal = db.execute(
+            """
+            SELECT isolated_at, isolation_receipt_hash
+            FROM final_holdout_seals
+            WHERE hypothesis_id=?
+            """,
+            (hypothesis_id,),
+        ).fetchone()
+        if (
+            seal is None
+            or seal["isolated_at"] is None
+            or seal["isolation_receipt_hash"] is None
+        ):
+            raise RegistryError(
+                "final-holdout plaintext isolation must be attested before research state advances"
+            )
 
     def register(
         self,
@@ -285,6 +320,9 @@ class HypothesisRegistry:
                     raise RegistryError("freezing requires manifest_hash")
             elif manifest_hash is not None and manifest_hash != row["manifest_hash"]:
                 raise RegistryError("manifest_hash is immutable after freeze")
+
+            if (current, target) in _HOLDOUT_GUARDED_TRANSITIONS:
+                self._require_isolated_holdout(db, hypothesis_id)
 
             family = db.execute(
                 "SELECT * FROM hypothesis_families WHERE family_id=?",
