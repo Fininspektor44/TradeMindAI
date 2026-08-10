@@ -10,9 +10,9 @@ may contain final-holdout rows.
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from trademind.orchestrator.artifact_store import ArtifactStore
 from trademind.orchestrator.control_plane import ControlPlane
@@ -127,6 +127,25 @@ class DiscoveryOrchestratorBridge:
             "git_commit": payload["git_commit"],
         }
 
+    @staticmethod
+    def _iter_strings(value: Any):
+        if isinstance(value, str):
+            yield value
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if isinstance(key, str):
+                    yield key
+                yield from DiscoveryOrchestratorBridge._iter_strings(nested)
+            return
+        if isinstance(value, (list, tuple)):
+            for nested in value:
+                yield from DiscoveryOrchestratorBridge._iter_strings(nested)
+
+    @staticmethod
+    def _normalize_path_text(value: str) -> str:
+        return value.replace("\\", "/").casefold()
+
     @classmethod
     def _assert_brief_has_no_raw_paths(
         cls,
@@ -135,12 +154,6 @@ class DiscoveryOrchestratorBridge:
         manifest_path: str | Path,
     ) -> dict:
         brief = cls._safe_research_brief(validated)
-        encoded = json.dumps(
-            brief,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
         forbidden = {str(Path(manifest_path)), str(Path(manifest_path).resolve())}
         datasets = validated.manifest_payload.get("datasets", [])
         if isinstance(datasets, list):
@@ -149,8 +162,18 @@ class DiscoveryOrchestratorBridge:
                     raw_path = str(raw["file_path"])
                     forbidden.add(raw_path)
                     forbidden.add(str(Path(raw_path).resolve()))
-        if any(path and path in encoded for path in forbidden):
-            raise DiscoveryBridgeError("research brief metadata contains a raw artifact path")
+
+        normalized_forbidden = {
+            cls._normalize_path_text(path)
+            for path in forbidden
+            if path
+        }
+        for text in cls._iter_strings(brief):
+            normalized_text = cls._normalize_path_text(text)
+            if any(path in normalized_text for path in normalized_forbidden):
+                raise DiscoveryBridgeError(
+                    "research brief metadata contains a raw artifact path"
+                )
         return brief
 
     def submit_frozen_hypothesis(
