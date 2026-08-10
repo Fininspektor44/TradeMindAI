@@ -21,6 +21,8 @@ class HoldoutSealRecord:
     manifest_hash: str
     envelope_hash: str
     key_id: str
+    evaluator_id: str
+    evaluator_hash: str
     created_at: str
 
 
@@ -48,12 +50,32 @@ class HoldoutSealStore:
                     manifest_hash TEXT NOT NULL,
                     envelope_hash TEXT NOT NULL UNIQUE,
                     key_id TEXT NOT NULL,
+                    evaluator_id TEXT NOT NULL,
+                    evaluator_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(hypothesis_id) REFERENCES hypotheses(hypothesis_id),
                     FOREIGN KEY(family_id) REFERENCES hypothesis_families(family_id)
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(final_holdout_seals)").fetchall()
+            }
+            required = {
+                "hypothesis_id",
+                "family_id",
+                "manifest_hash",
+                "envelope_hash",
+                "key_id",
+                "evaluator_id",
+                "evaluator_hash",
+                "created_at",
+            }
+            if not required.issubset(columns):
+                raise HoldoutSealError(
+                    "legacy final_holdout_seals schema detected; explicit migration is required"
+                )
 
     @staticmethod
     def _sha256(value: str, label: str) -> str:
@@ -75,10 +97,14 @@ class HoldoutSealStore:
         hypothesis_id: str,
         envelope_hash: str,
         key_id: str,
+        evaluator_id: str,
+        evaluator_hash: str,
     ) -> HoldoutSealRecord:
         hypothesis_id = self._nonempty(hypothesis_id, "hypothesis_id")
         envelope_hash = self._sha256(envelope_hash, "envelope_hash")
         key_id = self._nonempty(key_id, "key_id")
+        evaluator_id = self._nonempty(evaluator_id, "evaluator_id")
+        evaluator_hash = self._sha256(evaluator_hash, "evaluator_hash")
         now = datetime.now(timezone.utc).isoformat()
 
         with self._connect() as db:
@@ -113,8 +139,9 @@ class HoldoutSealStore:
                 db.execute(
                     """
                     INSERT INTO final_holdout_seals(
-                        hypothesis_id, family_id, manifest_hash, envelope_hash, key_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        hypothesis_id, family_id, manifest_hash, envelope_hash, key_id,
+                        evaluator_id, evaluator_hash, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         hypothesis_id,
@@ -122,6 +149,8 @@ class HoldoutSealStore:
                         manifest_hash,
                         envelope_hash,
                         key_id,
+                        evaluator_id,
+                        evaluator_hash,
                         now,
                     ),
                 )
@@ -139,6 +168,8 @@ class HoldoutSealStore:
             manifest_hash=row["manifest_hash"],
             envelope_hash=row["envelope_hash"],
             key_id=row["key_id"],
+            evaluator_id=row["evaluator_id"],
+            evaluator_hash=row["evaluator_hash"],
             created_at=row["created_at"],
         )
 
