@@ -24,6 +24,12 @@ class HoldoutSealRecord:
     evaluator_id: str
     evaluator_hash: str
     created_at: str
+    isolated_at: str | None
+    isolation_receipt_hash: str | None
+
+    @property
+    def isolated(self) -> bool:
+        return self.isolated_at is not None and self.isolation_receipt_hash is not None
 
 
 class HoldoutSealStore:
@@ -53,6 +59,8 @@ class HoldoutSealStore:
                     evaluator_id TEXT NOT NULL,
                     evaluator_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    isolated_at TEXT,
+                    isolation_receipt_hash TEXT,
                     FOREIGN KEY(hypothesis_id) REFERENCES hypotheses(hypothesis_id),
                     FOREIGN KEY(family_id) REFERENCES hypothesis_families(family_id)
                 )
@@ -71,6 +79,8 @@ class HoldoutSealStore:
                 "evaluator_id",
                 "evaluator_hash",
                 "created_at",
+                "isolated_at",
+                "isolation_receipt_hash",
             }
             if not required.issubset(columns):
                 raise HoldoutSealError(
@@ -140,8 +150,9 @@ class HoldoutSealStore:
                     """
                     INSERT INTO final_holdout_seals(
                         hypothesis_id, family_id, manifest_hash, envelope_hash, key_id,
-                        evaluator_id, evaluator_hash, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        evaluator_id, evaluator_hash, created_at, isolated_at,
+                        isolation_receipt_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
                     """,
                     (
                         hypothesis_id,
@@ -160,6 +171,46 @@ class HoldoutSealStore:
                 ) from exc
         return self.get(hypothesis_id)
 
+    def mark_isolated(
+        self,
+        hypothesis_id: str,
+        *,
+        isolation_receipt_hash: str,
+    ) -> HoldoutSealRecord:
+        hypothesis_id = self._nonempty(hypothesis_id, "hypothesis_id")
+        receipt_hash = self._sha256(isolation_receipt_hash, "isolation_receipt_hash")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """
+                SELECT s.*, h.state AS hypothesis_state
+                FROM final_holdout_seals s
+                JOIN hypotheses h ON h.hypothesis_id=s.hypothesis_id
+                WHERE s.hypothesis_id=?
+                """,
+                (hypothesis_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(hypothesis_id)
+            if HypothesisState(row["hypothesis_state"]) is not HypothesisState.FROZEN:
+                raise HoldoutSealError(
+                    "final-holdout isolation must be attested before leaving FROZEN state"
+                )
+            if row["isolated_at"] is not None or row["isolation_receipt_hash"] is not None:
+                raise HoldoutSealError("final holdout isolation is already attested")
+            cursor = db.execute(
+                """
+                UPDATE final_holdout_seals
+                SET isolated_at=?, isolation_receipt_hash=?
+                WHERE hypothesis_id=? AND isolated_at IS NULL AND isolation_receipt_hash IS NULL
+                """,
+                (now, receipt_hash, hypothesis_id),
+            )
+            if cursor.rowcount != 1:
+                raise HoldoutSealError("final holdout isolation attestation changed concurrently")
+        return self.get(hypothesis_id)
+
     @staticmethod
     def _record(row: sqlite3.Row) -> HoldoutSealRecord:
         return HoldoutSealRecord(
@@ -171,6 +222,8 @@ class HoldoutSealStore:
             evaluator_id=row["evaluator_id"],
             evaluator_hash=row["evaluator_hash"],
             created_at=row["created_at"],
+            isolated_at=row["isolated_at"],
+            isolation_receipt_hash=row["isolation_receipt_hash"],
         )
 
     def get(self, hypothesis_id: str) -> HoldoutSealRecord:
