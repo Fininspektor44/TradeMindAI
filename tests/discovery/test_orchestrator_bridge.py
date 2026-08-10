@@ -11,7 +11,7 @@ from trademind.orchestrator.control_plane import ControlPlane
 from trademind.orchestrator.models import Role, TaskState
 
 
-def _frozen_case(tmp_path):
+def _frozen_case(tmp_path, *, leak_dataset_path_in_parameters: bool = False):
     dataset = tmp_path / "market.csv"
     dataset.write_text("symbol,timeframe,time,open,high,low,close\n", encoding="utf-8")
     family_definition = {
@@ -20,6 +20,8 @@ def _frozen_case(tmp_path):
         "feature_set": "bridge-test-v1",
     }
     parameters = {"window": 20}
+    if leak_dataset_path_in_parameters:
+        parameters["note"] = str(dataset)
     manifest = ExperimentManifest.new(
         hypothesis_id="H-BRIDGE",
         family_definition=family_definition,
@@ -68,7 +70,7 @@ def test_frozen_hypothesis_creates_zero_budget_bounded_task(tmp_path):
     assert task.budget_limit == 0.0
     assert task.scope == ("src/trademind/discovery",)
     assert str(frozen_path) not in task.scope
-    assert "Final-holdout access is forbidden" in task.goal
+    assert "Final-holdout exposure to Orchestrator agents is forbidden" in task.goal
     assert any("manifest_sha256=" in item for item in task.acceptance_criteria)
     assert len(task.artifact_refs) == 1
     assert registry.get(manifest.hypothesis_id).state is HypothesisState.FROZEN
@@ -144,3 +146,19 @@ def test_same_frozen_hypothesis_cannot_be_submitted_twice(tmp_path):
         pass
     else:
         raise AssertionError("duplicate orchestration submission must fail closed")
+
+
+def test_raw_dataset_path_hidden_inside_parameters_is_rejected(tmp_path):
+    _, frozen_path, manifest, _, _, artifacts, bridge = _frozen_case(
+        tmp_path,
+        leak_dataset_path_in_parameters=True,
+    )
+
+    try:
+        bridge.submit_frozen_hypothesis(manifest.hypothesis_id, manifest_path=frozen_path)
+    except DiscoveryBridgeError:
+        pass
+    else:
+        raise AssertionError("metadata must not smuggle a raw dataset path into the brief")
+
+    assert not list(artifacts.root.rglob("*research-brief*.json"))
