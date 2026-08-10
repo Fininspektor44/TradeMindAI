@@ -144,7 +144,7 @@ def _sealed_case(tmp_path):
         quarantine_directory=quarantine,
         key_id="holdout-key-v1",
         evaluator_id="aggregate-v1",
-        evaluator_hash=EVALUATOR_HASH,
+        evaluator_artifact_path=EVALUATOR_ARTIFACT,
     )
     return registry, seals, keys, plaintext, sealed, quarantine, receipt
 
@@ -267,7 +267,7 @@ def test_manifest_dataset_may_not_overlap_final_holdout_time_range(tmp_path):
             quarantine_directory=tmp_path / "quarantine",
             key_id="holdout-key-v1",
             evaluator_id="aggregate-v1",
-            evaluator_hash=EVALUATOR_HASH,
+            evaluator_artifact_path=EVALUATOR_ARTIFACT,
         )
     assert holdout.exists()
     assert registry.get("H-FINAL").state is HypothesisState.FROZEN
@@ -288,7 +288,7 @@ def test_quarantine_must_be_disjoint_from_research_root(tmp_path):
             quarantine_directory=research_root / "quarantine",
             key_id="holdout-key-v1",
             evaluator_id="aggregate-v1",
-            evaluator_hash=EVALUATOR_HASH,
+            evaluator_artifact_path=EVALUATOR_ARTIFACT,
         )
     assert plaintext.exists()
 
@@ -306,7 +306,7 @@ def test_sealer_refuses_duplicate_or_post_freeze_redefinition(tmp_path):
             destination_path=tmp_path / "duplicate.json",
             key_id="holdout-key-v1",
             evaluator_id="aggregate-v2",
-            evaluator_hash=hashlib.sha256(b"other-evaluator").hexdigest(),
+            evaluator_artifact_path=EVALUATOR_ARTIFACT,
         )
     assert not (tmp_path / "duplicate.json").exists()
 
@@ -320,7 +320,7 @@ def test_sealer_refuses_duplicate_or_post_freeze_redefinition(tmp_path):
             destination_path=tmp_path / "late.json",
             key_id="holdout-key-v1",
             evaluator_id="aggregate-v1",
-            evaluator_hash=EVALUATOR_HASH,
+            evaluator_artifact_path=EVALUATOR_ARTIFACT,
         )
 
 
@@ -337,7 +337,7 @@ def test_low_level_seal_without_quarantine_blocks_registry_progress(tmp_path):
         destination_path=sealed,
         key_id="holdout-key-v1",
         evaluator_id="aggregate-v1",
-        evaluator_hash=EVALUATOR_HASH,
+        evaluator_artifact_path=EVALUATOR_ARTIFACT,
     )
 
     with pytest.raises(RegistryError, match="isolation"):
