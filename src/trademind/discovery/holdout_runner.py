@@ -7,7 +7,6 @@ holdout was sealed. Research agents never receive plaintext rows or the key.
 
 from __future__ import annotations
 
-import builtins
 import inspect
 import io
 import json
@@ -15,8 +14,6 @@ import logging
 import math
 import os
 import re
-import socket
-import subprocess
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
