@@ -150,6 +150,7 @@ def run_mock_cycle(
             task_id=task_id,
             goal="validate Orchestrator v1 end-to-end mechanics with local deterministic mocks",
             scope=("src/trademind/orchestrator", "tests/orchestrator"),
+            allowed_tools=("orchestrator-tests",),
             budget_limit=1.0,
             acceptance_criteria=(
                 "role-separated workflow reaches COMPLETED",

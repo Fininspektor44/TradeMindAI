@@ -112,6 +112,7 @@ def test_complete_mock_cycle_separates_roles_and_preserves_evidence(tmp_path):
             task_id="T-cycle",
             goal="prove the bounded mock orchestration cycle",
             scope=("src/trademind/orchestrator",),
+            allowed_tools=("orchestrator-tests",),
             budget_limit=1.0,
             acceptance_criteria=("mock cycle reaches COMPLETED",),
         )
@@ -298,7 +299,12 @@ def test_failed_operator_tests_fail_closed_and_keep_test_artifact(tmp_path):
         },
     )
     control.create_task(
-        Task.new(task_id="T-fail", goal="fail closed", budget_limit=1.0)
+        Task.new(
+            task_id="T-fail",
+            goal="fail closed",
+            allowed_tools=("orchestrator-tests",),
+            budget_limit=1.0,
+        )
     )
 
     task = control.task_store.get("T-fail")

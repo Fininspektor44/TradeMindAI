@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+from trademind.orchestrator.dispatcher import DispatchResult
 from trademind.orchestrator.models import Task, TaskState
 from trademind.orchestrator.notification import NotificationKind
 from trademind.orchestrator.service import OrchestratorService, ServiceStatus
@@ -10,9 +11,9 @@ class StaticDispatcher:
         self.task = task
         self.calls = 0
 
-    def next_runnable(self):
+    def next_dispatch(self):
         self.calls += 1
-        return self.task
+        return DispatchResult(self.task)
 
 
 class CountingEngine:

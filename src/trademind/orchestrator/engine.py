@@ -8,10 +8,11 @@ from .agent_protocol import AgentDecision, AgentResult
 from .artifact_store import ArtifactStore
 from .budget import BudgetManager
 from .control_plane import ControlPlane
+from .dispatcher import route_to_generic_workflow
 from .models import PolicyDecision, Role, Task, TaskState
 from .policy import classify_action
 from .role_router import RoleRouter
-from .tool_runner import ToolRunner
+from .tool_runner import ToolPolicyError, ToolRunner
 
 
 class WorkflowError(RuntimeError):
@@ -19,6 +20,10 @@ class WorkflowError(RuntimeError):
 
 
 class WorkflowPolicyError(WorkflowError):
+    pass
+
+
+class WorkflowRoutingError(WorkflowError):
     pass
 
 
@@ -403,7 +408,26 @@ class WorkflowEngine:
         target = spec.target
 
         if spec.tool_template is not None:
-            result = self.tools.run(spec.tool_template, cwd=self.working_directory)
+            try:
+                result = self.tools.run_allowed(
+                    spec.tool_template,
+                    allowed_templates=task.allowed_tools,
+                    cwd=self.working_directory,
+                )
+            except ToolPolicyError as exc:
+                return self.control.system_halt(
+                    task.task_id,
+                    TaskState.FAILED,
+                    revision=task.revision,
+                    expected_state=task.state,
+                    action="TOOL_POLICY_DENIED",
+                    policy_result=PolicyDecision.FORBIDDEN,
+                    error=str(exc),
+                    metadata={
+                        "requested_tool": spec.tool_template,
+                        "allowed_tools": list(task.allowed_tools),
+                    },
+                )
             artifact = self.artifacts.store_json(
                 task_id=task.task_id,
                 revision=task.revision,
@@ -430,6 +454,9 @@ class WorkflowEngine:
             raise KeyError(task_id)
         if task.state in _STOPPED:
             return task
+        route = route_to_generic_workflow(task)
+        if not route.accepted:
+            raise WorkflowRoutingError(route.reason)
         spec = _STAGES.get(task.state)
         if spec is None:
             raise WorkflowError(f"no workflow stage for {task.state.value}")

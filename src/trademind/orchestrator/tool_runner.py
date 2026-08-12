@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from types import MappingProxyType
 
 
 class ToolPolicyError(RuntimeError):
@@ -54,10 +55,16 @@ class ToolRunner:
         if not allowed_roots:
             raise ValueError("at least one allowed working-directory root is required")
         self.allowed_roots = tuple(Path(root).expanduser().resolve() for root in allowed_roots)
-        self.templates = dict(templates)
+        registered_templates = dict(templates)
         self.allowed_environment = frozenset(allowed_environment)
-        if any(not name.strip() for name in self.templates):
+        if any(not name.strip() for name in registered_templates):
             raise ValueError("tool template names must not be empty")
+        self._templates: Mapping[str, CommandTemplate] = MappingProxyType(registered_templates)
+
+    @property
+    def templates(self) -> Mapping[str, CommandTemplate]:
+        """Read-only registry of trusted command templates."""
+        return self._templates
 
     def _validated_cwd(self, cwd: str | Path) -> Path:
         resolved = Path(cwd).expanduser().resolve()
@@ -74,10 +81,19 @@ class ToolRunner:
             if key.upper() in self.allowed_environment
         }
 
-    def run(self, template_name: str, *, cwd: str | Path) -> ToolRunResult:
-        template = self.templates.get(template_name)
+    def _resolve_template(self, template_name: str) -> CommandTemplate:
+        template = self._templates.get(template_name)
         if template is None:
             raise ToolPolicyError(f"unknown tool template: {template_name}")
+        return template
+
+    def _run_template(
+        self,
+        template_name: str,
+        template: CommandTemplate,
+        *,
+        cwd: str | Path,
+    ) -> ToolRunResult:
         working_directory = self._validated_cwd(cwd)
         command = (template.executable, *template.args)
         try:
@@ -113,3 +129,23 @@ class ToolRunner:
             stderr=completed.stderr,
             timed_out=False,
         )
+
+    def run_allowed(
+        self,
+        template_name: str,
+        *,
+        allowed_templates: Collection[str],
+        cwd: str | Path,
+    ) -> ToolRunResult:
+        """Authorize an exact template name, resolve it once, and execute that instance."""
+        if template_name not in allowed_templates:
+            raise ToolPolicyError(
+                f"tool template {template_name!r} is not explicitly allowed by task.allowed_tools"
+            )
+        template = self._resolve_template(template_name)
+        return self._run_template(template_name, template, cwd=cwd)
+
+    def run(self, template_name: str, *, cwd: str | Path) -> ToolRunResult:
+        """Execute a trusted template outside the Task-scoped workflow boundary."""
+        template = self._resolve_template(template_name)
+        return self._run_template(template_name, template, cwd=cwd)

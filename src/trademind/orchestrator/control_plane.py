@@ -240,6 +240,7 @@ class ControlPlane:
         target: TaskState,
         *,
         revision: int | None = None,
+        expected_state: TaskState | None = None,
         action: str = "SYSTEM_HALT",
         policy_result: PolicyDecision | None = None,
         error: str | None = None,
@@ -255,6 +256,10 @@ class ControlPlane:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             current = TaskStore._row_to_task(self._task_row(db, task_id, revision))
+            if expected_state is not None and current.state is not expected_state:
+                raise RevisionConflict(
+                    f"task state changed: expected {expected_state.value}, got {current.state.value}"
+                )
             updated = transition(current, target)
             updated = self._persist_transition(
                 db,

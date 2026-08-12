@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from threading import Event
 
-from .dispatcher import Dispatcher
+from .dispatcher import DispatchDiagnostic, Dispatcher
 from .engine import WorkflowEngine
 from .models import TaskState
 from .notification import Notification, NotificationKind, NotificationSink, NullNotificationSink
@@ -24,6 +24,7 @@ class ServiceTick:
     status: ServiceStatus
     task_id: str | None
     state: TaskState | None
+    routing_diagnostics: tuple[DispatchDiagnostic, ...] = ()
 
 
 class OrchestratorService:
@@ -45,9 +46,15 @@ class OrchestratorService:
         self.idle_sleep_seconds = float(idle_sleep_seconds)
 
     def run_once(self) -> ServiceTick:
-        task = self.dispatcher.next_runnable()
+        dispatch = self.dispatcher.next_dispatch()
+        task = dispatch.task
         if task is None:
-            return ServiceTick(ServiceStatus.IDLE, None, None)
+            return ServiceTick(
+                ServiceStatus.IDLE,
+                None,
+                None,
+                routing_diagnostics=dispatch.diagnostics,
+            )
 
         updated = self.engine.step(task.task_id)
         if updated.state is TaskState.HUMAN_REQUIRED:
@@ -59,7 +66,12 @@ class OrchestratorService:
                     message=f"Task {updated.task_id} requires human approval",
                 )
             )
-            return ServiceTick(ServiceStatus.STOPPED, updated.task_id, updated.state)
+            return ServiceTick(
+                ServiceStatus.STOPPED,
+                updated.task_id,
+                updated.state,
+                routing_diagnostics=dispatch.diagnostics,
+            )
 
         if updated.state in {
             TaskState.FAILED,
@@ -76,14 +88,24 @@ class OrchestratorService:
                     metadata={"state": updated.state.value},
                 )
             )
-            return ServiceTick(ServiceStatus.STOPPED, updated.task_id, updated.state)
+            return ServiceTick(
+                ServiceStatus.STOPPED,
+                updated.task_id,
+                updated.state,
+                routing_diagnostics=dispatch.diagnostics,
+            )
 
         status = (
             ServiceStatus.STOPPED
             if updated.state is TaskState.COMPLETED
             else ServiceStatus.ADVANCED
         )
-        return ServiceTick(status, updated.task_id, updated.state)
+        return ServiceTick(
+            status,
+            updated.task_id,
+            updated.state,
+            routing_diagnostics=dispatch.diagnostics,
+        )
 
     def run_forever(self, stop_event: Event) -> None:
         """Run until externally stopped; persisted task state makes restart recovery deterministic."""

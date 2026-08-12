@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sys
 
 from trademind.discovery.holdout_store import HoldoutSealStore
 from trademind.discovery.hypothesis_registry import HypothesisRegistry, HypothesisState
@@ -9,8 +10,14 @@ from trademind.discovery.orchestrator_bridge import (
     DiscoveryOrchestratorBridge,
 )
 from trademind.orchestrator.artifact_store import ArtifactStore
+from trademind.orchestrator.budget import BudgetManager
 from trademind.orchestrator.control_plane import ControlPlane
+from trademind.orchestrator.dispatcher import route_to_generic_workflow
+from trademind.orchestrator.engine import WorkflowEngine
+from trademind.orchestrator.mock_runner import DeterministicMockProvider
 from trademind.orchestrator.models import Role, TaskState
+from trademind.orchestrator.role_router import RoleRouter
+from trademind.orchestrator.tool_runner import CommandTemplate, ToolRunner
 
 
 BRIDGE_ENVELOPE_HASH = hashlib.sha256(b"bridge-envelope").hexdigest()
@@ -150,6 +157,58 @@ def test_positive_budget_is_explicit_opt_in(tmp_path):
         budget_limit=1.25,
     )
     assert task.budget_limit == 1.25
+
+
+def test_bridge_task_is_explicit_generic_workflow_and_completes_full_cycle(tmp_path):
+    _, frozen_path, manifest, registry, control, artifacts, bridge = _frozen_case(tmp_path)
+    task = bridge.submit_frozen_hypothesis(
+        manifest.hypothesis_id,
+        manifest_path=frozen_path,
+        budget_limit=1.0,
+    )
+    providers = {
+        role: DeterministicMockProvider(role)
+        for role in (Role.ARCHITECT, Role.DEVELOPER, Role.AUDITOR)
+    }
+    engine = WorkflowEngine(
+        control=control,
+        router=RoleRouter(providers),
+        budget=BudgetManager(
+            control.path,
+            daily_cost_ceiling=1.0,
+            monthly_cost_ceiling=10.0,
+            per_task_call_limit=10,
+            per_role_call_limit=20,
+            failure_cooldown_seconds=0,
+            daily_token_ceiling=1_000,
+            monthly_token_ceiling=10_000,
+        ),
+        artifacts=artifacts,
+        tools=ToolRunner(
+            allowed_roots=(tmp_path,),
+            templates={
+                "orchestrator-tests": CommandTemplate(
+                    executable=sys.executable,
+                    args=("-c", "print('bounded discovery implementation tests pass')"),
+                    timeout_seconds=10,
+                )
+            },
+        ),
+        working_directory=str(tmp_path),
+        estimated_model_cost=0.0,
+        estimated_model_tokens=1,
+    )
+
+    assert task.allowed_tools == ("orchestrator-tests",)
+    assert route_to_generic_workflow(task).accepted
+
+    completed = engine.run_until_stopped(task.task_id)
+
+    assert completed.state is TaskState.COMPLETED
+    assert all(provider.calls > 0 for provider in providers.values())
+    assert registry.get(manifest.hypothesis_id).state is HypothesisState.FROZEN
+    assert registry.family_status(manifest.hypothesis_family_id)["holdout_consumed"] is False
+    assert control.audit_log.verify()
 
 
 def test_unfrozen_hypothesis_is_rejected(tmp_path):

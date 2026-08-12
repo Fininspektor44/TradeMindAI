@@ -236,6 +236,7 @@ class DiscoveryOrchestratorBridge:
             ),
             scope=("src/trademind/discovery",),
             risk_class=RiskClass.LOW,
+            allowed_tools=("orchestrator-tests",),
             budget_limit=budget_limit,
             acceptance_criteria=(
                 f"manifest_sha256={binding.manifest_hash}",
