@@ -118,3 +118,21 @@ def test_envelope_contains_only_structured_task_metadata_and_policy_boundary():
     assert envelope.artifact_refs == task.artifact_refs
     assert set(envelope.forbidden_actions) == set(FORBIDDEN_ACTIONS)
     assert envelope.required_output_schema == "audit-v1"
+
+
+def test_router_passes_structured_input_to_provider_without_string_conversion():
+    provider = MockProvider("architect")
+    router = RoleRouter({Role.ARCHITECT: provider})
+
+    router.execute(
+        _task(),
+        role=Role.ARCHITECT,
+        required_output_schema="hypothesis-v0",
+        structured_input={"candidate": {"symbol": "EURUSD", "horizon": 12}},
+        input_schema="candidate-v0",
+    )
+
+    envelope = provider.seen[0]
+    assert envelope.input_schema == "candidate-v0"
+    assert envelope.structured_input["candidate"]["symbol"] == "EURUSD"
+    assert not isinstance(envelope.structured_input, str)

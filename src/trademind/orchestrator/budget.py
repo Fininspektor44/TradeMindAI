@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .agent_protocol import (
+    AgentProtocolError,
+    AgentResult,
+    JsonPayloadError,
+    canonical_json_dumps,
+    canonical_json_loads,
+)
 from .models import BudgetCheck, Role
 
 
@@ -88,7 +94,7 @@ class BudgetManager:
 
     @staticmethod
     def request_hash(payload: dict) -> str:
-        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        canonical = canonical_json_dumps(payload)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def cached_result(self, request_hash: str) -> dict | None:
@@ -100,10 +106,27 @@ class BudgetManager:
             ).fetchone()
         if row is None or row["result_json"] is None:
             return None
-        payload = json.loads(row["result_json"])
-        if not isinstance(payload, dict):
-            raise RuntimeError("cached model result must be a JSON object")
+        try:
+            payload = canonical_json_loads(row["result_json"])
+            if not isinstance(payload, dict):
+                return None
+            result = AgentResult.from_payload(payload)
+            if result.success is not True:
+                return None
+        except (AgentProtocolError, JsonPayloadError):
+            return None
         return payload
+
+    def has_cached_entry(self, request_hash: str) -> bool:
+        """Report cache-key presence without interpreting or mutating its value."""
+        with self._connect() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM request_cache WHERE request_hash=?",
+                    (request_hash,),
+                ).fetchone()
+                is not None
+            )
 
     def check(
         self,
@@ -115,6 +138,7 @@ class BudgetManager:
         estimated_cost: float = 0.0,
         estimated_tokens: int = 0,
         task_cost_ceiling: float | None = None,
+        include_cache: bool = True,
     ) -> BudgetCheck:
         if estimated_cost < 0 or estimated_tokens < 0:
             raise ValueError("estimated cost and tokens must be non-negative")
@@ -125,14 +149,12 @@ class BudgetManager:
         day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
         month_start = day_start.replace(day=1)
 
-        with self._connect() as db:
-            cached = db.execute(
-                "SELECT result_json FROM request_cache WHERE request_hash=?",
-                (request_hash,),
-            ).fetchone()
-            if cached is not None and cached["result_json"] is not None:
+        if include_cache:
+            cached = self.cached_result(request_hash)
+            if cached is not None:
                 return BudgetCheck(True, "materially identical request is cached", cached=True)
 
+        with self._connect() as db:
             last_failure = db.execute(
                 """
                 SELECT timestamp FROM model_usage
@@ -211,14 +233,30 @@ class BudgetManager:
         success: bool,
         cacheable: bool = False,
         cache_payload: dict | None = None,
+        replace_invalid_cache: bool = False,
         now: datetime | None = None,
     ) -> None:
         if cost < 0 or tokens < 0:
             raise ValueError("cost and tokens must be non-negative")
+        if type(success) is not bool:
+            raise ValueError("success must be a bool")
         if cache_payload is not None and not cacheable:
             raise ValueError("cache_payload requires cacheable=True")
         if cacheable and success and cache_payload is None:
             raise ValueError("successful cacheable result requires cache_payload")
+        if replace_invalid_cache and not (success and cacheable):
+            raise ValueError("replace_invalid_cache requires a successful cacheable result")
+        result_json = None
+        if cache_payload is not None:
+            cached_result = AgentResult.from_payload(cache_payload)
+            if cached_result.success is not success:
+                raise ValueError(
+                    "record success metadata must match cache payload success"
+                )
+            if cached_result.success is not True:
+                raise ValueError("request_cache accepts only successful AgentResult payloads")
+        if success and cacheable:
+            result_json = canonical_json_dumps(cache_payload)
         timestamp = (now or datetime.now(timezone.utc)).isoformat()
         with self._connect() as db:
             db.execute(
@@ -238,19 +276,25 @@ class BudgetManager:
                 ),
             )
             if success and cacheable:
-                result_json = json.dumps(
-                    cache_payload,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                )
-                db.execute(
-                    """
-                    INSERT OR IGNORE INTO request_cache(request_hash, created_at, result_json)
-                    VALUES (?, ?, ?)
-                    """,
-                    (request_hash, timestamp, result_json),
-                )
+                if replace_invalid_cache:
+                    db.execute(
+                        """
+                        INSERT INTO request_cache(request_hash, created_at, result_json)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(request_hash) DO UPDATE SET
+                            created_at=excluded.created_at,
+                            result_json=excluded.result_json
+                        """,
+                        (request_hash, timestamp, result_json),
+                    )
+                else:
+                    db.execute(
+                        """
+                        INSERT OR IGNORE INTO request_cache(request_hash, created_at, result_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        (request_hash, timestamp, result_json),
+                    )
 
     def total_calls(self) -> int:
         with self._connect() as db:

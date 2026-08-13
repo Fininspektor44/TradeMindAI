@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from .agent_protocol import AgentDecision, AgentResult
+from .agent_protocol import (
+    AgentDecision,
+    AgentProtocolError,
+    AgentResult,
+    JsonPayloadError,
+    validate_result,
+)
 from .artifact_store import ArtifactStore
 from .budget import BudgetManager
 from .control_plane import ControlPlane
@@ -144,38 +150,36 @@ class WorkflowEngine:
         model_name: str,
         result: AgentResult,
     ) -> str:
+        result_payload = result.to_payload()
+        artifact_payload = {
+            "role": role.value,
+            "provider": provider_name,
+            "model": model_name,
+            "success": result.success,
+            "decision": result.decision.value,
+            "summary": result.summary,
+            "output_schema": result.output_schema,
+            "tokens": result.tokens,
+            "cost": result.cost,
+            "error": result.error,
+            "declared_artifact_refs": list(result.artifact_refs),
+        }
+        if "structured_output" in result_payload:
+            artifact_payload["structured_output"] = result_payload["structured_output"]
         artifact = self.artifacts.store_json(
             task_id=task.task_id,
             revision=task.revision,
             kind=f"{task.state.value.lower()}-{role.value.lower()}",
-            payload={
-                "role": role.value,
-                "provider": provider_name,
-                "model": model_name,
-                "success": result.success,
-                "decision": result.decision.value,
-                "summary": result.summary,
-                "output_schema": result.output_schema,
-                "tokens": result.tokens,
-                "cost": result.cost,
-                "error": result.error,
-                "declared_artifact_refs": list(result.artifact_refs),
-            },
+            payload=artifact_payload,
         )
         return artifact.hash_ref
 
     @staticmethod
     def _cached_agent_result(payload: dict) -> AgentResult:
-        return AgentResult(
-            success=bool(payload["success"]),
-            summary=str(payload["summary"]),
-            artifact_refs=tuple(payload.get("artifact_refs", ())),
-            output_schema=str(payload.get("output_schema", "")),
-            tokens=int(payload.get("tokens", 0)),
-            cost=float(payload.get("cost", 0.0)),
-            error=payload.get("error"),
-            decision=AgentDecision(payload.get("decision", AgentDecision.CONTINUE.value)),
-        )
+        result = AgentResult.from_payload(payload)
+        if result.success is not True:
+            raise AgentProtocolError("request_cache accepts only successful AgentResult payloads")
+        return result
 
     def _apply_agent_result(
         self,
@@ -271,29 +275,33 @@ class WorkflowEngine:
             envelope_payload=envelope.to_payload(),
         )
 
+        cache_entry_present = self.budget.has_cached_entry(request_hash)
         cached_payload = self.budget.cached_result(request_hash)
+        invalid_cache_entry = cache_entry_present and cached_payload is None
         if cached_payload is not None:
-            result = self._cached_agent_result(cached_payload)
-            if result.output_schema != spec.output_schema:
-                raise WorkflowError("cached model result schema does not match requested stage")
-            cached_provider = f"cache:{provider.provider_name}"
-            artifact_hash = self._store_agent_result(
-                task,
-                role=role,
-                provider_name=cached_provider,
-                model_name=provider.model_name,
-                result=result,
-            )
-            return self._apply_agent_result(
-                task,
-                spec,
-                role=role,
-                provider_name=cached_provider,
-                model_name=provider.model_name,
-                result=result,
-                artifact_hash=artifact_hash,
-                policy=policy,
-            )
+            try:
+                result = validate_result(envelope, self._cached_agent_result(cached_payload))
+            except (AgentProtocolError, JsonPayloadError):
+                invalid_cache_entry = True
+            else:
+                cached_provider = f"cache:{provider.provider_name}"
+                artifact_hash = self._store_agent_result(
+                    task,
+                    role=role,
+                    provider_name=cached_provider,
+                    model_name=provider.model_name,
+                    result=result,
+                )
+                return self._apply_agent_result(
+                    task,
+                    spec,
+                    role=role,
+                    provider_name=cached_provider,
+                    model_name=provider.model_name,
+                    result=result,
+                    artifact_hash=artifact_hash,
+                    policy=policy,
+                )
 
         check = self.budget.check(
             task_id=task.task_id,
@@ -302,6 +310,7 @@ class WorkflowEngine:
             estimated_cost=self.estimated_model_cost,
             estimated_tokens=self.estimated_model_tokens,
             task_cost_ceiling=task.budget_limit,
+            include_cache=False,
         )
         if not check.allowed:
             artifact = self.artifacts.store_json(
@@ -380,7 +389,8 @@ class WorkflowEngine:
             tokens=result.tokens,
             success=result.success,
             cacheable=result.success,
-            cache_payload=asdict(result) if result.success else None,
+            cache_payload=result.to_payload() if result.success else None,
+            replace_invalid_cache=invalid_cache_entry and result.success,
         )
         artifact_hash = self._store_agent_result(
             task,

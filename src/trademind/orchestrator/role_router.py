@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .agent_protocol import AgentEnvelope, AgentProvider, AgentResult, validate_result
+from .agent_protocol import AgentEnvelope, AgentProvider, AgentResult, JsonValue, validate_result
 from .models import Role, Task
 from .policy import FORBIDDEN_ACTIONS
 
@@ -32,6 +32,8 @@ class RoleRouter:
         *,
         role: Role,
         required_output_schema: str,
+        structured_input: Mapping[str, JsonValue] | None = None,
+        input_schema: str | None = None,
     ) -> AgentEnvelope:
         if role not in _AI_ROLES:
             raise RoleRoutingError(f"{role.value} is deterministic local software in v1")
@@ -45,6 +47,8 @@ class RoleRouter:
             acceptance_criteria=task.acceptance_criteria,
             artifact_refs=task.artifact_refs,
             required_output_schema=required_output_schema,
+            structured_input=structured_input,
+            input_schema=input_schema,
         )
 
     def provider_for(self, role: Role) -> AgentProvider:
@@ -61,11 +65,15 @@ class RoleRouter:
         *,
         role: Role,
         required_output_schema: str,
+        structured_input: Mapping[str, JsonValue] | None = None,
+        input_schema: str | None = None,
     ) -> AgentResult:
         provider = self.provider_for(role)
         envelope = self.envelope_for(
             task,
             role=role,
             required_output_schema=required_output_schema,
+            structured_input=structured_input,
+            input_schema=input_schema,
         )
         return validate_result(envelope, provider.execute(envelope))

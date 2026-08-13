@@ -45,6 +45,14 @@ class DeterministicMockProvider:
             )
         self.calls += 1
         decision = AgentDecision.APPROVE if self.role is Role.AUDITOR else AgentDecision.CONTINUE
+        result_kwargs = {}
+        if envelope.structured_input is not None:
+            result_kwargs["structured_output"] = {
+                "input_schema": envelope.input_schema,
+                "received_structured_input": True,
+                "required_output_schema": envelope.required_output_schema,
+                "role": self.role.value,
+            }
         return AgentResult(
             success=True,
             summary=f"{self.role.value} completed {envelope.required_output_schema}",
@@ -52,6 +60,7 @@ class DeterministicMockProvider:
             tokens=1,
             cost=0.0,
             decision=decision,
+            **result_kwargs,
         )
 
 
