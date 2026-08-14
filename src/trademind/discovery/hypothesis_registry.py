@@ -113,6 +113,19 @@ class HypothesisRegistry:
         db.execute("PRAGMA foreign_keys=ON")
         return db
 
+    def _validate_transaction_connection(self, db: sqlite3.Connection) -> None:
+        """Require a caller-owned transaction on this registry's database."""
+        if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+            raise RegistryError("hypothesis registry requires an active caller transaction")
+        if db.row_factory is not sqlite3.Row:
+            raise RegistryError("hypothesis registry transaction requires sqlite3.Row row_factory")
+        if db.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise RegistryError("hypothesis registry transaction requires foreign keys")
+        rows = db.execute("PRAGMA database_list").fetchall()
+        main_path = next((row[2] for row in rows if row[1] == "main"), "")
+        if not main_path or Path(main_path).resolve() != self.path.resolve():
+            raise RegistryError("hypothesis registry transaction uses a different database")
+
     def _init_schema(self) -> None:
         with self._connect() as db:
             db.executescript(
@@ -183,11 +196,7 @@ class HypothesisRegistry:
             """,
             (hypothesis_id,),
         ).fetchone()
-        if (
-            seal is None
-            or seal["isolated_at"] is None
-            or seal["isolation_receipt_hash"] is None
-        ):
+        if seal is None or seal["isolated_at"] is None or seal["isolation_receipt_hash"] is None:
             raise RegistryError(
                 "final-holdout plaintext isolation must be attested before research state advances"
             )
@@ -199,70 +208,96 @@ class HypothesisRegistry:
         family_definition: Mapping[str, Any],
         content_definition: Mapping[str, Any],
     ) -> HypothesisRecord:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self.register_in_transaction(
+                db,
+                hypothesis_id=hypothesis_id,
+                family_definition=family_definition,
+                content_definition=content_definition,
+            )
+
+    def register_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        *,
+        hypothesis_id: str,
+        family_definition: Mapping[str, Any],
+        content_definition: Mapping[str, Any],
+    ) -> HypothesisRecord:
+        """Register through an existing transaction without committing it.
+
+        This narrow adapter lets a trusted control-plane layer bind its own state,
+        audit evidence, and the existing registry entry atomically. It does not
+        change registry identity or lifecycle semantics.
+        """
+        self._validate_transaction_connection(db)
         hypothesis_id = self._validate_nonempty(hypothesis_id, "hypothesis_id")
         family_json = _canonical(family_definition)
         content_json = _canonical(content_definition)
         family_id = derive_hypothesis_family_id(family_definition)
         content_hash = derive_content_hash(content_definition)
         now = datetime.now(timezone.utc).isoformat()
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            duplicate = db.execute(
-                "SELECT hypothesis_id FROM hypotheses WHERE content_hash=?",
-                (content_hash,),
-            ).fetchone()
-            if duplicate is not None:
-                raise DuplicateHypothesis(f"duplicate_of={duplicate['hypothesis_id']}")
+        duplicate = db.execute(
+            "SELECT hypothesis_id FROM hypotheses WHERE content_hash=?",
+            (content_hash,),
+        ).fetchone()
+        if duplicate is not None:
+            raise DuplicateHypothesis(f"duplicate_of={duplicate['hypothesis_id']}")
 
-            family = db.execute(
-                "SELECT * FROM hypothesis_families WHERE family_id=?",
-                (family_id,),
-            ).fetchone()
-            if family is not None:
-                stored_definition = family["definition_json"]
-                if stored_definition is None:
-                    raise RegistryError(
-                        "legacy family row has no immutable definition fingerprint; migrate explicitly"
-                    )
-                if stored_definition != family_json:
-                    raise RegistryError("family identity collision or definition mismatch")
-                if int(family["holdout_consumed"]):
-                    raise RegistryError("hypothesis family has already consumed final holdout")
-                if family["terminal_state"]:
-                    raise RegistryError(
-                        f"hypothesis family is terminal: {family['terminal_state']}"
-                    )
-            else:
-                db.execute(
-                    """
-                    INSERT INTO hypothesis_families(
-                        family_id, definition_json, holdout_consumed, terminal_state, updated_at
-                    ) VALUES (?, ?, 0, NULL, ?)
-                    """,
-                    (family_id, family_json, now),
+        family = db.execute(
+            "SELECT * FROM hypothesis_families WHERE family_id=?",
+            (family_id,),
+        ).fetchone()
+        if family is not None:
+            stored_definition = family["definition_json"]
+            if stored_definition is None:
+                raise RegistryError(
+                    "legacy family row has no immutable definition fingerprint; migrate explicitly"
                 )
+            if stored_definition != family_json:
+                raise RegistryError("family identity collision or definition mismatch")
+            if int(family["holdout_consumed"]):
+                raise RegistryError("hypothesis family has already consumed final holdout")
+            if family["terminal_state"]:
+                raise RegistryError(f"hypothesis family is terminal: {family['terminal_state']}")
+        else:
+            db.execute(
+                """
+                INSERT INTO hypothesis_families(
+                    family_id, definition_json, holdout_consumed, terminal_state, updated_at
+                ) VALUES (?, ?, 0, NULL, ?)
+                """,
+                (family_id, family_json, now),
+            )
 
-            try:
-                db.execute(
-                    """
-                    INSERT INTO hypotheses(
-                        hypothesis_id, family_id, content_hash, content_definition_json,
-                        manifest_hash, state, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
-                    """,
-                    (
-                        hypothesis_id,
-                        family_id,
-                        content_hash,
-                        content_json,
-                        HypothesisState.PROPOSED.value,
-                        now,
-                        now,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise RegistryError(f"hypothesis already exists: {hypothesis_id}") from exc
-        return self.get(hypothesis_id)
+        try:
+            db.execute(
+                """
+                INSERT INTO hypotheses(
+                    hypothesis_id, family_id, content_hash, content_definition_json,
+                    manifest_hash, state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    hypothesis_id,
+                    family_id,
+                    content_hash,
+                    content_json,
+                    HypothesisState.PROPOSED.value,
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise RegistryError(f"hypothesis already exists: {hypothesis_id}") from exc
+        row = db.execute(
+            "SELECT * FROM hypotheses WHERE hypothesis_id=?",
+            (hypothesis_id,),
+        ).fetchone()
+        if row is None:
+            raise RegistryError("hypothesis insert was not visible")
+        return self._row(row)
 
     @staticmethod
     def _row(row: sqlite3.Row) -> HypothesisRecord:
