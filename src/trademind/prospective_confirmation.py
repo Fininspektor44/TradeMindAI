@@ -44,6 +44,13 @@ the entire point of pre-registering them instead), so their provenance
 anchors to the discovery-only mining batch itself -- the same real dataset
 and an explicit reference to the sibling V1 protocol from the same batch --
 rather than to a completed experiment's hypothesis/manifest/holdout refs.
+
+``ProspectiveEvaluationResult.last_eligible_signal_time`` reports the latest
+``signal_time`` among the rows a given evaluation call actually counted as
+eligible (or ``None``). It is purely descriptive -- it never influences
+``outcome`` -- and exists so an operational monitor evaluating a repeatedly
+growing snapshot (see ``trademind.mt5_prospective_monitor``) can report
+freshness without re-deriving eligibility itself.
 """
 
 from __future__ import annotations
@@ -160,6 +167,18 @@ def _audit_identity(value: object, *, field_name: str) -> str:
     ):
         raise ProspectiveConfirmationError(f"{field_name} must be a bounded audit identity")
     return value
+
+
+def _last_eligible_signal_time(eligible: Sequence[Mapping[str, str]]) -> str | None:
+    """Latest ``signal_time`` (canonical UTC isoformat) among already-filtered,
+    already-validated eligible rows, or ``None`` if none are eligible. Purely
+    descriptive -- does not participate in the PASS/FAIL/WAITING_FOR_DATA
+    decision, which remains entirely driven by ``validate_rows``/criteria."""
+    if not eligible:
+        return None
+    return max(
+        datetime.fromisoformat(row["signal_time"]).astimezone(timezone.utc) for row in eligible
+    ).isoformat()
 
 
 def _exact_fields(payload: Mapping[str, object], *, required: frozenset[str], name: str) -> None:
@@ -525,6 +544,7 @@ class ProspectiveEvaluationResult:
     avg_net_atr: float
     win_rate: float
     eligible_rows_considered: int
+    last_eligible_signal_time: str | None
 
 
 def evaluate_prospective_snapshot(
@@ -597,6 +617,7 @@ def evaluate_prospective_snapshot(
         avg_net_atr=result.total.avg_net_atr,
         win_rate=result.total.win_rate,
         eligible_rows_considered=len(eligible),
+        last_eligible_signal_time=_last_eligible_signal_time(eligible),
     )
 
 
@@ -1003,6 +1024,7 @@ def evaluate_prospective_snapshot_v2(
         avg_net_atr=result.total.avg_net_atr,
         win_rate=result.total.win_rate,
         eligible_rows_considered=len(eligible),
+        last_eligible_signal_time=_last_eligible_signal_time(eligible),
     )
 
 

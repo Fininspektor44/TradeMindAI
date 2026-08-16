@@ -232,6 +232,18 @@ def test_pre_cutoff_rows_are_rejected() -> None:
     result = evaluate_prospective_snapshot_v2(protocol, rows)
     assert result.eligible_rows_considered == 0
     assert result.outcome is ProspectiveOutcome.WAITING_FOR_DATA
+    assert result.last_eligible_signal_time is None
+
+
+def test_last_eligible_signal_time_reflects_pattern_filtering() -> None:
+    protocol = _protocol(action=None, pattern="BULLISH_FVG")
+    rows = [
+        _row(1.0, fvg_direction="BULLISH"),
+        _row(5.0, fvg_direction="BEARISH"),  # later in time, but wrong pattern.
+        _row(3.0, fvg_direction="BULLISH"),
+    ]
+    result = evaluate_prospective_snapshot_v2(protocol, rows)
+    assert result.last_eligible_signal_time == rows[2]["signal_time"]
 
 
 # ---------------------------------------------------------------------------

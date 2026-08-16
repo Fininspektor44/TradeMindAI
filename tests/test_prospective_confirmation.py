@@ -227,6 +227,20 @@ def test_mixed_pre_and_post_cutoff_only_counts_post_cutoff() -> None:
     assert result.eligible_rows_considered == 5
 
 
+def test_last_eligible_signal_time_is_the_latest_eligible_row() -> None:
+    protocol = _protocol()
+    rows = _rows_spaced(5, start_hours_after_cutoff=1.0, step_hours=24.0)
+    result = evaluate_prospective_snapshot(protocol, rows)
+    assert result.last_eligible_signal_time == rows[-1]["signal_time"]
+
+
+def test_last_eligible_signal_time_is_none_when_nothing_is_eligible() -> None:
+    protocol = _protocol()
+    rows = _rows_spaced(3, start_hours_after_cutoff=-24 * 40)
+    result = evaluate_prospective_snapshot(protocol, rows)
+    assert result.last_eligible_signal_time is None
+
+
 def test_non_matching_symbol_or_action_excluded() -> None:
     protocol = _protocol()
     rows = [
