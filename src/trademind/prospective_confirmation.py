@@ -28,6 +28,22 @@ The cutoff is a hard, structural gate: only rows with ``signal_time``
 *strictly after* the frozen cutoff are ever eligible. This is enforced by
 straightforward comparison in ``evaluate_prospective_snapshot`` -- it is not
 a policy note, it is the entire filter.
+
+``ProspectiveConfirmationProtocolV2`` is a purely additive schema variant,
+added the same way ``ExperimentManifestV2`` sits alongside the closed
+``ExperimentManifest`` in ``discovery/manifest.py``: V1 is untouched (its
+already-frozen ``.USTECHCASH`` SELL artifact stays byte-identical and fully
+loadable), and V2 exists only because some discovery-only-stable candidates
+are defined by an SMC event pattern (``BULLISH_FVG``, ``BSL_SWEEP``, ...)
+rather than by action alone. It reuses the exact same closed pattern
+vocabulary and grouping logic ``trademind.validation.validate_symbol_patterns``
+already uses -- ``trademind.smc_stats._EVENT_ORDER``/``_event_groups``,
+unchanged -- so no new pattern taxonomy is invented here. V2 candidates were
+never run through a formal manifest/validation/holdout experiment (that is
+the entire point of pre-registering them instead), so their provenance
+anchors to the discovery-only mining batch itself -- the same real dataset
+and an explicit reference to the sibling V1 protocol from the same batch --
+rather than to a completed experiment's hypothesis/manifest/holdout refs.
 """
 
 from __future__ import annotations
@@ -58,6 +74,7 @@ from trademind.signal_statistics_provenance import (
     sha256_bytes,
     validate_sha256_ref,
 )
+from trademind.smc_stats import _EVENT_ORDER, _event_groups
 from trademind.validation import validate_rows
 
 PROSPECTIVE_CONFIRMATION_PROTOCOL_V1_SCHEMA_VERSION = "prospective-confirmation-protocol-v1"
@@ -66,12 +83,20 @@ PROSPECTIVE_CONFIRMATION_PROTOCOL_V1_MEDIA_TYPE = (
 )
 PROTOCOL_KIND = "PROSPECTIVE_CONFIRMATION_PROTOCOL_V1"
 
+PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_SCHEMA_VERSION = "prospective-confirmation-protocol-v2"
+PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_MEDIA_TYPE = (
+    "application/vnd.trademind.prospective-confirmation-protocol-v2+json"
+)
+PROTOCOL_V2_KIND = "PROSPECTIVE_CONFIRMATION_PROTOCOL_V2"
+
 _PROTOCOL_HASH_DOMAIN = b"trademind:research:prospective-confirmation-protocol:v1"
+_PROTOCOL_V2_HASH_DOMAIN = b"trademind:research:prospective-confirmation-protocol:v2"
 
 _BOUNDED_TEXT = re.compile(r"^\S(?:.{0,62}\S)?$")
 _MACHINE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _HYPOTHESIS_ID = re.compile(r"^rpi-v1:sha256:[0-9a-f]{64}:[0-7]$")
 _ACTIONS = frozenset({"BUY", "SELL"})
+_EVENT_PATTERNS = frozenset(_EVENT_ORDER)
 
 
 class ProspectiveConfirmationError(ValueError):
@@ -585,20 +610,436 @@ def evaluate_prospective_snapshot_csv(
     return evaluate_prospective_snapshot(protocol, rows)
 
 
+# ---------------------------------------------------------------------------
+# V2: purely additive -- adds an optional SMC event-pattern filter and makes
+# ``action`` optional. V1 above is completely unmodified; see module docstring.
+# ---------------------------------------------------------------------------
+
+_PROTOCOL_V2_FIELDS = frozenset(
+    {
+        "schema_version",
+        "protocol_kind",
+        "candidate",
+        "cutoff_time",
+        "minimum_sample",
+        "primary_metric",
+        "sample_criterion",
+        "success_criterion",
+        "source_batch",
+        "code_provenance",
+        "protocol_semantic_identity",
+        "diagnostics",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProspectiveConfirmationProtocolV2:
+    """Immutable pre-registration with an optional SMC event-pattern filter.
+
+    At least one of ``action``/``pattern`` must be set -- a bare symbol+
+    horizon filter with no differentiating condition is not a candidate this
+    protocol represents. ``pattern``, when set, must be one of the closed
+    event labels ``trademind.smc_stats._EVENT_ORDER`` already defines
+    (``BULLISH_FVG``, ``BSL_SWEEP``, ...); no new taxonomy is introduced.
+
+    Provenance points at the discovery-only mining batch this candidate came
+    from (dataset description, discovery row count, and the sibling V1
+    protocol's own semantic identity) rather than at a completed experiment,
+    since these candidates were deliberately never run through validation.
+    """
+
+    symbol: str
+    horizon: int
+    cutoff_time: str
+    minimum_sample: int
+    primary_metric: str
+    sample_criterion: EvaluationCriterionV1
+    success_criterion: EvaluationCriterionV1
+    source_dataset_description: str
+    source_discovery_row_count: int
+    sibling_protocol_semantic_identity: str
+    code_provenance: CodeProvenance
+    diagnostics: ProspectiveConfirmationDiagnostics
+    action: str | None = None
+    pattern: str | None = None
+    schema_version: str = PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_SCHEMA_VERSION
+    protocol_kind: str = PROTOCOL_V2_KIND
+    protocol_semantic_identity: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_SCHEMA_VERSION:
+            raise ProspectiveConfirmationError("unsupported prospective confirmation schema_version")
+        if self.protocol_kind != PROTOCOL_V2_KIND:
+            raise ProspectiveConfirmationError("unsupported prospective confirmation protocol kind")
+        _bounded_text(self.symbol, field_name="protocol.symbol")
+        _positive_int(self.horizon, field_name="protocol.horizon")
+        _utc_timestamp(self.cutoff_time, field_name="protocol.cutoff_time")
+        _positive_int(self.minimum_sample, field_name="protocol.minimum_sample")
+        _machine_identifier(self.primary_metric, field_name="protocol.primary_metric")
+
+        if self.action is not None and self.action not in _ACTIONS:
+            raise ProspectiveConfirmationError("protocol.action must be BUY, SELL, or null")
+        if self.pattern is not None and self.pattern not in _EVENT_PATTERNS:
+            raise ProspectiveConfirmationError(
+                f"protocol.pattern must be one of {sorted(_EVENT_PATTERNS)} or null"
+            )
+        if self.action is None and self.pattern is None:
+            raise ProspectiveConfirmationError(
+                "protocol must set action, pattern, or both -- a bare symbol+horizon "
+                "filter is not a differentiated candidate"
+            )
+
+        if type(self.sample_criterion) is not EvaluationCriterionV1:
+            raise ProspectiveConfirmationError("sample_criterion must be EvaluationCriterionV1")
+        if (
+            self.sample_criterion.metric != "trades"
+            or self.sample_criterion.operator is not CriterionOperator.GREATER_THAN_OR_EQUAL
+            or self.sample_criterion.threshold != self.minimum_sample
+        ):
+            raise ProspectiveConfirmationError(
+                "sample_criterion must be exactly trades >= minimum_sample"
+            )
+        if type(self.success_criterion) is not EvaluationCriterionV1:
+            raise ProspectiveConfirmationError("success_criterion must be EvaluationCriterionV1")
+        if self.success_criterion.metric != self.primary_metric:
+            raise ProspectiveConfirmationError("success_criterion must score the primary_metric")
+
+        _bounded_text(
+            self.source_dataset_description, field_name="source_batch.dataset_description"
+        )
+        if type(self.source_discovery_row_count) is not int or self.source_discovery_row_count < 1:
+            raise ProspectiveConfirmationError(
+                "source_batch.discovery_row_count must be an exact positive integer"
+            )
+        _sha256_ref(
+            self.sibling_protocol_semantic_identity,
+            field_name="source_batch.sibling_protocol_semantic_identity",
+        )
+        if type(self.code_provenance) is not CodeProvenance:
+            raise ProspectiveConfirmationError("code_provenance must be CodeProvenance")
+
+        object.__setattr__(
+            self,
+            "protocol_semantic_identity",
+            sha256_bytes(
+                _PROTOCOL_V2_HASH_DOMAIN + b"\x00" + canonical_json_bytes(self.semantic_projection())
+            ),
+        )
+        canonical_json_bytes(self.to_payload())
+
+    def semantic_projection(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "protocol_kind": self.protocol_kind,
+            "candidate": {
+                "symbol": self.symbol,
+                "action": self.action,
+                "pattern": self.pattern,
+                "horizon": self.horizon,
+            },
+            "cutoff_time": self.cutoff_time,
+            "minimum_sample": self.minimum_sample,
+            "primary_metric": self.primary_metric,
+            "sample_criterion": self.sample_criterion.to_payload(),
+            "success_criterion": self.success_criterion.to_payload(),
+            "source_batch": {
+                "dataset_description": self.source_dataset_description,
+                "discovery_row_count": self.source_discovery_row_count,
+                "sibling_protocol_semantic_identity": self.sibling_protocol_semantic_identity,
+            },
+            "code_provenance": self.code_provenance.to_payload(),
+        }
+
+    def to_payload(self) -> dict[str, object]:
+        payload = self.semantic_projection()
+        payload["protocol_semantic_identity"] = self.protocol_semantic_identity
+        payload["diagnostics"] = self.diagnostics.to_payload()
+        return payload
+
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(self.to_payload())
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> "ProspectiveConfirmationProtocolV2":
+        try:
+            frozen = freeze_json_object(payload, field_name="prospective_confirmation_protocol_v2")
+        except ProvenanceError as exc:
+            raise ProspectiveConfirmationError(
+                "prospective confirmation protocol v2 must be strict bounded JSON"
+            ) from exc
+        _exact_fields(
+            frozen, required=_PROTOCOL_V2_FIELDS, name="prospective_confirmation_protocol_v2"
+        )
+        candidate = frozen["candidate"]
+        source_batch = frozen["source_batch"]
+        if not isinstance(candidate, Mapping) or not isinstance(source_batch, Mapping):
+            raise ProspectiveConfirmationError("protocol nested objects are malformed")
+        _exact_fields(
+            candidate,
+            required=frozenset({"symbol", "action", "pattern", "horizon"}),
+            name="candidate",
+        )
+        _exact_fields(
+            source_batch,
+            required=frozenset(
+                {"dataset_description", "discovery_row_count", "sibling_protocol_semantic_identity"}
+            ),
+            name="source_batch",
+        )
+        built = cls(
+            schema_version=frozen["schema_version"],
+            protocol_kind=frozen["protocol_kind"],
+            symbol=candidate["symbol"],
+            action=candidate["action"],
+            pattern=candidate["pattern"],
+            horizon=candidate["horizon"],
+            cutoff_time=frozen["cutoff_time"],
+            minimum_sample=frozen["minimum_sample"],
+            primary_metric=frozen["primary_metric"],
+            sample_criterion=EvaluationCriterionV1.from_payload(frozen["sample_criterion"]),
+            success_criterion=EvaluationCriterionV1.from_payload(frozen["success_criterion"]),
+            source_dataset_description=source_batch["dataset_description"],
+            source_discovery_row_count=source_batch["discovery_row_count"],
+            sibling_protocol_semantic_identity=source_batch["sibling_protocol_semantic_identity"],
+            code_provenance=CodeProvenance.from_payload(frozen["code_provenance"]),
+            diagnostics=ProspectiveConfirmationDiagnostics.from_payload(frozen["diagnostics"]),
+        )
+        if built.protocol_semantic_identity != frozen["protocol_semantic_identity"]:
+            raise ProspectiveConfirmationError(
+                "prospective confirmation protocol semantic identity does not match its "
+                "semantic projection"
+            )
+        return built
+
+
+def build_prospective_confirmation_protocol_v2(
+    *,
+    symbol: str,
+    horizon: int,
+    cutoff_time: str,
+    minimum_sample: int,
+    primary_metric: str,
+    source_dataset_description: str,
+    source_discovery_row_count: int,
+    sibling_protocol_semantic_identity: str,
+    code_provenance: CodeProvenance,
+    created_at: str,
+    created_by: str,
+    action: str | None = None,
+    pattern: str | None = None,
+) -> ProspectiveConfirmationProtocolV2:
+    """Build one immutable V2 protocol with the frozen rule (see V1's builder)."""
+    return ProspectiveConfirmationProtocolV2(
+        symbol=symbol,
+        action=action,
+        pattern=pattern,
+        horizon=horizon,
+        cutoff_time=cutoff_time,
+        minimum_sample=minimum_sample,
+        primary_metric=primary_metric,
+        sample_criterion=EvaluationCriterionV1(
+            metric="trades",
+            operator=CriterionOperator.GREATER_THAN_OR_EQUAL,
+            threshold=minimum_sample,
+        ),
+        success_criterion=EvaluationCriterionV1(
+            metric=primary_metric,
+            operator=CriterionOperator.GREATER_THAN_OR_EQUAL,
+            threshold=0.0,
+        ),
+        source_dataset_description=source_dataset_description,
+        source_discovery_row_count=source_discovery_row_count,
+        sibling_protocol_semantic_identity=sibling_protocol_semantic_identity,
+        code_provenance=code_provenance,
+        diagnostics=ProspectiveConfirmationDiagnostics(created_at=created_at, created_by=created_by),
+    )
+
+
+def persist_prospective_confirmation_protocol_v2(
+    protocol: ProspectiveConfirmationProtocolV2,
+    *,
+    artifact_store: ArtifactStore,
+) -> ArtifactRef:
+    """Persist exact canonical protocol bytes under Verified CAS."""
+    if type(protocol) is not ProspectiveConfirmationProtocolV2:
+        raise ProspectiveConfirmationError("protocol must be ProspectiveConfirmationProtocolV2")
+    exact_bytes = protocol.canonical_bytes()
+    artifact = artifact_store.import_snapshot(
+        io.BytesIO(exact_bytes),
+        media_type=PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_MEDIA_TYPE,
+    )
+    if artifact.hash_ref != sha256_bytes(exact_bytes):
+        raise ProspectiveConfirmationPersistenceError(
+            "Verified CAS returned an unexpected prospective confirmation protocol hash"
+        )
+    return artifact
+
+
+def verify_prospective_confirmation_protocol_v2(
+    encoded: str | bytes,
+) -> ProspectiveConfirmationProtocolV2:
+    """Verify strict canonical wire bytes and the recomputed semantic identity."""
+    if type(encoded) is bytes:
+        exact_bytes = encoded
+    elif type(encoded) is str:
+        try:
+            exact_bytes = encoded.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ProspectiveConfirmationError(
+                "prospective confirmation protocol v2 must be valid UTF-8"
+            ) from exc
+    else:
+        raise ProspectiveConfirmationError(
+            "prospective confirmation protocol v2 wire payload must be exact str or bytes"
+        )
+    try:
+        parsed = parse_json(exact_bytes)
+    except ProvenanceError as exc:
+        raise ProspectiveConfirmationError(
+            f"prospective confirmation protocol v2 wire payload is invalid: {exc}"
+        ) from exc
+    if not isinstance(parsed, Mapping):
+        raise ProspectiveConfirmationError(
+            "prospective confirmation protocol v2 root must be a JSON object"
+        )
+    if canonical_json_bytes(parsed) != exact_bytes:
+        raise ProspectiveConfirmationError(
+            "prospective confirmation protocol v2 wire payload must use canonical JSON bytes"
+        )
+    return ProspectiveConfirmationProtocolV2.from_payload(parsed)
+
+
+def load_prospective_confirmation_protocol_v2(
+    artifact_hash_ref: str,
+    *,
+    artifact_store: ArtifactStore,
+) -> ProspectiveConfirmationProtocolV2:
+    """Load exact CAS bytes and reverify semantic identity. Self-contained."""
+    artifact = artifact_store.resolve_verified(
+        artifact_hash_ref, expected_media_type=PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_MEDIA_TYPE
+    )
+    exact_bytes = artifact_store.read_verified(
+        artifact_hash_ref, expected_media_type=PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_MEDIA_TYPE
+    )
+    if artifact.hash_ref != sha256_bytes(exact_bytes):
+        raise ProspectiveConfirmationPersistenceError(
+            "Verified CAS prospective confirmation protocol identity mismatch"
+        )
+    return verify_prospective_confirmation_protocol_v2(exact_bytes)
+
+
+def evaluate_prospective_snapshot_v2(
+    protocol: ProspectiveConfirmationProtocolV2,
+    rows: Sequence[Mapping[str, str]],
+) -> ProspectiveEvaluationResult:
+    """Score a future journal snapshot against a frozen V2 protocol.
+
+    Identical cutoff/symbol discipline to ``evaluate_prospective_snapshot``,
+    plus an optional action filter and an optional SMC event-pattern filter
+    (reusing ``trademind.smc_stats._event_groups`` unchanged). Pure and
+    deterministic.
+    """
+    if type(protocol) is not ProspectiveConfirmationProtocolV2:
+        raise ProspectiveConfirmationError("protocol must be ProspectiveConfirmationProtocolV2")
+    cutoff = datetime.fromisoformat(protocol.cutoff_time)
+
+    candidate_rows: list[dict[str, str]] = []
+    for row in rows:
+        raw_time = (row.get("signal_time") or "").strip()
+        if not raw_time:
+            raise ProspectiveConfirmationError("snapshot row has an empty signal_time")
+        try:
+            parsed = datetime.fromisoformat(raw_time)
+        except ValueError as exc:
+            raise ProspectiveConfirmationError(
+                f"snapshot row signal_time is not a valid ISO timestamp: {raw_time!r}"
+            ) from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ProspectiveConfirmationError("snapshot row signal_time must be timezone-aware")
+        parsed = parsed.astimezone(timezone.utc)
+        if parsed <= cutoff:
+            continue
+        if (row.get("symbol") or "").strip().upper() != protocol.symbol.upper():
+            continue
+        if protocol.action is not None and row.get("action") != protocol.action:
+            continue
+        candidate_rows.append(dict(row))
+
+    if protocol.pattern is not None:
+        groups = _event_groups(candidate_rows)
+        eligible = groups.get(protocol.pattern, [])
+    else:
+        eligible = candidate_rows
+
+    result = validate_rows(
+        eligible,
+        protocol.horizon,
+        candidate_minimum=protocol.minimum_sample,
+        research_minimum=protocol.minimum_sample,
+    )
+    trades = int(result.total.trades)
+    observed = ObservedMetricsV1(
+        primary_metric=protocol.primary_metric,
+        values={"trades": float(trades), protocol.primary_metric: float(result.total.avg_net_atr)},
+    )
+    decision = evaluate_criteria(
+        EvaluationCriteriaV1(
+            mode=CriteriaMode.ALL, criteria=(protocol.sample_criterion, protocol.success_criterion)
+        ),
+        observed,
+    )
+    sample_evaluation = next(e for e in decision.evaluations if e.metric == "trades")
+    if not sample_evaluation.passed:
+        outcome = ProspectiveOutcome.WAITING_FOR_DATA
+    elif decision.passed:
+        outcome = ProspectiveOutcome.PASS
+    else:
+        outcome = ProspectiveOutcome.FAIL
+
+    return ProspectiveEvaluationResult(
+        outcome=outcome,
+        completed_non_overlapping_trades=trades,
+        avg_net_atr=result.total.avg_net_atr,
+        win_rate=result.total.win_rate,
+        eligible_rows_considered=len(eligible),
+    )
+
+
+def evaluate_prospective_snapshot_v2_csv(
+    protocol: ProspectiveConfirmationProtocolV2,
+    snapshot_path: str | Path,
+) -> ProspectiveEvaluationResult:
+    """Convenience I/O wrapper: read a journal-schema CSV, then evaluate it."""
+    with Path(snapshot_path).open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    return evaluate_prospective_snapshot_v2(protocol, rows)
+
+
 __all__ = [
     "PROSPECTIVE_CONFIRMATION_PROTOCOL_V1_MEDIA_TYPE",
     "PROSPECTIVE_CONFIRMATION_PROTOCOL_V1_SCHEMA_VERSION",
+    "PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_MEDIA_TYPE",
+    "PROSPECTIVE_CONFIRMATION_PROTOCOL_V2_SCHEMA_VERSION",
     "PROTOCOL_KIND",
+    "PROTOCOL_V2_KIND",
     "ProspectiveConfirmationDiagnostics",
     "ProspectiveConfirmationError",
     "ProspectiveConfirmationPersistenceError",
     "ProspectiveConfirmationProtocolV1",
+    "ProspectiveConfirmationProtocolV2",
     "ProspectiveEvaluationResult",
     "ProspectiveOutcome",
     "build_prospective_confirmation_protocol_v1",
+    "build_prospective_confirmation_protocol_v2",
     "evaluate_prospective_snapshot",
     "evaluate_prospective_snapshot_csv",
+    "evaluate_prospective_snapshot_v2",
+    "evaluate_prospective_snapshot_v2_csv",
     "load_prospective_confirmation_protocol_v1",
+    "load_prospective_confirmation_protocol_v2",
     "persist_prospective_confirmation_protocol_v1",
+    "persist_prospective_confirmation_protocol_v2",
     "verify_prospective_confirmation_protocol_v1",
+    "verify_prospective_confirmation_protocol_v2",
 ]
