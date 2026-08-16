@@ -31,6 +31,20 @@ snapshot (never writes to it) and reshapes each protocol's
 The monitor is observational only: it never opens, closes, or amends a
 trade, never contacts a broker, and never calls a model/provider. Nothing
 in this module performs a network request.
+
+The authoritative live source is the ECN live-signal-runtime observations
+file (SER8: ``data\\live_signal_runtime_ecn_77053345\\observations.csv``).
+Its ``_OBSERVATION_FIELDS`` schema (``trademind.fx_research``) already uses
+the exact column names the frozen candidates and ``trademind.validation``/
+``trademind.smc_stats`` need -- ``signal_time``, ``symbol``, ``timeframe``,
+``action``, ``atr``, ``fvg_direction``, ``net_move_12``, ``progress_atr_12``,
+``outcome_12`` -- so no field renaming or reshaping is needed; ``--journal``
+accepts this file directly. ``read_journal_snapshot`` fails closed
+(``LiveObservationsSchemaError``) if a snapshot -- this file or any other --
+is missing a column the three frozen H12 candidates require, rather than
+silently scoring it as zero eligible rows. The legacy
+``data/journal_ecn/signals.csv`` writer is not used by this module and is
+not read unless explicitly passed via ``--journal``.
 """
 
 from __future__ import annotations
@@ -188,17 +202,55 @@ _CANDIDATES: tuple[
 )
 
 
+class LiveObservationsSchemaError(ValueError):
+    """Raised when a snapshot CSV is missing a column the three frozen H12
+    candidates require. Fails closed: an incompatible or corrupted source
+    file is refused outright rather than silently evaluated as zero
+    eligible rows for whichever candidate happened to need the missing
+    field."""
+
+
+# The exact columns the three frozen candidates and the reused
+# validate_rows/_event_groups machinery read for horizon=12, and nothing
+# else -- this is the "map only fields required by existing prospective
+# evaluator" contract, not a full copy of ``trademind.fx_research``'s
+# _OBSERVATION_FIELDS schema (which the live observations.csv also has, but
+# whose other ~60 columns none of these three candidates ever touch).
+LIVE_OBSERVATIONS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "signal_time",
+    "symbol",
+    "timeframe",
+    "action",
+    "atr",
+    "fvg_direction",
+    "net_move_12",
+    "outcome_12",
+)
+
+
 def read_journal_snapshot(journal_path: str | Path) -> list[dict[str, str]]:
-    """Read-only ingest of a journal-schema CSV snapshot.
+    """Read-only ingest of a journal/observations-schema CSV snapshot.
 
     Opens the source file strictly for reading ("r") and never writes to
     it, appends to it, or otherwise mutates it -- the growing MT5 journal
-    on disk is treated as read-only input, exactly like every existing
-    ``evaluate_prospective_snapshot*_csv`` convenience wrapper already does.
+    or live ECN observations file on disk is treated as read-only input,
+    exactly like every existing ``evaluate_prospective_snapshot*_csv``
+    convenience wrapper already does.
+
+    Fails closed with ``LiveObservationsSchemaError`` if the CSV header is
+    missing any of ``LIVE_OBSERVATIONS_REQUIRED_COLUMNS`` -- an empty or
+    unreadable header included -- before any row is evaluated.
     """
     path = Path(journal_path)
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        return [dict(row) for row in csv.DictReader(handle)]
+        reader = csv.DictReader(handle)
+        header = reader.fieldnames or ()
+        missing = [column for column in LIVE_OBSERVATIONS_REQUIRED_COLUMNS if column not in header]
+        if missing:
+            raise LiveObservationsSchemaError(
+                f"{path} is missing required column(s): {', '.join(missing)}"
+            )
+        return [dict(row) for row in reader]
 
 
 def evaluate_candidate(
@@ -259,8 +311,10 @@ def main(argv: list[str] | None = None) -> int:
         "--journal",
         type=Path,
         default=default_journal,
-        help="Path to the live MT5 signal journal CSV snapshot (read-only). "
-        "Defaults to $TRADEMIND_JOURNAL_DIR/signals.csv, or data/journal_ecn/signals.csv.",
+        help="Path to a journal- or live-ECN-observations-schema CSV snapshot "
+        "(read-only), e.g. data/live_signal_runtime_ecn_77053345/observations.csv "
+        "on SER8. Defaults to $TRADEMIND_JOURNAL_DIR/signals.csv, or "
+        "data/journal_ecn/signals.csv.",
     )
     args = parser.parse_args(argv)
 
