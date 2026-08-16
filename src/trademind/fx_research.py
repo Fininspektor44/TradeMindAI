@@ -30,6 +30,30 @@ FX_MAJORS = (
     "AUDUSD",
     "NZDUSD",
 )
+
+# The three frozen prospective-confirmation candidates (see
+# trademind.mt5_prospective_monitor / trademind.prospective_confirmation):
+# .USTECHCASH SELL H12, .US30CASH BULLISH_FVG H12, XAGUSD SELL BEARISH_FVG
+# H12. Exact requested symbols only -- no alias/remapping is performed here
+# or anywhere downstream; the live MT5 ECN exporter (mt5/TradeMindAI_ECN_
+# UniversalVolumeExporter_v1_9_4.mq5, InpCanonicalSymbols) already lists
+# these instruments, so this is purely a Python-side observation-collection
+# gate being widened to match what the exporter already provides.
+FROZEN_PROSPECTIVE_SYMBOLS = (
+    ".USTECHCASH",
+    ".US30CASH",
+    "XAGUSD",
+)
+assert not set(FX_MAJORS) & set(FROZEN_PROSPECTIVE_SYMBOLS), (
+    "FROZEN_PROSPECTIVE_SYMBOLS must stay disjoint from FX_MAJORS"
+)
+
+# The live symbol universe actually collected into observations.csv.
+# Additive on top of FX_MAJORS: FX_MAJORS itself is never mutated (it keeps
+# meaning exactly "the seven FX majors" wherever else it's read), and this
+# is the only place the observation-collection gates below are widened.
+LIVE_OBSERVATION_SYMBOLS = FX_MAJORS + FROZEN_PROSPECTIVE_SYMBOLS
+
 HORIZONS = (3, 6, 12)
 _VALID_OUTCOMES = {"WIN", "LOSS", "FLAT"}
 
@@ -220,7 +244,9 @@ def _utc_time(epoch_seconds: int, server_utc_offset_hours: int) -> datetime:
 
 
 def load_volume_rows(path: Path) -> tuple[list[dict[str, str]], int]:
-    """Load canonical v1.4 rows and keep only healthy M5 FX-major observations."""
+    """Load canonical v1.4 rows and keep only healthy M5 rows for the live
+    observation symbol universe (FX majors plus the frozen prospective
+    candidates; see ``LIVE_OBSERVATION_SYMBOLS``)."""
     rows: list[dict[str, str]] = []
     source_rows = 0
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -228,7 +254,7 @@ def load_volume_rows(path: Path) -> tuple[list[dict[str, str]], int]:
             source_rows += 1
             row = {key: str(value or "").strip() for key, value in dict(raw).items()}
             symbol = row.get("symbol", "").upper()
-            if symbol not in FX_MAJORS:
+            if symbol not in LIVE_OBSERVATION_SYMBOLS:
                 continue
             if row.get("timeframe", "").upper() != "M5":
                 continue
@@ -250,6 +276,28 @@ def load_volume_rows(path: Path) -> tuple[list[dict[str, str]], int]:
             rows.append(row)
     rows.sort(key=lambda item: (item["symbol"], _integer(item, "time")))
     return rows, source_rows
+
+
+def observed_symbols(path: Path) -> set[str]:
+    """Every distinct uppercased ``symbol`` value present anywhere in the
+    raw canonical volume export, independent of ``LIVE_OBSERVATION_SYMBOLS``,
+    timeframe, or freshness filtering.
+
+    This answers one narrow question: did MT5 (via the exporter) expose an
+    exact row for this symbol string at all in this run? Used only for
+    read-only status reporting -- e.g. to explicitly surface a requested
+    frozen prospective symbol MT5 did not expose under that exact name,
+    rather than letting it silently disappear inside ``load_volume_rows``'s
+    stricter filter.
+    """
+    if not path.is_file():
+        return set()
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return {
+            symbol
+            for raw in csv.DictReader(handle)
+            if (symbol := str(raw.get("symbol") or "").strip().upper())
+        }
 
 
 def _candle(row: dict[str, str], server_utc_offset_hours: int) -> Candle:
@@ -398,10 +446,12 @@ def build_fx_observations(
     *,
     server_utc_offset_hours: int = 0,
 ) -> list[dict[str, str]]:
-    """Build deterministic, research-only FX observations from canonical volume bars."""
+    """Build deterministic, research-only observations from canonical volume
+    bars, for the live observation symbol universe (FX majors plus the
+    frozen prospective candidates; see ``LIVE_OBSERVATION_SYMBOLS``)."""
     by_symbol: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in volume_rows:
-        if row.get("symbol", "").upper() in FX_MAJORS:
+        if row.get("symbol", "").upper() in LIVE_OBSERVATION_SYMBOLS:
             by_symbol[row["symbol"].upper()].append(row)
 
     signal_engine = SignalEngine()
@@ -409,7 +459,7 @@ def build_fx_observations(
     minimum = max(signal_engine.minimum_candles, structure_engine.minimum_candles)
     output: list[dict[str, str]] = []
 
-    for symbol in FX_MAJORS:
+    for symbol in LIVE_OBSERVATION_SYMBOLS:
         rows = sorted(by_symbol.get(symbol, []), key=lambda item: _integer(item, "time"))
         candles = [_candle(row, server_utc_offset_hours) for row in rows]
         for index in range(minimum - 1, len(rows)):

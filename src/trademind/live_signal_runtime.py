@@ -27,10 +27,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from trademind.fx_research import (
-    FX_MAJORS,
+    FROZEN_PROSPECTIVE_SYMBOLS,
+    LIVE_OBSERVATION_SYMBOLS,
     _OBSERVATION_FIELDS,
     build_fx_observations,
     load_volume_rows,
+    observed_symbols,
     session_for_time,
 )
 from trademind.fx_signal_adapter import build_candidates
@@ -113,14 +115,16 @@ def closed_volume_rows(
     server_utc_offset_hours: int,
     close_grace_seconds: float,
 ) -> list[dict[str, str]]:
-    """Return only healthy bars whose close is safely in the past."""
+    """Return only healthy bars whose close is safely in the past, for the
+    live observation symbol universe (FX majors plus the frozen prospective
+    candidates; see ``trademind.fx_research.LIVE_OBSERVATION_SYMBOLS``)."""
     if close_grace_seconds < 0:
         raise ValueError("close_grace_seconds cannot be negative")
     cutoff = now.astimezone(timezone.utc) - timedelta(seconds=close_grace_seconds)
     closed: list[dict[str, str]] = []
     for source in rows:
         row = dict(source)
-        if row.get("symbol", "").upper() not in FX_MAJORS:
+        if row.get("symbol", "").upper() not in LIVE_OBSERVATION_SYMBOLS:
             continue
         if row.get("timeframe", "").upper() != "M5":
             continue
@@ -447,6 +451,14 @@ def run_live_runtime(
         volume_source_dir,
         canonical_volume_path,
     )
+    # Explicitly surface any frozen prospective symbol MT5 did not expose
+    # under its exact requested name this run, rather than letting it
+    # silently vanish inside load_volume_rows'/closed_volume_rows' stricter
+    # (symbol+timeframe+freshness) filters below.
+    available_symbols = observed_symbols(canonical_volume_path)
+    missing_frozen_prospective_symbols = [
+        symbol for symbol in FROZEN_PROSPECTIVE_SYMBOLS if symbol not in available_symbols
+    ]
     volume_rows, _ = load_volume_rows(canonical_volume_path)
     closed_rows = closed_volume_rows(
         volume_rows,
@@ -561,6 +573,10 @@ def run_live_runtime(
         "closed_fx_m5_rows": len(closed_rows),
         "latest_closed_bar_at": _iso(latest_close) if latest_close else None,
         "new_closed_bar_detected": has_new_bar,
+        "frozen_prospective_symbol_coverage": {
+            "requested": list(FROZEN_PROSPECTIVE_SYMBOLS),
+            "missing": missing_frozen_prospective_symbols,
+        },
         "new_observations": new_observation_count,
         "new_candidates": new_candidate_count,
         "candidate_rows_rejected": rejected_candidate_rows,
