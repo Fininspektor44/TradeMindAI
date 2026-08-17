@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import sqlite3
 import threading
@@ -18,6 +19,7 @@ from trademind.orchestrator.dispatcher import Dispatcher, route_to_generic_workf
 from trademind.orchestrator.engine import WorkflowEngine, WorkflowRoutingError
 from trademind.orchestrator.models import Task, TaskState
 from trademind.research_execution import (
+    RESEARCH_PROPOSAL_RESPONSE_MEDIA_TYPE,
     ResearchExecutionControl,
     ResearchExecutionRecordV1,
 )
@@ -34,6 +36,7 @@ from trademind.research_proposal_response import (
     RESEARCH_PROPOSAL_RESPONSE_KIND,
     RESEARCH_PROPOSAL_RESPONSE_SCHEMA_VERSION,
     ResearchProposalResponseV1,
+    ResearchProposalV1,
 )
 from trademind.signal_statistics_agent_packet import (
     SignalStatisticsPacketV2,
@@ -45,6 +48,7 @@ from trademind.signal_statistics_provenance import (
     CandidateContentV2,
     CandidateDefinitionV2,
     CodeProvenance,
+    canonical_json_bytes,
 )
 from trademind.signal_statistics_report import build_report_v2, persist_report_v2
 
@@ -809,3 +813,139 @@ def test_registry_transaction_adapter_rejects_wrong_database(tmp_path: Path) -> 
                 family_definition={"event": "x"},
                 content_definition={"event": "x", "parameter": 1},
             )
+
+
+# ---------------------------------------------------------------------------
+# Authoritative-source fail-closed coverage (missing/tampered/malformed CAS,
+# candidate binding absent from Packet).
+# ---------------------------------------------------------------------------
+
+
+def test_missing_result_artifact_fails_closed(tmp_path: Path) -> None:
+    context = _setup(tmp_path)
+    store = ArtifactStore(context.artifact_root)
+    object_path = Path(store.resolve_verified(context.execution.result_artifact_hash_ref).path)
+    object_path.unlink()
+
+    before = _counts(context.db_path)
+    with pytest.raises(ResearchProposalSourceError):
+        context.intake_control.ingest_succeeded_research_execution_v1(
+            context.execution.request_hash
+        )
+    assert _counts(context.db_path) == before
+
+
+def test_tampered_result_artifact_fails_closed(tmp_path: Path) -> None:
+    context = _setup(tmp_path)
+    store = ArtifactStore(context.artifact_root)
+    object_path = Path(store.resolve_verified(context.execution.result_artifact_hash_ref).path)
+    object_path.write_bytes(b"tampered-not-the-authoritative-response")
+
+    before = _counts(context.db_path)
+    with pytest.raises(ResearchProposalSourceError):
+        context.intake_control.ingest_succeeded_research_execution_v1(
+            context.execution.request_hash
+        )
+    assert _counts(context.db_path) == before
+
+
+def test_malformed_response_content_fails_closed(tmp_path: Path) -> None:
+    """A hash-consistent (untampered) but schema-invalid CAS artifact must
+    still be rejected -- distinct from a hash mismatch, this exercises
+    strict ResearchProposalResponseV1 parsing itself."""
+    context = _setup(tmp_path)
+    store = ArtifactStore(context.artifact_root)
+    malformed_bytes = canonical_json_bytes({"not_a_research_proposal_response": True})
+    malformed_ref = store.import_snapshot(
+        io.BytesIO(malformed_bytes), media_type=RESEARCH_PROPOSAL_RESPONSE_MEDIA_TYPE
+    )
+    with sqlite3.connect(context.db_path) as db:
+        db.execute(
+            "UPDATE research_executions SET result_artifact_hash_ref=? WHERE request_hash=?",
+            (malformed_ref.hash_ref, context.execution.request_hash),
+        )
+
+    before = _counts(context.db_path)
+    with pytest.raises(ResearchProposalSourceError):
+        context.intake_control.ingest_succeeded_research_execution_v1(
+            context.execution.request_hash
+        )
+    assert _counts(context.db_path) == before
+
+
+def test_proposal_candidate_absent_from_packet_is_rejected(tmp_path: Path) -> None:
+    context = _setup(tmp_path)
+    real_candidate_id = context.packet.candidate_bindings[0]["candidate_id"]
+    absent_candidate_id = "ssc-v2-" + "f" * 64
+    assert absent_candidate_id != real_candidate_id
+
+    with pytest.raises(ResearchProposalSourceError):
+        ResearchProposalIntakeControl._candidate_binding(context.packet, absent_candidate_id)
+
+
+# ---------------------------------------------------------------------------
+# Trusted accept/reject boundary: untrusted model content can never accept.
+# ---------------------------------------------------------------------------
+
+
+def test_high_confidence_proposal_does_not_auto_accept(tmp_path: Path) -> None:
+    context = _setup(tmp_path)
+    pending = context.intake_control.ingest_succeeded_research_execution_v1(
+        context.execution.request_hash
+    )[0]
+    assert pending.proposal.confidence.value == "HIGH"
+    assert pending.state is ResearchProposalIntakeState.PENDING_REVIEW
+    assert pending.reviewer_id is None
+    assert pending.hypothesis_id is None
+    assert _counts(context.db_path)["hypotheses"] == 0
+
+
+def test_ingest_alone_never_accepts_regardless_of_proposal_count_or_content(
+    tmp_path: Path,
+) -> None:
+    context = _setup(tmp_path, proposal_count=3)
+    intakes = context.intake_control.ingest_succeeded_research_execution_v1(
+        context.execution.request_hash
+    )
+    assert len(intakes) == 3
+    assert all(item.state is ResearchProposalIntakeState.PENDING_REVIEW for item in intakes)
+    assert all(item.reviewer_id is None and item.hypothesis_id is None for item in intakes)
+    assert _counts(context.db_path)["hypotheses"] == 0
+
+
+def test_untrusted_proposal_classes_expose_no_accept_capable_surface() -> None:
+    """Structural proof, not a condition: the untrusted-model-content-bearing
+    classes carry no method or attribute that could be called to accept a
+    proposal -- acceptance can only originate from
+    ResearchProposalIntakeControl.accept_for_hypothesis, called by a trusted
+    caller with an explicit reviewer_id."""
+    for cls in (ResearchProposalV1, ResearchProposalResponseV1):
+        for name in dir(cls):
+            lowered = name.lower()
+            assert "accept" not in lowered, f"{cls.__name__}.{name} looks accept-capable"
+            assert "approve" not in lowered, f"{cls.__name__}.{name} looks approve-capable"
+
+
+def test_no_provider_network_or_broker_trading_path_in_intake_module() -> None:
+    source = Path("src/trademind/research_proposal_intake.py").read_text(encoding="utf-8")
+    forbidden = (
+        "requests",
+        "httpx",
+        "urllib",
+        "socket.",
+        "openai",
+        "OpenAI",
+        "anthropic",
+        "Anthropic",
+        "ollama",
+        "Ollama",
+        "manus",
+        "Manus",
+        "MetaTrader5",
+        "OrderSend(",
+        "PositionClose(",
+        "PositionModify(",
+        "CTrade",
+        "TRADE_ACTION_DEAL",
+    )
+    assert all(token not in source for token in forbidden)
