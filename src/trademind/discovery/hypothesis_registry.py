@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from trademind.orchestrator.artifact_store import ArtifactStore
+
+    from .manifest import ExperimentManifestV2
 
 
 class RegistryError(RuntimeError):
@@ -99,6 +104,14 @@ class HypothesisRecord:
     state: HypothesisState
     created_at: str
     updated_at: str
+    manifest_artifact_hash_ref: str | None = None
+    manifest_schema_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ManifestV2FreezeResult:
+    record: HypothesisRecord
+    created: bool
 
 
 class HypothesisRegistry:
@@ -143,6 +156,8 @@ class HypothesisRegistry:
                     content_hash TEXT NOT NULL UNIQUE,
                     content_definition_json TEXT NOT NULL,
                     manifest_hash TEXT,
+                    manifest_artifact_hash_ref TEXT,
+                    manifest_schema_version TEXT,
                     state TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -161,6 +176,10 @@ class HypothesisRegistry:
             }
             if "content_definition_json" not in hypothesis_columns:
                 db.execute("ALTER TABLE hypotheses ADD COLUMN content_definition_json TEXT")
+            if "manifest_artifact_hash_ref" not in hypothesis_columns:
+                db.execute("ALTER TABLE hypotheses ADD COLUMN manifest_artifact_hash_ref TEXT")
+            if "manifest_schema_version" not in hypothesis_columns:
+                db.execute("ALTER TABLE hypotheses ADD COLUMN manifest_schema_version TEXT")
 
     @staticmethod
     def _validate_nonempty(value: str, label: str) -> str:
@@ -301,6 +320,29 @@ class HypothesisRegistry:
 
     @staticmethod
     def _row(row: sqlite3.Row) -> HypothesisRecord:
+        from .manifest import EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION
+
+        artifact_hash_ref = row["manifest_artifact_hash_ref"]
+        manifest_schema_version = row["manifest_schema_version"]
+        if (artifact_hash_ref is None) != (manifest_schema_version is None):
+            raise RegistryError("persisted manifest v2 binding is incomplete")
+        if artifact_hash_ref is not None:
+            if (
+                type(artifact_hash_ref) is not str
+                or len(artifact_hash_ref) != 71
+                or not artifact_hash_ref.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in artifact_hash_ref[7:])
+            ):
+                raise RegistryError("persisted manifest artifact hash ref is invalid")
+            if manifest_schema_version != EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION:
+                raise RegistryError("persisted manifest schema version is unsupported")
+            manifest_hash = row["manifest_hash"]
+            if (
+                type(manifest_hash) is not str
+                or len(manifest_hash) != 64
+                or any(character not in "0123456789abcdef" for character in manifest_hash)
+            ):
+                raise RegistryError("persisted manifest semantic hash is invalid")
         return HypothesisRecord(
             hypothesis_id=row["hypothesis_id"],
             hypothesis_family_id=row["family_id"],
@@ -309,6 +351,8 @@ class HypothesisRegistry:
             state=HypothesisState(row["state"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            manifest_artifact_hash_ref=artifact_hash_ref,
+            manifest_schema_version=manifest_schema_version,
         )
 
     def get(self, hypothesis_id: str) -> HypothesisRecord:
@@ -328,6 +372,154 @@ class HypothesisRegistry:
             HypothesisState.FROZEN,
             manifest_hash=manifest_hash,
         )
+
+    def freeze_manifest_v2_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        *,
+        manifest_artifact_hash_ref: str,
+        artifact_store: ArtifactStore,
+    ) -> ManifestV2FreezeResult:
+        """Atomically bind one verified V2 CAS manifest and freeze its hypothesis.
+
+        The caller owns and commits or rolls back ``db`` and may append audit rows
+        in the same transaction. This primitive performs no audit by itself. A
+        retry with the same scientific identity is inert and reports
+        ``created=False`` so the future trusted creation layer can avoid duplicate
+        audit. The first exact CAS artifact wins when diagnostic-only bytes differ.
+        """
+        from .manifest import (
+            EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION,
+            load_experiment_manifest_v2,
+        )
+
+        self._validate_transaction_connection(db)
+        manifest = load_experiment_manifest_v2(
+            manifest_artifact_hash_ref,
+            artifact_store=artifact_store,
+        )
+        row = db.execute(
+            "SELECT * FROM hypotheses WHERE hypothesis_id=?",
+            (manifest.hypothesis_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(manifest.hypothesis_id)
+        if row["family_id"] != manifest.hypothesis_family_id:
+            raise RegistryError("manifest v2 family identity does not match registry")
+        if row["content_hash"] != manifest.bound_hypothesis_content_hash:
+            raise RegistryError("manifest v2 content identity does not match registry")
+
+        semantic_digest = manifest.manifest_semantic_hash.removeprefix("sha256:")
+        current = HypothesisState(row["state"])
+        if current is HypothesisState.FROZEN:
+            existing = self._row(row)
+            if (
+                existing.manifest_hash != semantic_digest
+                or existing.manifest_schema_version != EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION
+                or existing.manifest_artifact_hash_ref is None
+            ):
+                raise RegistryError("hypothesis is frozen to a conflicting manifest")
+            existing_manifest = load_experiment_manifest_v2(
+                existing.manifest_artifact_hash_ref,
+                artifact_store=artifact_store,
+            )
+            if (
+                existing_manifest.manifest_semantic_hash != manifest.manifest_semantic_hash
+                or existing_manifest.hypothesis_id != manifest.hypothesis_id
+                or existing_manifest.hypothesis_family_id != manifest.hypothesis_family_id
+                or existing_manifest.bound_hypothesis_content_hash
+                != manifest.bound_hypothesis_content_hash
+            ):
+                raise RegistryError("persisted manifest v2 binding is inconsistent")
+            return ManifestV2FreezeResult(record=existing, created=False)
+        if current is not HypothesisState.PROPOSED:
+            raise RegistryError(f"illegal transition {current.value} -> FROZEN")
+        if (
+            row["manifest_hash"] is not None
+            or row["manifest_artifact_hash_ref"] is not None
+            or row["manifest_schema_version"] is not None
+        ):
+            raise RegistryError("PROPOSED hypothesis contains a stale manifest binding")
+
+        family = db.execute(
+            "SELECT * FROM hypothesis_families WHERE family_id=?",
+            (row["family_id"],),
+        ).fetchone()
+        if family is None:
+            raise RegistryError("family registry row is missing")
+        if int(family["holdout_consumed"]):
+            raise RegistryError("hypothesis family has already consumed final holdout")
+        if family["terminal_state"]:
+            raise RegistryError(f"hypothesis family is terminal: {family['terminal_state']}")
+
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = db.execute(
+            """
+            UPDATE hypotheses
+            SET state=?, manifest_hash=?, manifest_artifact_hash_ref=?,
+                manifest_schema_version=?, updated_at=?
+            WHERE hypothesis_id=? AND state=? AND manifest_hash IS NULL
+                AND manifest_artifact_hash_ref IS NULL AND manifest_schema_version IS NULL
+            """,
+            (
+                HypothesisState.FROZEN.value,
+                semantic_digest,
+                manifest_artifact_hash_ref,
+                EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION,
+                now,
+                manifest.hypothesis_id,
+                HypothesisState.PROPOSED.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise RegistryError("hypothesis manifest binding changed concurrently")
+        family_cursor = db.execute(
+            "UPDATE hypothesis_families SET updated_at=? WHERE family_id=?",
+            (now, row["family_id"]),
+        )
+        if family_cursor.rowcount != 1:
+            raise RegistryError("hypothesis family disappeared during manifest binding")
+        updated = db.execute(
+            "SELECT * FROM hypotheses WHERE hypothesis_id=?",
+            (manifest.hypothesis_id,),
+        ).fetchone()
+        if updated is None:
+            raise RegistryError("frozen hypothesis disappeared")
+        return ManifestV2FreezeResult(record=self._row(updated), created=True)
+
+    def load_bound_manifest_v2(
+        self,
+        hypothesis_id: str,
+        *,
+        artifact_store: ArtifactStore,
+    ) -> ExperimentManifestV2:
+        """Load and reverify the exact V2 CAS object bound to a frozen hypothesis."""
+        from .manifest import (
+            EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION,
+            load_experiment_manifest_v2,
+        )
+
+        record = self.get(hypothesis_id)
+        if record.state is not HypothesisState.FROZEN:
+            raise RegistryError("hypothesis must be FROZEN before loading manifest v2")
+        if (
+            record.manifest_hash is None
+            or record.manifest_artifact_hash_ref is None
+            or record.manifest_schema_version != EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION
+        ):
+            raise RegistryError("hypothesis has no complete manifest v2 binding")
+        manifest = load_experiment_manifest_v2(
+            record.manifest_artifact_hash_ref,
+            artifact_store=artifact_store,
+        )
+        if (
+            manifest.hypothesis_id != record.hypothesis_id
+            or manifest.hypothesis_family_id != record.hypothesis_family_id
+            or manifest.bound_hypothesis_content_hash != record.content_hash
+            or manifest.manifest_semantic_hash.removeprefix("sha256:") != record.manifest_hash
+        ):
+            raise RegistryError("bound manifest v2 does not match registry identities")
+        return manifest
 
     def transition(
         self,
