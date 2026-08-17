@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from trademind.discovery.hypothesis_registry import HypothesisRegistry, HypothesisState
-from trademind.discovery.holdout_runner import FinalHoldoutRunner, HoldoutRunError
+from trademind.discovery.holdout_runner import FinalHoldoutRunner
 from trademind.discovery.holdout_sealer import FinalHoldoutSealer
 from trademind.discovery.holdout_store import HoldoutSealStore
 from trademind.discovery.manifest import (
@@ -33,25 +33,21 @@ from trademind.experiment_execution_contract import (
     EvaluatorBinding,
     EvaluatorRegistry,
     ExecutionPhase,
-    ExperimentExecutionContractError,
 )
 from trademind.experiment_execution_runtime import ExperimentExecutionRuntimeV1
 from trademind.final_holdout_decision_gate import FinalHoldoutDecisionGateV1
 from trademind.final_holdout_evaluation import (
-    FinalHoldoutEvaluationConflictError,
     FinalHoldoutEvaluationControlV1,
+    FinalHoldoutEvaluationError,
+    FinalHoldoutEvaluationNonAuthoritativeError,
     build_final_holdout_result_v1,
     load_final_holdout_result_v1,
     persist_final_holdout_result_v1,
     verify_final_holdout_result_v1,
 )
-from trademind.orchestrator.artifact_store import (
-    ArtifactIntegrityError,
-    ArtifactNotFoundError,
-    ArtifactStore,
-)
+from trademind.orchestrator.artifact_store import ArtifactStore
 from trademind.signal_statistics_provenance import CodeProvenance
-from trademind.validation_decision import ValidationDecisionBuilderV1, ValidationOutcome
+from trademind.validation_decision import ValidationDecisionBuilderV1
 
 FAMILY = "final-eval-v1"
 EVALUATOR_ID = "fake-final-eval-v1"
@@ -459,153 +455,106 @@ def _evaluate(case: dict, **overrides):
 
 
 # ---------------------------------------------------------------------------
-# Authorized PASS / FAIL final evaluation
+# Retirement: FinalHoldoutEvaluationControlV1.evaluate is a non-authoritative,
+# fail-closed entry point. This module (and the rest of the six-file SER8
+# parallel lineage it anchors) is retired in favor of the single
+# authoritative production path in trademind.discovery
+# (train_test_execution -> validation_execution -> holdout_trigger_bridge ->
+# final_verdict_control). See the module docstring for the full rationale.
+# The tests below replace the previous authorized-pass/fail, one-shot,
+# tampered-seal, lineage-substitution, crash-recovery, and CAS round-trip
+# tests, which exercised evaluate() actually succeeding -- behavior this
+# module can no longer exhibit by design.
 # ---------------------------------------------------------------------------
 
 
-def test_authorized_pass_final_evaluation(tmp_path: Path) -> None:
+def test_evaluate_fails_closed_unconditionally_even_with_a_fully_valid_case(tmp_path: Path) -> None:
+    # A completely valid, otherwise-successful setup (the exact fixture that
+    # used to reach ACCEPTED) still cannot advance through this entry point:
+    # the guard is categorical, not a side effect of some validation failure.
     case = _full_case(tmp_path, threshold=-1.0, holdout_values=[5.0, 6.0, 7.0])
-    outcome = _evaluate(case)
-    assert outcome.result.outcome is ValidationOutcome.PASS
-    assert outcome.result.criteria_decision.passed is True
-    assert outcome.result.observed_metrics.values["mean_value"] == pytest.approx(6.0)
-    markers = outcome.result.semantic_projection()["final_holdout_semantic_markers"]
-    assert markers["scientifically_validated"] is True
-    assert markers["final_holdout_consumed"] is True
-    assert markers["trading_authorized"] is False
-    assert case["registry"].get(HYPOTHESIS_ID).state is HypothesisState.ACCEPTED
-    assert verify_final_holdout_result_v1(outcome.result.canonical_bytes()) == outcome.result
-
-
-def test_authorized_fail_final_evaluation(tmp_path: Path) -> None:
-    # Validation passes (public rows mean ~3.5 >= -1.0), authorizing the gate,
-    # but the actual final holdout mean fails the SAME predeclared threshold.
-    case = _full_case(tmp_path, threshold=-1.0, holdout_values=[-50.0, -60.0, -70.0])
-    outcome = _evaluate(case)
-    assert outcome.result.outcome is ValidationOutcome.FAIL
-    assert outcome.result.criteria_decision.passed is False
-    markers = outcome.result.semantic_projection()["final_holdout_semantic_markers"]
-    assert markers["scientifically_validated"] is False
-    assert markers["final_holdout_consumed"] is True
-    assert case["registry"].get(HYPOTHESIS_ID).state is HypothesisState.REJECTED_FINAL
-
-
-# ---------------------------------------------------------------------------
-# Missing / invalid authorization
-# ---------------------------------------------------------------------------
-
-
-def test_missing_authorization_ref_fails_closed(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    with pytest.raises(ArtifactNotFoundError):
-        _evaluate(case, authorization_artifact_hash_ref=f"sha256:{'9' * 64}")
-
-
-def test_no_authorization_on_file_fails_closed(tmp_path: Path) -> None:
-    # A well-formed authorization artifact that was never registered as the
-    # one authoritative grant (simulated: different hypothesis's own grant).
-    registry, store, manifest, manifest_ref = _case(tmp_path, hypothesis_id=HYPOTHESIS_ID)
-    _seal_and_isolate(tmp_path, registry, manifest, holdout_values=[1.0, 2.0, 3.0])
-    _register(registry, OTHER_HYPOTHESIS_ID)
-    other_manifest = _manifest(store, registry, hypothesis_id=OTHER_HYPOTHESIS_ID)
-    _freeze(registry, store, other_manifest)
-    _seal_and_isolate(tmp_path, registry, other_manifest, holdout_values=[1.0, 2.0, 3.0])
-
-    execution, evidence_artifact, decision_artifact, authorization, authorization_artifact = _authorize(
-        registry, store, hypothesis_id=OTHER_HYPOTHESIS_ID
-    )
-    ledger = ResultLedger(tmp_path / "results.jsonl")
-    seals = HoldoutSealStore(registry)
-    runner = FinalHoldoutRunner(
-        registry=registry,
-        seals=seals,
-        keys=StaticKeys(),
-        ledger=ledger,
-        evaluator=HoldoutMeanEvaluator(),
-        evaluator_artifact_path=EVALUATOR_ARTIFACT,
-    )
-    control = FinalHoldoutEvaluationControlV1(
-        runner=runner, artifact_store=store, evaluator_registry=_evaluator_registry()
-    )
-    with pytest.raises(ExperimentExecutionContractError, match="manifest"):
-        control.evaluate(
-            HYPOTHESIS_ID,
-            authorization_artifact_hash_ref=authorization_artifact.hash_ref,
-            validation_decision_artifact_hash_ref=decision_artifact.hash_ref,
-            evidence_artifact_hash_ref=evidence_artifact.hash_ref,
-            result_artifact_hash_ref=execution.result_artifact.hash_ref,
-            sealed_holdout_path=tmp_path / "irrelevant.json",
-            created_at=CREATED_AT,
-            created_by=CREATED_BY,
-        )
-
-
-# ---------------------------------------------------------------------------
-# One-shot enforcement / idempotent reload
-# ---------------------------------------------------------------------------
-
-
-def test_one_shot_enforcement_via_runner(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    _evaluate(case)
-    with pytest.raises(HoldoutRunError):
-        case["runner"].run_once(hypothesis_id=HYPOTHESIS_ID, sealed_path=case["sealed_path"])
-
-
-def test_second_consumption_returns_idempotent_result_without_redecrypting(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    first = _evaluate(case)
-    assert case["evaluator"].calls == 1
-    second = _evaluate(case)
-    assert case["evaluator"].calls == 1  # never decrypted a second time.
-    assert first.result == second.result
-    assert first.result_artifact.hash_ref == second.result_artifact.hash_ref
-    assert case["registry"].get(HYPOTHESIS_ID).state is HypothesisState.ACCEPTED
-
-
-# ---------------------------------------------------------------------------
-# Corrupt / tampered seal
-# ---------------------------------------------------------------------------
-
-
-def test_corrupt_tampered_seal_fails_closed(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    document = json.loads(case["sealed_path"].read_text(encoding="utf-8"))
-    document["header"]["evaluator_id"] = "tampered-after-seal"
-    case["sealed_path"].write_text(json.dumps(document), encoding="utf-8")
-    with pytest.raises(HoldoutRunError):
+    with pytest.raises(FinalHoldoutEvaluationNonAuthoritativeError):
         _evaluate(case)
-    # Tampering detected before any consumption; state is unchanged (still
-    # short of even VALIDATION_PASSED bootstrap having been attempted here
-    # is irrelevant -- the key point is no ACCEPTED/REJECTED_FINAL leaked).
-    assert case["registry"].get(HYPOTHESIS_ID).state is not HypothesisState.ACCEPTED
-    assert case["registry"].get(HYPOTHESIS_ID).state is not HypothesisState.REJECTED_FINAL
 
 
-# ---------------------------------------------------------------------------
-# Lineage / provenance mismatch
-# ---------------------------------------------------------------------------
-
-
-def test_lineage_substitution_wrong_hypothesis_fails_closed(tmp_path: Path) -> None:
+def test_evaluate_fails_closed_before_any_argument_is_used_or_validated(tmp_path: Path) -> None:
+    # Garbage/malformed arguments -- an unregistered hypothesis_id, bogus
+    # artifact refs, a nonexistent sealed-holdout path -- still surface the
+    # SAME retirement error, proving the guard precedes all internal
+    # validation rather than merely coinciding with some other failure.
     case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    registry, store = case["registry"], case["store"]
-    _register(registry, OTHER_HYPOTHESIS_ID)
-    other_manifest = _manifest(store, registry, hypothesis_id=OTHER_HYPOTHESIS_ID)
-    _freeze(registry, store, other_manifest)
-    _seal_and_isolate(tmp_path, registry, other_manifest, holdout_values=[1.0, 2.0, 3.0])
-
-    with pytest.raises(ExperimentExecutionContractError, match="manifest"):
+    with pytest.raises(FinalHoldoutEvaluationNonAuthoritativeError):
         case["control"].evaluate(
-            OTHER_HYPOTHESIS_ID,
-            authorization_artifact_hash_ref=case["authorization_artifact"].hash_ref,
-            validation_decision_artifact_hash_ref=case["decision_artifact"].hash_ref,
-            evidence_artifact_hash_ref=case["evidence_artifact"].hash_ref,
-            result_artifact_hash_ref=case["execution"].result_artifact.hash_ref,
-            sealed_holdout_path=case["sealed_path"],
-            created_at=CREATED_AT,
-            created_by=CREATED_BY,
+            "not-a-real-hypothesis-id",
+            authorization_artifact_hash_ref="not-a-real-hash-ref",
+            validation_decision_artifact_hash_ref="not-a-real-hash-ref",
+            evidence_artifact_hash_ref="not-a-real-hash-ref",
+            result_artifact_hash_ref="not-a-real-hash-ref",
+            sealed_holdout_path=tmp_path / "does-not-exist.json",
+            created_at="not-a-real-timestamp",
+            created_by="operator:test",
         )
+
+
+def test_evaluate_does_not_mutate_registry_state(tmp_path: Path) -> None:
+    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
+    before = case["registry"].get(HYPOTHESIS_ID).state
+    assert before is HypothesisState.FROZEN
+    with pytest.raises(FinalHoldoutEvaluationNonAuthoritativeError):
+        _evaluate(case)
+    after = case["registry"].get(HYPOTHESIS_ID).state
+    assert after is before
+    assert after not in (
+        HypothesisState.HOLDOUT_CONSUMED,
+        HypothesisState.ACCEPTED,
+        HypothesisState.REJECTED_FINAL,
+    )
+
+
+def test_evaluate_does_not_persist_any_artifact_or_consume_the_seal(tmp_path: Path) -> None:
+    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
+    before = sorted(p for p in case["store"].root.rglob("*") if p.is_file())
+    with pytest.raises(FinalHoldoutEvaluationNonAuthoritativeError):
+        _evaluate(case)
+    after = sorted(p for p in case["store"].root.rglob("*") if p.is_file())
+    assert after == before
+    # The one-shot holdout evaluator was never invoked and the ledger never
+    # gained a FINAL_HOLDOUT_CLAIM/RESULT record: the blocked evaluate() call
+    # never reached the runner (it never got past its own first statement).
+    assert case["evaluator"].calls == 0
+    assert not case["ledger"].path.exists() or case["ledger"].path.read_text(encoding="utf-8") == ""
+    assert case["registry"].get(HYPOTHESIS_ID).state is HypothesisState.FROZEN
+
+
+def test_evaluate_error_is_a_final_holdout_evaluation_error(tmp_path: Path) -> None:
+    # The retirement error is still a FinalHoldoutEvaluationError, so any
+    # legacy caller that only catches the module's own base exception is not
+    # left with an unhandled, unexpected exception type.
+    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
+    with pytest.raises(FinalHoldoutEvaluationError):
+        _evaluate(case)
+
+
+def test_module_still_exposes_its_data_structures_and_verification_helpers() -> None:
+    # The module is retired only at its single write-entry-point; everything
+    # else (CAS build/persist/load/verify helpers) remains importable and
+    # usable for historical/audit reference, per the module docstring.
+    for helper in (
+        build_final_holdout_result_v1,
+        load_final_holdout_result_v1,
+        persist_final_holdout_result_v1,
+        verify_final_holdout_result_v1,
+    ):
+        assert callable(helper)
+
+
+def test_final_holdout_evaluation_control_v1_construction_still_succeeds(tmp_path: Path) -> None:
+    # Constructing the (retired) control object itself is not blocked -- only
+    # its evaluate() entry point is. This confirms the guard is scoped to the
+    # one method identified as the lineage's sole registry-mutating write
+    # path, not to the whole module.
+    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
+    assert isinstance(case["control"], FinalHoldoutEvaluationControlV1)
 
 
 # ---------------------------------------------------------------------------
@@ -619,186 +568,6 @@ def test_build_final_holdout_result_has_no_ad_hoc_criteria_parameter() -> None:
     signature = inspect.signature(build_final_holdout_result_v1)
     forbidden_names = {"criteria", "threshold", "evaluation_criteria", "ad_hoc_criteria"}
     assert not (set(signature.parameters) & forbidden_names)
-
-
-def test_final_criteria_decision_uses_manifest_predeclared_criteria(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, threshold=-1.0, holdout_values=[5.0, 6.0, 7.0])
-    outcome = _evaluate(case)
-    assert outcome.result.criteria_decision.mode == case["manifest"].evaluation_criteria.mode
-    expected_metrics = {c.metric for c in case["manifest"].evaluation_criteria.criteria}
-    actual_metrics = {ev.metric for ev in outcome.result.criteria_decision.evaluations}
-    assert actual_metrics == expected_metrics
-
-
-# ---------------------------------------------------------------------------
-# Crash / restart safety around the consumption boundary
-# ---------------------------------------------------------------------------
-
-
-def test_crash_after_runner_consumption_recovers_from_ledger_not_replaintext(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    # Simulate a prior control.evaluate() call that got as far as run_once()
-    # succeeding (registry -> HOLDOUT_CONSUMED, runner's own ledger record
-    # written) but crashed before persisting this layer's own CAS result.
-    case["control"]._ensure_validation_passed(HYPOTHESIS_ID)
-    receipt = case["runner"].run_once(hypothesis_id=HYPOTHESIS_ID, sealed_path=case["sealed_path"])
-    assert case["evaluator"].calls == 1
-    assert case["registry"].get(HYPOTHESIS_ID).state is HypothesisState.HOLDOUT_CONSUMED
-
-    # A fresh control instance now completes evaluation: it must recover the
-    # already-decrypted aggregate metrics from the runner's ledger record,
-    # never re-invoking the evaluator (which would mean a second plaintext read).
-    fresh_control = FinalHoldoutEvaluationControlV1(
-        runner=case["runner"], artifact_store=case["store"], evaluator_registry=_evaluator_registry()
-    )
-    outcome = fresh_control.evaluate(
-        HYPOTHESIS_ID,
-        authorization_artifact_hash_ref=case["authorization_artifact"].hash_ref,
-        validation_decision_artifact_hash_ref=case["decision_artifact"].hash_ref,
-        evidence_artifact_hash_ref=case["evidence_artifact"].hash_ref,
-        result_artifact_hash_ref=case["execution"].result_artifact.hash_ref,
-        sealed_holdout_path=case["sealed_path"],
-        created_at=CREATED_AT,
-        created_by=CREATED_BY,
-    )
-    assert case["evaluator"].calls == 1  # still only the one legitimate decrypt.
-    assert outcome.result.observed_metrics.values["mean_value"] == pytest.approx(receipt.aggregate_metrics["mean_value"])
-    assert case["registry"].get(HYPOTHESIS_ID).state is HypothesisState.ACCEPTED
-
-
-def test_restart_reload_reproduces_identical_result(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    first = _evaluate(case)
-
-    restarted_store = ArtifactStore(case["store"].root)
-    restarted_registry = HypothesisRegistry(case["registry"].path)
-    restarted_seals = HoldoutSealStore(restarted_registry)
-    restarted_ledger = ResultLedger(case["ledger"].path)
-    restarted_runner = FinalHoldoutRunner(
-        registry=restarted_registry,
-        seals=restarted_seals,
-        keys=StaticKeys(),
-        ledger=restarted_ledger,
-        evaluator=HoldoutMeanEvaluator(),
-        evaluator_artifact_path=EVALUATOR_ARTIFACT,
-    )
-    restarted_control = FinalHoldoutEvaluationControlV1(
-        runner=restarted_runner, artifact_store=restarted_store, evaluator_registry=_evaluator_registry()
-    )
-    second = restarted_control.evaluate(
-        HYPOTHESIS_ID,
-        authorization_artifact_hash_ref=case["authorization_artifact"].hash_ref,
-        validation_decision_artifact_hash_ref=case["decision_artifact"].hash_ref,
-        evidence_artifact_hash_ref=case["evidence_artifact"].hash_ref,
-        result_artifact_hash_ref=case["execution"].result_artifact.hash_ref,
-        sealed_holdout_path=case["sealed_path"],
-        created_at=CREATED_AT,
-        created_by=CREATED_BY,
-    )
-    assert first.result == second.result
-    assert first.result_artifact.hash_ref == second.result_artifact.hash_ref
-
-
-# ---------------------------------------------------------------------------
-# Immutable result persistence / reload
-# ---------------------------------------------------------------------------
-
-
-def test_persist_load_verified_cas_round_trip(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    outcome = _evaluate(case)
-    loaded = load_final_holdout_result_v1(
-        outcome.result_artifact.hash_ref,
-        artifact_store=case["store"],
-        manifest=case["manifest"],
-        authorization=case["authorization"],
-        authorization_artifact_hash_ref=case["authorization_artifact"].hash_ref,
-    )
-    assert loaded == outcome.result
-
-
-def test_corrupt_result_cas_fails_closed_on_reload(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    outcome = _evaluate(case)
-    resolved = case["store"].resolve_verified(outcome.result_artifact.hash_ref)
-    Path(resolved.path).write_bytes(b"corrupted final holdout result bytes")
-    with pytest.raises(ArtifactIntegrityError):
-        load_final_holdout_result_v1(
-            outcome.result_artifact.hash_ref,
-            artifact_store=case["store"],
-            manifest=case["manifest"],
-            authorization=case["authorization"],
-            authorization_artifact_hash_ref=case["authorization_artifact"].hash_ref,
-        )
-
-
-def test_conflicting_final_result_rejected(tmp_path: Path) -> None:
-    # A self-consistent-but-untruthful result: observed metrics pass the
-    # predeclared criterion (6.0 >= -1.0), yet the embedded decision and
-    # top-level outcome falsely claim FAIL.
-    import dataclasses
-
-    from trademind.experiment_execution_contract import CriteriaDecisionV1
-
-    case = _full_case(tmp_path, threshold=-1.0, holdout_values=[5.0, 6.0, 7.0])
-    outcome = _evaluate(case)
-    real = outcome.result
-    lying_decision = CriteriaDecisionV1(
-        schema_version=real.criteria_decision.schema_version,
-        mode=real.criteria_decision.mode,
-        passed=False,
-        primary_metric=real.criteria_decision.primary_metric,
-        primary_metric_value=real.criteria_decision.primary_metric_value,
-        evaluations=tuple(
-            dataclasses.replace(ev, passed=False) for ev in real.criteria_decision.evaluations
-        ),
-    )
-    tampered = dataclasses.replace(
-        real, outcome=ValidationOutcome.FAIL, criteria_decision=lying_decision
-    )
-    persisted = persist_final_holdout_result_v1(tampered, artifact_store=case["store"])
-    with pytest.raises(FinalHoldoutEvaluationConflictError):
-        load_final_holdout_result_v1(
-            persisted.hash_ref,
-            artifact_store=case["store"],
-            manifest=case["manifest"],
-            authorization=case["authorization"],
-            authorization_artifact_hash_ref=case["authorization_artifact"].hash_ref,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Correct existing HypothesisRegistry transition
-# ---------------------------------------------------------------------------
-
-
-def test_registry_transitions_through_existing_lifecycle_states(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    registry = case["registry"]
-    assert registry.get(HYPOTHESIS_ID).state is HypothesisState.FROZEN
-    _evaluate(case)
-    final_state = registry.get(HYPOTHESIS_ID).state
-    assert final_state in (HypothesisState.ACCEPTED, HypothesisState.REJECTED_FINAL)
-    assert registry.family_status(case["manifest"].hypothesis_family_id)["holdout_consumed"] is True
-    assert registry.family_status(case["manifest"].hypothesis_family_id)["terminal_state"] == final_state.value
-
-
-def test_terminal_outcome_conflict_fails_closed(tmp_path: Path) -> None:
-    case = _full_case(tmp_path, holdout_values=[1.0, 2.0, 3.0])
-    _evaluate(case)
-    # Force the registry into the OPPOSITE terminal state and confirm the
-    # control layer refuses to silently agree with a conflicting outcome.
-    with sqlite3.connect(case["registry"].path) as db:
-        db.execute(
-            "UPDATE hypotheses SET state=? WHERE hypothesis_id=?",
-            (HypothesisState.REJECTED_FINAL.value, HYPOTHESIS_ID),
-        )
-        db.execute(
-            "UPDATE hypothesis_families SET terminal_state=? WHERE family_id=?",
-            (HypothesisState.REJECTED_FINAL.value, case["manifest"].hypothesis_family_id),
-        )
-    with pytest.raises(FinalHoldoutEvaluationConflictError):
-        _evaluate(case)
 
 
 # ---------------------------------------------------------------------------

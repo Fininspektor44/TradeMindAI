@@ -2,12 +2,21 @@
 
 IMPORTANT: every journal row in this file is synthetic fixture data written
 to exercise the WIRING (EvaluatorBinding registration, chronological split
-handling, metric propagation, criteria evaluation, holdout consumption,
-registry transition) end to end. None of it is a real trading signal and
-none of the PASS/FAIL outcomes below constitute scientific evidence about
-any strategy. See test_final_holdout_evaluation.py for the underlying
-pipeline's own test suite; these tests only confirm this one evaluator
-plugs into that closed pipeline correctly.
+handling, metric propagation, criteria evaluation) end to end. None of it is
+a real trading signal and none of the PASS/FAIL outcomes below constitute
+scientific evidence about any strategy. See test_final_holdout_evaluation.py
+for the underlying VALIDATION-phase pipeline's own test suite.
+
+``FinalHoldoutEvaluationControlV1.evaluate`` (the SER8 lineage's final-holdout
+entry point) is retired as a non-authoritative research lifecycle path -- see
+that module's own docstring. The full-pipeline tests below therefore exercise
+this evaluator's VALIDATION-phase wiring through the real, still-functioning
+execution/evidence/decision/authorization steps, then assert that the
+retired evaluate() call fails closed rather than reaching ACCEPTED/
+REJECTED_FINAL through this lineage; ``test_holdout_evaluator_never_reads_
+public_rows`` calls ``SMCPatternJournalHoldoutEvaluator.evaluate`` directly
+(bypassing the control layer) since that behavior belongs to the evaluator
+itself, not to the retired lifecycle plumbing.
 """
 
 from __future__ import annotations
@@ -42,7 +51,10 @@ from trademind.experiment_evidence import ExperimentEvidenceBuilderV1
 from trademind.experiment_execution_contract import EvaluatorRegistry, ExecutionPhase
 from trademind.experiment_execution_runtime import ExperimentExecutionRuntimeError, ExperimentExecutionRuntimeV1
 from trademind.final_holdout_decision_gate import FinalHoldoutDecisionGateV1
-from trademind.final_holdout_evaluation import FinalHoldoutEvaluationControlV1
+from trademind.final_holdout_evaluation import (
+    FinalHoldoutEvaluationControlV1,
+    FinalHoldoutEvaluationNonAuthoritativeError,
+)
 from trademind.orchestrator.artifact_store import ArtifactStore
 from trademind.signal_statistics_provenance import CodeProvenance
 from trademind.smc_pattern_journal_evaluator import (
@@ -358,17 +370,22 @@ def _run_pipeline(tmp_path: Path, *, holdout_rows: list[dict[str, str]], thresho
     control = FinalHoldoutEvaluationControlV1(
         runner=runner, artifact_store=store, evaluator_registry=_evaluator_registry()
     )
-    outcome = control.evaluate(
-        HYPOTHESIS_ID,
-        authorization_artifact_hash_ref=authorization_artifact.hash_ref,
-        validation_decision_artifact_hash_ref=decision_artifact.hash_ref,
-        evidence_artifact_hash_ref=evidence_artifact.hash_ref,
-        result_artifact_hash_ref=execution.result_artifact.hash_ref,
-        sealed_holdout_path=sealed_path,
-        created_at=CREATED_AT,
-        created_by=CREATED_BY,
-    )
-    return registry, manifest, execution, decision, outcome
+    # FinalHoldoutEvaluationControlV1.evaluate is retired (non-authoritative,
+    # fail-closed) -- see trademind.final_holdout_evaluation's module
+    # docstring. This proves the retirement holds even for this real
+    # evaluator's own fully-valid, otherwise-successful authorization chain.
+    with pytest.raises(FinalHoldoutEvaluationNonAuthoritativeError):
+        control.evaluate(
+            HYPOTHESIS_ID,
+            authorization_artifact_hash_ref=authorization_artifact.hash_ref,
+            validation_decision_artifact_hash_ref=decision_artifact.hash_ref,
+            evidence_artifact_hash_ref=evidence_artifact.hash_ref,
+            result_artifact_hash_ref=execution.result_artifact.hash_ref,
+            sealed_holdout_path=sealed_path,
+            created_at=CREATED_AT,
+            created_by=CREATED_BY,
+        )
+    return registry, manifest, execution, decision
 
 
 # ---------------------------------------------------------------------------
@@ -427,43 +444,50 @@ def test_full_pipeline_pass_wiring(tmp_path: Path) -> None:
         _journal_row(10, action="BUY", outcome="WIN", atr=1.0, net_move=2.0),
         _journal_row(11, action="BUY", outcome="LOSS", atr=1.0, net_move=-1.0),
     ]
-    registry, manifest, execution, decision, outcome = _run_pipeline(
+    registry, manifest, execution, decision = _run_pipeline(
         tmp_path, holdout_rows=holdout_rows, threshold=0.0
     )
+    del manifest
     assert decision.outcome is ValidationOutcome.PASS
     assert execution.result.evaluator_id == EVALUATOR_ID
     assert execution.result.evaluator_version == EVALUATOR_VERSION
-    assert outcome.result.outcome is ValidationOutcome.PASS
-    assert outcome.result.holdout_evaluator_id == HOLDOUT_EVALUATOR_ID
-    # 2 wins (+2.0 each) + 1 loss (-1.0) = 3.0 / 3 trades = 1.0
-    assert outcome.result.observed_metrics.values["avg_net_atr"] == pytest.approx(1.0)
-    assert registry.get(HYPOTHESIS_ID).state is HypothesisState.ACCEPTED
+    # The retired final-holdout entry point never advances the hypothesis:
+    # it stays exactly where the frozen manifest left it (the SER8 lineage's
+    # own VALIDATION_PASSED transition also lives inside the now-unreachable
+    # evaluate() body, so it is never reached either).
+    assert registry.get(HYPOTHESIS_ID).state is HypothesisState.FROZEN
 
 
 def test_full_pipeline_fail_wiring(tmp_path: Path) -> None:
     # Validation still passes (its own rows are unaffected), authorizing the
-    # gate, but the final holdout's own rows fail the same predeclared threshold.
+    # gate; the final holdout's own rows would have failed the same
+    # predeclared threshold, but the retired entry point never gets far
+    # enough to evaluate them.
     holdout_rows = [
         _journal_row(9, action="BUY", outcome="LOSS", atr=1.0, net_move=-3.0),
         _journal_row(10, action="BUY", outcome="LOSS", atr=1.0, net_move=-4.0),
         _journal_row(11, action="BUY", outcome="LOSS", atr=1.0, net_move=-5.0),
     ]
-    registry, manifest, execution, decision, outcome = _run_pipeline(
+    registry, manifest, execution, decision = _run_pipeline(
         tmp_path, holdout_rows=holdout_rows, threshold=0.0
     )
+    del manifest, execution
     assert decision.outcome is ValidationOutcome.PASS
-    assert outcome.result.outcome is ValidationOutcome.FAIL
-    assert outcome.result.observed_metrics.values["avg_net_atr"] == pytest.approx(-4.0)
-    assert registry.get(HYPOTHESIS_ID).state is HypothesisState.REJECTED_FINAL
+    assert registry.get(HYPOTHESIS_ID).state is HypothesisState.FROZEN
 
 
-def test_holdout_evaluator_never_reads_public_rows(tmp_path: Path) -> None:
+def test_holdout_evaluator_never_reads_public_rows() -> None:
     # Sanity: the holdout evaluation result must reflect ONLY the sealed
-    # holdout rows, not the public discovery/validation journal used earlier.
+    # holdout rows, not the public discovery/validation journal used
+    # earlier. Exercised directly against the evaluator (its own
+    # evaluate(plaintext) method), bypassing the retired control layer,
+    # since this behavior belongs to the evaluator, not to the lifecycle
+    # plumbing around it.
     holdout_rows = [_journal_row(9, action="BUY", outcome="WIN", atr=1.0, net_move=10.0)]
-    _, _, _, _, outcome = _run_pipeline(tmp_path, holdout_rows=holdout_rows, threshold=0.0)
-    assert outcome.result.observed_metrics.values["avg_net_atr"] == pytest.approx(10.0)
-    assert outcome.result.observed_metrics.values["trades"] == pytest.approx(1.0)
+    evaluator = SMCPatternJournalHoldoutEvaluator(horizon=HORIZON, candidate_minimum=1, research_minimum=1)
+    observed = evaluator.evaluate(_journal_csv_bytes(holdout_rows))
+    assert observed["avg_net_atr"] == pytest.approx(10.0)
+    assert observed["trades"] == pytest.approx(1.0)
 
 
 def test_evaluator_config_error_wrapped_by_runtime(tmp_path: Path) -> None:

@@ -1,5 +1,31 @@
 """Final Holdout Evaluation V1: one-shot consumption and terminal verdict.
 
+RETIRED AS A NON-AUTHORITATIVE RESEARCH LIFECYCLE PATH. ``FinalHoldoutEvaluationControlV1.
+evaluate`` now fails closed, unconditionally, before touching anything --
+see its own docstring. This repository has exactly one authoritative
+production path for PROPOSED -> FROZEN -> TRAIN_TESTED -> VALIDATION_PASSED/
+VALIDATION_REJECTED -> HOLDOUT_CONSUMED -> ACCEPTED/REJECTED_FINAL:
+``trademind.discovery.train_test_execution.TrainTestExecutionControl``,
+``trademind.discovery.validation_execution.ValidationExecutionControl``,
+``trademind.discovery.holdout_trigger_bridge.HoldoutTriggerBridge``, and
+``trademind.discovery.final_verdict_control.FinalVerdictAcceptanceControl``.
+This module and its siblings (experiment_evidence.py,
+experiment_execution_contract.py, experiment_execution_runtime.py,
+validation_decision.py, final_holdout_decision_gate.py,
+experiment_manifest_creation.py) were an independently-built parallel
+implementation of the same lifecycle, sharing the same
+``HypothesisRegistry``/``HypothesisState`` state machine as the modules
+above -- a real risk of two implementations being able to advance the same
+hypothesis_id. This module was the ONLY one of the seven that ever called
+``HypothesisRegistry.transition`` (verified by an exhaustive repository-wide
+search); blocking its sole entry point is therefore necessary and sufficient
+to close that risk without touching any of the other six files, which
+remain present, unmodified, and importable for historical/audit reference
+(none of them can mutate registry state on their own).
+
+Everything below this notice describes the RETIRED design and is preserved
+verbatim for historical/audit reference; none of it is reachable anymore.
+
 This is the top layer of the discovery/validation/holdout pipeline. It
 consumes an authoritative Final Holdout Authorization V1 and the EXISTING
 holdout infrastructure -- unchanged -- to produce one immutable, deterministic
@@ -108,6 +134,24 @@ class FinalHoldoutEvaluationConflictError(FinalHoldoutEvaluationError):
 
 class FinalHoldoutEvaluationPersistenceError(RuntimeError):
     """Raised when Verified CAS does not preserve the exact final holdout result identity."""
+
+
+class FinalHoldoutEvaluationNonAuthoritativeError(FinalHoldoutEvaluationError):
+    """Raised unconditionally by ``FinalHoldoutEvaluationControlV1.evaluate`` because this
+    module is retired as a non-authoritative research lifecycle path. See the module
+    docstring for the single authoritative path this repository now uses instead."""
+
+
+_NON_AUTHORITATIVE_NOTICE = (
+    "FinalHoldoutEvaluationControlV1.evaluate is retired: this module is a non-authoritative, "
+    "parallel implementation of the research lifecycle. The single authoritative production "
+    "path is trademind.discovery.train_test_execution.TrainTestExecutionControl -> "
+    "trademind.discovery.validation_execution.ValidationExecutionControl -> "
+    "trademind.discovery.holdout_trigger_bridge.HoldoutTriggerBridge -> "
+    "trademind.discovery.final_verdict_control.FinalVerdictAcceptanceControl. This method "
+    "fails closed, before touching the registry, the runner, or any artifact, rather than "
+    "advancing any hypothesis_id through a second implementation of the same state machine."
+)
 
 
 def _machine_identifier(value: object, *, field_name: str) -> str:
@@ -882,6 +926,11 @@ class FinalHoldoutEvaluationControlV1:
         created_at: str,
         created_by: str,
     ) -> FinalHoldoutEvaluationOutcome:
+        # RETIRED: unconditional fail-closed guard, first statement, before any
+        # argument is used or validated -- see the module docstring and
+        # FinalHoldoutEvaluationNonAuthoritativeError. This module can no longer
+        # advance any hypothesis_id through the registry.
+        raise FinalHoldoutEvaluationNonAuthoritativeError(_NON_AUTHORITATIVE_NOTICE)
         manifest, record = self._load_manifest_for_hypothesis(hypothesis_id)
 
         exec_result = load_result_v1(
