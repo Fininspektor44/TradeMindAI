@@ -18,12 +18,14 @@ from trademind.discovery.hypothesis_registry import (
 )
 from trademind.discovery.manifest import (
     EXPERIMENT_MANIFEST_V2_MEDIA_TYPE,
+    FINAL_HOLDOUT_CRITERIA_SCHEMA_VERSION,
     CriteriaMode,
     CriterionOperator,
     DatasetArtifactV2,
     EvaluationCriteriaV1,
     EvaluationCriterionV1,
     ExperimentManifestV2,
+    FinalHoldoutCriteriaV1,
     ManifestV2ValidationError,
     ProposalIntakeProvenanceV1,
     TradingFrictionV1,
@@ -31,6 +33,7 @@ from trademind.discovery.manifest import (
     load_experiment_manifest_v2,
     persist_experiment_manifest_v2,
     verify_experiment_manifest_v2,
+    verify_final_holdout_metric_vocabulary,
 )
 from trademind.discovery.split_engine import SplitPlan, chronological_split
 from trademind.orchestrator.artifact_store import (
@@ -113,6 +116,19 @@ def _criteria(
     )
 
 
+def _final_holdout_criteria(
+    *,
+    metric: str = "holdout_rows",
+    threshold: int | float = 1,
+    operator: CriterionOperator = CriterionOperator.GREATER_THAN_OR_EQUAL,
+    mode: CriteriaMode = CriteriaMode.ALL,
+) -> FinalHoldoutCriteriaV1:
+    return FinalHoldoutCriteriaV1(
+        mode=mode,
+        criteria=(EvaluationCriterionV1(metric=metric, operator=operator, threshold=threshold),),
+    )
+
+
 def _friction(*, spread: float = 1.0) -> TradingFrictionV1:
     return TradingFrictionV1(
         model_id="fixed-bps-v1",
@@ -158,6 +174,7 @@ def _manifest(
     hypothesis_id: str = HYPOTHESIS_ID,
     family_id: str | None = None,
     content_hash: str | None = None,
+    final_holdout_criteria: FinalHoldoutCriteriaV1 | None = None,
 ) -> ExperimentManifestV2:
     record = registry.get(HYPOTHESIS_ID)
     result_ref = hypothesis_id.removeprefix("rpi-v1:").rsplit(":", 1)[0]
@@ -183,6 +200,7 @@ def _manifest(
         semantic_parameters=parameters or {"horizon": 12, "target": "forward_net_r"},
         created_at=created_at,
         created_by=created_by,
+        final_holdout_criteria=final_holdout_criteria,
     )
 
 
@@ -899,4 +917,386 @@ def test_manifest_builder_performs_no_provider_holdout_or_trading_action(tmp_pat
     assert payload["orders_enabled"] is False
     assert "result" not in payload
     assert "holdout_metrics" not in payload
+    assert registry.get(HYPOTHESIS_ID).state is HypothesisState.PROPOSED
+
+
+# ---------------------------------------------------------------------------
+# Final Holdout Acceptance Contract V1 (FinalHoldoutCriteriaV1): the
+# explicit, stage-scoped decision contract for the final-holdout stage,
+# additive to ExperimentManifestV2. Consuming it to decide
+# ACCEPTED/REJECTED_FINAL is explicitly out of scope for this contract layer
+# -- see discovery/manifest.py's own FinalHoldoutCriteriaV1 docstring.
+# ---------------------------------------------------------------------------
+
+
+# 1: manifest with valid final_holdout_criteria round-trips.
+
+
+def test_final_holdout_criteria_round_trips_through_manifest_payload(tmp_path: Path) -> None:
+    registry = HypothesisRegistry(tmp_path / "registry.db")
+    _register(registry)
+    store = ArtifactStore(tmp_path / "artifacts")
+    criteria = _final_holdout_criteria(metric="holdout_rows", threshold=2)
+    manifest = _manifest(store, registry, final_holdout_criteria=criteria)
+
+    assert manifest.final_holdout_criteria is not None
+    assert manifest.final_holdout_criteria.required_metric_names == frozenset({"holdout_rows"})
+
+    restored = ExperimentManifestV2.from_payload(manifest.to_payload())
+    assert restored.final_holdout_criteria is not None
+    assert restored.final_holdout_criteria.to_payload() == criteria.to_payload()
+    assert restored.manifest_semantic_hash == manifest.manifest_semantic_hash
+
+    wire = manifest.canonical_bytes()
+    reloaded = verify_experiment_manifest_v2(wire)
+    assert reloaded.final_holdout_criteria.to_payload() == criteria.to_payload()
+
+    artifact = persist_experiment_manifest_v2(manifest, artifact_store=store)
+    loaded = load_experiment_manifest_v2(artifact.hash_ref, artifact_store=store)
+    assert loaded.final_holdout_criteria.to_payload() == criteria.to_payload()
+
+
+def test_final_holdout_criteria_absent_round_trips_as_none(tmp_path: Path) -> None:
+    registry = HypothesisRegistry(tmp_path / "registry.db")
+    _register(registry)
+    store = ArtifactStore(tmp_path / "artifacts")
+    manifest = _manifest(store, registry)
+
+    assert manifest.final_holdout_criteria is None
+    payload = manifest.to_payload()
+    assert payload["final_holdout_criteria"] is None
+    restored = ExperimentManifestV2.from_payload(payload)
+    assert restored.final_holdout_criteria is None
+
+
+# 2: semantic hash changes when holdout criteria change.
+
+
+def test_final_holdout_criteria_participates_in_manifest_semantic_hash(tmp_path: Path) -> None:
+    registry = HypothesisRegistry(tmp_path / "registry.db")
+    _register(registry)
+    store = ArtifactStore(tmp_path / "artifacts")
+    without = _manifest(store, registry)
+    with_criteria = _manifest(
+        store, registry, final_holdout_criteria=_final_holdout_criteria(threshold=1)
+    )
+    changed_threshold = _manifest(
+        store, registry, final_holdout_criteria=_final_holdout_criteria(threshold=2)
+    )
+    changed_metric = _manifest(
+        store,
+        registry,
+        final_holdout_criteria=_final_holdout_criteria(metric="other_metric", threshold=1),
+    )
+
+    hashes = {
+        without.manifest_semantic_hash,
+        with_criteria.manifest_semantic_hash,
+        changed_threshold.manifest_semantic_hash,
+        changed_metric.manifest_semantic_hash,
+    }
+    assert len(hashes) == 4
+
+    # FinalHoldoutCriteriaV1's own semantic_hash is likewise sensitive to
+    # every field that determines its identity.
+    base = _final_holdout_criteria(threshold=1)
+    assert base.semantic_hash != _final_holdout_criteria(threshold=2).semantic_hash
+    assert base.semantic_hash != _final_holdout_criteria(metric="other_metric").semantic_hash
+    assert base.semantic_hash != _final_holdout_criteria(mode=CriteriaMode.ANY).semantic_hash
+    assert base.semantic_hash == _final_holdout_criteria(threshold=1).semantic_hash
+
+
+# 3: undeclared metric cannot satisfy criteria.
+
+
+def test_undeclared_metric_cannot_satisfy_final_holdout_criteria() -> None:
+    criteria = _final_holdout_criteria(metric="holdout_rows")
+    # A metrics mapping that only carries an unrelated, undeclared name does
+    # not satisfy the contract, regardless of its value.
+    with pytest.raises(ManifestV2ValidationError, match="missing required names"):
+        verify_final_holdout_metric_vocabulary(criteria, {"some_other_metric": 999})
+
+
+# 4: missing required metric fails closed.
+
+
+def test_missing_required_final_holdout_metric_fails_closed() -> None:
+    criteria = FinalHoldoutCriteriaV1(
+        mode=CriteriaMode.ALL,
+        criteria=(
+            EvaluationCriterionV1(
+                metric="holdout_rows", operator=CriterionOperator.GREATER_THAN_OR_EQUAL, threshold=1
+            ),
+            EvaluationCriterionV1(
+                metric="holdout_mean", operator=CriterionOperator.GREATER_THAN, threshold=0.0
+            ),
+        ),
+    )
+    with pytest.raises(ManifestV2ValidationError, match="holdout_mean"):
+        verify_final_holdout_metric_vocabulary(criteria, {"holdout_rows": 3})
+    with pytest.raises(ManifestV2ValidationError, match="metrics must be a mapping"):
+        verify_final_holdout_metric_vocabulary(criteria, None)  # type: ignore[arg-type]
+    with pytest.raises(ManifestV2ValidationError, match="exact FinalHoldoutCriteriaV1"):
+        verify_final_holdout_metric_vocabulary(object(), {"holdout_rows": 1})  # type: ignore[arg-type]
+
+
+# 5: NaN/Inf fails closed.
+
+
+def test_final_holdout_criteria_rejects_nan_and_inf_threshold() -> None:
+    with pytest.raises(ManifestV2ValidationError, match="threshold"):
+        FinalHoldoutCriteriaV1(
+            mode=CriteriaMode.ALL,
+            criteria=(
+                EvaluationCriterionV1(
+                    metric="holdout_rows",
+                    operator=CriterionOperator.GREATER_THAN_OR_EQUAL,
+                    threshold=float("nan"),
+                ),
+            ),
+        )
+    with pytest.raises(ManifestV2ValidationError, match="threshold"):
+        FinalHoldoutCriteriaV1(
+            mode=CriteriaMode.ALL,
+            criteria=(
+                EvaluationCriterionV1(
+                    metric="holdout_rows",
+                    operator=CriterionOperator.GREATER_THAN_OR_EQUAL,
+                    threshold=float("inf"),
+                ),
+            ),
+        )
+
+
+# 6: unsupported operator/mode rejected.
+
+
+def test_final_holdout_criteria_rejects_unsupported_operator_and_mode() -> None:
+    with pytest.raises(ManifestV2ValidationError, match="unsupported criterion operator"):
+        EvaluationCriterionV1.from_payload(
+            {"metric": "holdout_rows", "operator": "==", "threshold": 1}
+        )
+    with pytest.raises(ManifestV2ValidationError, match="unsupported final holdout criteria mode"):
+        FinalHoldoutCriteriaV1.from_payload(
+            {
+                "schema_version": FINAL_HOLDOUT_CRITERIA_SCHEMA_VERSION,
+                "mode": "MAJORITY",
+                "criteria": (
+                    {"metric": "holdout_rows", "operator": ">=", "threshold": 1},
+                ),
+                "semantic_hash": f"sha256:{'0' * 64}",
+            }
+        )
+    with pytest.raises(ManifestV2ValidationError, match="mode must be CriteriaMode"):
+        FinalHoldoutCriteriaV1(mode="ALL", criteria=(EvaluationCriterionV1(  # type: ignore[arg-type]
+            metric="holdout_rows", operator=CriterionOperator.GREATER_THAN_OR_EQUAL, threshold=1
+        ),))
+    with pytest.raises(ManifestV2ValidationError, match="unsupported final holdout criteria schema_version"):
+        FinalHoldoutCriteriaV1(
+            mode=CriteriaMode.ALL,
+            criteria=(
+                EvaluationCriterionV1(
+                    metric="holdout_rows",
+                    operator=CriterionOperator.GREATER_THAN_OR_EQUAL,
+                    threshold=1,
+                ),
+            ),
+            schema_version="final-holdout-criteria-v999",
+        )
+
+
+# 7: evaluator metric vocabulary matches declared contract.
+
+
+def test_evaluator_metric_vocabulary_matches_declared_contract() -> None:
+    criteria = FinalHoldoutCriteriaV1(
+        mode=CriteriaMode.ALL,
+        criteria=(
+            EvaluationCriterionV1(
+                metric="holdout_rows", operator=CriterionOperator.GREATER_THAN_OR_EQUAL, threshold=1
+            ),
+            EvaluationCriterionV1(
+                metric="holdout_mean_return", operator=CriterionOperator.GREATER_THAN, threshold=0.0
+            ),
+        ),
+    )
+    # Simulates a HoldoutRunReceipt.aggregate_metrics mapping that satisfies
+    # the declared vocabulary (extra, undeclared keys are harmless).
+    receipt_like_metrics = {"holdout_rows": 5, "holdout_mean_return": 0.02, "extra_diagnostic": True}
+    verify_final_holdout_metric_vocabulary(criteria, receipt_like_metrics)  # does not raise
+
+
+# 8: validation criteria remain separate from holdout criteria.
+
+
+def test_validation_and_final_holdout_criteria_are_independent(tmp_path: Path) -> None:
+    registry = HypothesisRegistry(tmp_path / "registry.db")
+    _register(registry)
+    store = ArtifactStore(tmp_path / "artifacts")
+    # Deliberately using the SAME metric name in both containers to prove
+    # they are separate namespaces, not merged or cross-referenced.
+    shared_name = "mean_net_r"
+    manifest = _manifest(
+        store,
+        registry,
+        primary_metric=shared_name,
+        criteria=_criteria(metric=shared_name, threshold=0.05),
+        final_holdout_criteria=_final_holdout_criteria(metric=shared_name, threshold=0.10),
+    )
+    assert manifest.evaluation_criteria.criteria[0].threshold == 0.05
+    assert manifest.final_holdout_criteria.criteria[0].threshold == 0.10
+
+    only_validation_changed = _manifest(
+        store,
+        registry,
+        primary_metric=shared_name,
+        criteria=_criteria(metric=shared_name, threshold=0.99),
+        final_holdout_criteria=_final_holdout_criteria(metric=shared_name, threshold=0.10),
+    )
+    only_holdout_changed = _manifest(
+        store,
+        registry,
+        primary_metric=shared_name,
+        criteria=_criteria(metric=shared_name, threshold=0.05),
+        final_holdout_criteria=_final_holdout_criteria(metric=shared_name, threshold=0.99),
+    )
+    assert only_validation_changed.final_holdout_criteria.to_payload() == manifest.final_holdout_criteria.to_payload()
+    assert only_holdout_changed.evaluation_criteria.to_payload() == manifest.evaluation_criteria.to_payload()
+    assert only_validation_changed.manifest_semantic_hash != manifest.manifest_semantic_hash
+    assert only_holdout_changed.manifest_semantic_hash != manifest.manifest_semantic_hash
+    assert only_validation_changed.manifest_semantic_hash != only_holdout_changed.manifest_semantic_hash
+
+    payload = manifest.to_payload()
+    assert "evaluation_criteria" in payload["experiment"]
+    assert "final_holdout_criteria" not in payload["experiment"]
+    assert payload["final_holdout_criteria"] is not None
+    assert payload["final_holdout_criteria"] != payload["experiment"]["evaluation_criteria"]
+
+
+# 9: alpha/q/minimum_effect_size/max_hypotheses_tests are not silently reused.
+
+
+def test_final_holdout_criteria_never_reuses_validation_numeric_fields(tmp_path: Path) -> None:
+    import dataclasses
+
+    field_names = {item.name for item in dataclasses.fields(FinalHoldoutCriteriaV1)}
+    assert field_names.isdisjoint({"alpha", "q", "minimum_effect_size", "max_hypotheses_tests"})
+
+    import inspect
+
+    signature = inspect.signature(verify_final_holdout_metric_vocabulary)
+    assert set(signature.parameters) == {"criteria", "metrics"}
+
+    registry = HypothesisRegistry(tmp_path / "registry.db")
+    _register(registry)
+    store = ArtifactStore(tmp_path / "artifacts")
+    base = _manifest(store, registry, final_holdout_criteria=_final_holdout_criteria())
+    # Changing alpha/q/minimum_effect_size/max_hypotheses_tests changes the
+    # manifest's overall identity (they are still part of the manifest, as
+    # validation-stage fields) but never mutates final_holdout_criteria's
+    # own payload or semantic_hash.
+    changed = build_experiment_manifest_v2(
+        artifact_store=store,
+        hypothesis_id=HYPOTHESIS_ID,
+        hypothesis_family_id=base.hypothesis_family_id,
+        bound_hypothesis_content_hash=base.bound_hypothesis_content_hash,
+        proposal_provenance=base.proposal_provenance,
+        datasets=base.datasets,
+        split_plan=base.split_plan,
+        split_dataset_role=base.split_dataset_role,
+        test_family=base.test_family,
+        primary_metric=base.primary_metric,
+        evaluation_criteria=base.evaluation_criteria,
+        alpha=0.01,
+        q=0.01,
+        minimum_effect_size=0.5,
+        max_hypotheses_tests=999,
+        trading_friction=base.trading_friction,
+        deterministic_seed=base.deterministic_seed,
+        code_provenance=base.code_provenance,
+        semantic_parameters=base.semantic_parameters,
+        created_at=base.created_at,
+        created_by=base.created_by,
+        final_holdout_criteria=base.final_holdout_criteria,
+    )
+    assert changed.alpha != base.alpha
+    assert changed.final_holdout_criteria.to_payload() == base.final_holdout_criteria.to_payload()
+    assert changed.final_holdout_criteria.semantic_hash == base.final_holdout_criteria.semantic_hash
+
+
+# 10: old closed manifest/validation/holdout tests remain green -- verified
+# by running the full existing suites as part of the required regression
+# (see VALIDATION section of the implementation report); every pre-existing
+# test in this file above this section is unmodified.
+
+
+# 11-13: no holdout plaintext access, no provider/network, no broker/MT5
+# added by this additive contract.
+
+
+def test_final_holdout_criteria_contract_adds_no_holdout_provider_or_broker_imports() -> None:
+    import ast
+
+    source = Path("src/trademind/discovery/manifest.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+    forbidden_import_substrings = (
+        "holdout_crypto",
+        "holdout_keys",
+        "holdout_runner",
+        "holdout_sealer",
+        "requests",
+        "httpx",
+        "urllib",
+        "socket",
+        "openai",
+        "anthropic",
+        "claude",
+        "ollama",
+        "metatrader5",
+        "mt5",
+    )
+    lowered = {name.lower() for name in imported}
+    for name in lowered:
+        for term in forbidden_import_substrings:
+            assert term not in name, f"unexpected forbidden-shaped import: {name!r}"
+
+    called_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            called_names.add(node.func.id)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            called_names.add(node.func.attr)
+    forbidden_calls = {"decrypt", "decrypt_bytes", "evaluate", "OrderSend", "PositionClose", "PositionModify"}
+    assert not (called_names & forbidden_calls), called_names & forbidden_calls
+    assert "CTrade" not in source
+    assert "TRADE_ACTION_DEAL" not in source
+
+
+def test_final_holdout_criteria_does_not_apply_a_decision_or_transition(tmp_path: Path) -> None:
+    """This contract layer never applies its own rule and never transitions
+    a hypothesis -- verify_final_holdout_metric_vocabulary only checks name
+    presence, and no ACCEPTED/REJECTED_FINAL reference exists anywhere in
+    the module (that remains the explicitly out-of-scope Final Verdict /
+    Acceptance Control layer's responsibility)."""
+    source = Path("src/trademind/discovery/manifest.py").read_text(encoding="utf-8")
+    assert "HypothesisState" not in source
+    assert "ACCEPTED" not in source
+    assert "REJECTED_FINAL" not in source
+    assert "registry.transition" not in source
+
+    registry = HypothesisRegistry(tmp_path / "registry.db")
+    _register(registry)
+    assert registry.get(HYPOTHESIS_ID).state is HypothesisState.PROPOSED
+    store = ArtifactStore(tmp_path / "artifacts")
+    criteria = _final_holdout_criteria(metric="holdout_rows", threshold=1_000_000)
+    _manifest(store, registry, final_holdout_criteria=criteria)
+    # Building a manifest with an intentionally-unsatisfiable final holdout
+    # criterion has no effect on hypothesis state at all -- this layer only
+    # declares the contract, it never evaluates or enforces it.
     assert registry.get(HYPOTHESIS_ID).state is HypothesisState.PROPOSED

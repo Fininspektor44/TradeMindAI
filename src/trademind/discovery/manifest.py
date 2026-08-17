@@ -332,6 +332,7 @@ EXPERIMENT_MANIFEST_V2_MEDIA_TYPE = "application/vnd.trademind.experiment-manife
 PROPOSAL_INTAKE_PROVENANCE_SCHEMA_VERSION = "experiment-manifest-proposal-intake-provenance-v1"
 EVALUATION_CRITERIA_SCHEMA_VERSION = "experiment-evaluation-criteria-v1"
 TRADING_FRICTION_SCHEMA_VERSION = "experiment-trading-friction-v1"
+FINAL_HOLDOUT_CRITERIA_SCHEMA_VERSION = "experiment-final-holdout-criteria-v1"
 
 MAX_MANIFEST_DATASETS = 32
 MAX_MANIFEST_CRITERIA = 16
@@ -341,6 +342,7 @@ MAX_MANIFEST_TESTS = 1_000_000
 MAX_FRICTION_VALUE = 1_000_000.0
 
 _MANIFEST_V2_HASH_DOMAIN = b"trademind:discovery:experiment-manifest:v2"
+_FINAL_HOLDOUT_CRITERIA_HASH_DOMAIN = b"trademind:discovery:final-holdout-criteria:v1"
 _MACHINE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _FAMILY_ID = re.compile(r"^hf_[0-9a-f]{64}$")
@@ -756,6 +758,156 @@ class EvaluationCriteriaV1:
 
 
 @dataclass(frozen=True, slots=True)
+class FinalHoldoutCriteriaV1:
+    """Explicit, stage-scoped decision contract for the FINAL HOLDOUT stage
+    only.
+
+    Structurally identical in shape to ``EvaluationCriteriaV1`` -- it reuses
+    the same ``CriterionOperator``/``CriteriaMode``/``EvaluationCriterionV1``
+    vocabulary, since ``>``, ``>=``, ``<``, ``<=``, ``ALL``, and ``ANY``
+    carry no stage-specific meaning -- but is a SEPARATE field, a SEPARATE
+    schema, and a SEPARATE Python type from ``evaluation_criteria``. The two
+    are never interchangeable, and building or reading one never assumes or
+    derives the other. This is the only manifest-level declaration of which
+    metric names a ``HoldoutEvaluator`` (discovery/holdout_runner.py) is
+    contractually required to return, and the threshold rule that governs
+    them; it does not itself apply that rule to anything -- consuming it to
+    compute a final research verdict is the explicitly out-of-scope
+    responsibility of a future Final Verdict / Acceptance Control layer.
+    ``verify_final_holdout_metric_vocabulary`` below is the one piece of
+    consumption logic this module provides: a pure structural check that
+    observed metrics satisfy the declared NAME vocabulary, never an
+    evaluation of the operators/thresholds themselves and never a verdict.
+
+    ``ExperimentManifestV2.alpha``/``q``/``minimum_effect_size``/
+    ``max_hypotheses_tests`` are validation-stage significance/effect-size
+    controls (consumed today only by ``ValidationExecutionControl``) and are
+    NOT implicitly reapplied to the final-holdout decision by this contract
+    or by anything that reads it. A manifest that wants an equivalent
+    significance/effect-size gate at the holdout stage too must express it
+    explicitly as one or more criteria here -- reusing those validation-stage
+    numeric fields a second time, unchanged, for an entirely different
+    metric space would silently assume a correspondence this contract makes
+    no promise of.
+    """
+
+    mode: CriteriaMode
+    criteria: tuple[EvaluationCriterionV1, ...]
+    schema_version: str = FINAL_HOLDOUT_CRITERIA_SCHEMA_VERSION
+    semantic_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.schema_version != FINAL_HOLDOUT_CRITERIA_SCHEMA_VERSION:
+            raise ManifestV2ValidationError(
+                "unsupported final holdout criteria schema_version"
+            )
+        if type(self.mode) is not CriteriaMode:
+            raise ManifestV2ValidationError("final holdout criteria mode must be CriteriaMode")
+        if type(self.criteria) is not tuple or not 1 <= len(self.criteria) <= MAX_MANIFEST_CRITERIA:
+            raise ManifestV2ValidationError(
+                f"final holdout criteria must contain between 1 and {MAX_MANIFEST_CRITERIA} entries"
+            )
+        if not all(type(item) is EvaluationCriterionV1 for item in self.criteria):
+            raise ManifestV2ValidationError("final holdout criteria contains an invalid criterion")
+        identities = [canonical_json_bytes(item.to_payload()) for item in self.criteria]
+        if len(set(identities)) != len(identities):
+            raise ManifestV2ValidationError("final holdout criteria contains duplicate entries")
+        ordered = tuple(
+            sorted(self.criteria, key=lambda item: canonical_json_bytes(item.to_payload()))
+        )
+        object.__setattr__(self, "criteria", ordered)
+        object.__setattr__(
+            self,
+            "semantic_hash",
+            sha256_bytes(
+                _FINAL_HOLDOUT_CRITERIA_HASH_DOMAIN
+                + b"\x00"
+                + canonical_json_bytes(self._semantic_payload())
+            ),
+        )
+        canonical_json_bytes(self.to_payload())
+
+    def _semantic_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "mode": self.mode.value,
+            "criteria": [item.to_payload() for item in self.criteria],
+        }
+
+    @property
+    def required_metric_names(self) -> frozenset[str]:
+        """The closed set of metric names a HoldoutEvaluator must return for
+        this contract to be checkable at all."""
+        return frozenset(item.metric for item in self.criteria)
+
+    def to_payload(self) -> dict[str, object]:
+        payload = self._semantic_payload()
+        payload["semantic_hash"] = self.semantic_hash
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> FinalHoldoutCriteriaV1:
+        _v2_exact_fields(
+            payload,
+            required=frozenset({"schema_version", "mode", "criteria", "semantic_hash"}),
+            field_name="final_holdout_criteria",
+        )
+        try:
+            mode = CriteriaMode(payload["mode"])
+        except (TypeError, ValueError) as exc:
+            raise ManifestV2ValidationError("unsupported final holdout criteria mode") from exc
+        raw_criteria = payload["criteria"]
+        if type(raw_criteria) is not tuple:
+            raise ManifestV2ValidationError("final holdout criteria.criteria must be a JSON array")
+        parsed: list[EvaluationCriterionV1] = []
+        for index, item in enumerate(raw_criteria):
+            if not isinstance(item, Mapping):
+                raise ManifestV2ValidationError(
+                    f"final_holdout_criteria.criteria[{index}] must be a JSON object"
+                )
+            parsed.append(EvaluationCriterionV1.from_payload(item))
+        built = cls(
+            schema_version=payload["schema_version"],
+            mode=mode,
+            criteria=tuple(parsed),
+        )
+        try:
+            claimed_hash = validate_sha256_ref(payload["semantic_hash"])
+        except ProvenanceError as exc:
+            raise ManifestV2ValidationError(
+                "final_holdout_criteria.semantic_hash is invalid"
+            ) from exc
+        if claimed_hash != built.semantic_hash:
+            raise ManifestV2ValidationError("final_holdout_criteria hash identity mismatch")
+        return built
+
+
+def verify_final_holdout_metric_vocabulary(
+    criteria: FinalHoldoutCriteriaV1,
+    metrics: Mapping[str, object],
+) -> None:
+    """Pure, structural check: every metric name ``criteria`` declares must
+    be present in ``metrics`` (e.g. a ``HoldoutRunReceipt.aggregate_metrics``).
+
+    Does not evaluate operators/thresholds and does not produce a verdict --
+    applying the decision rule to compute a final research outcome remains
+    the responsibility of a future Final Verdict / Acceptance Control layer.
+    Fails closed (raises ``ManifestV2ValidationError``) if any required
+    metric name is absent, exactly the failure mode a caller-forged or
+    incomplete metrics mapping must trigger.
+    """
+    if type(criteria) is not FinalHoldoutCriteriaV1:
+        raise ManifestV2ValidationError("criteria must be an exact FinalHoldoutCriteriaV1")
+    if not isinstance(metrics, Mapping):
+        raise ManifestV2ValidationError("metrics must be a mapping")
+    missing = criteria.required_metric_names - frozenset(metrics)
+    if missing:
+        raise ManifestV2ValidationError(
+            f"final holdout metrics are missing required names: {', '.join(sorted(missing))}"
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TradingFrictionV1:
     """Provider-neutral predeclared friction assumptions in one explicit unit."""
 
@@ -834,6 +986,16 @@ class ExperimentManifestV2:
     Test-family and metric identifiers are predeclared names, not proof that a
     future runner supports them; the trusted creation/execution boundary must
     bind them to its explicit supported vocabulary before running anything.
+
+    ``evaluation_criteria`` (together with ``alpha``/``q``/
+    ``minimum_effect_size``/``max_hypotheses_tests``) is the VALIDATION-stage
+    decision contract, consumed by ``ValidationExecutionControl``. It is never
+    assumed to also govern the final-holdout decision. ``final_holdout_criteria``
+    (``FinalHoldoutCriteriaV1`` or ``None``) is the separate, explicit,
+    optional contract for that later stage -- see its own docstring. A
+    manifest with ``final_holdout_criteria=None`` declares no automated
+    final-holdout decision rule at all; nothing in this dataclass infers one
+    from ``evaluation_criteria`` in that case.
     """
 
     hypothesis_id: str
@@ -856,6 +1018,7 @@ class ExperimentManifestV2:
     semantic_parameters: Mapping[str, FrozenJsonValue]
     created_at: str
     created_by: str
+    final_holdout_criteria: FinalHoldoutCriteriaV1 | None = None
     schema_version: str = EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION
     manifest_semantic_hash: str = field(init=False)
 
@@ -943,6 +1106,13 @@ class ExperimentManifestV2:
             and type(self.trading_friction) is not TradingFrictionV1
         ):
             raise ManifestV2ValidationError("trading_friction must be TradingFrictionV1 or null")
+        if (
+            self.final_holdout_criteria is not None
+            and type(self.final_holdout_criteria) is not FinalHoldoutCriteriaV1
+        ):
+            raise ManifestV2ValidationError(
+                "final_holdout_criteria must be FinalHoldoutCriteriaV1 or null"
+            )
         if self.deterministic_seed is not None and (
             type(self.deterministic_seed) is not int
             or not 0 <= self.deterministic_seed <= MAX_JSON_INTEGER_ABS
@@ -1010,6 +1180,11 @@ class ExperimentManifestV2:
                 "parameters": _v2_json_compatible(self.semantic_parameters),
             },
             "code_provenance": self.code_provenance.to_payload(),
+            "final_holdout_criteria": (
+                self.final_holdout_criteria.to_payload()
+                if self.final_holdout_criteria is not None
+                else None
+            ),
         }
 
     def to_payload(self) -> dict[str, object]:
@@ -1049,6 +1224,7 @@ class ExperimentManifestV2:
                     "experiment",
                     "code_provenance",
                     "diagnostics",
+                    "final_holdout_criteria",
                 }
             ),
             field_name="experiment_manifest_v2",
@@ -1067,6 +1243,7 @@ class ExperimentManifestV2:
         experiment = frozen["experiment"]
         code_provenance = frozen["code_provenance"]
         diagnostics = frozen["diagnostics"]
+        raw_final_holdout_criteria = frozen["final_holdout_criteria"]
         for field_name, value in (
             ("hypothesis", hypothesis),
             ("proposal_provenance", provenance),
@@ -1079,6 +1256,12 @@ class ExperimentManifestV2:
                 raise ManifestV2ValidationError(f"{field_name} must be a JSON object")
         if type(raw_datasets) is not tuple:
             raise ManifestV2ValidationError("datasets must be a JSON array")
+        if raw_final_holdout_criteria is not None and not isinstance(
+            raw_final_holdout_criteria, Mapping
+        ):
+            raise ManifestV2ValidationError(
+                "final_holdout_criteria must be a JSON object or null"
+            )
 
         _v2_exact_fields(
             hypothesis,
@@ -1171,6 +1354,11 @@ class ExperimentManifestV2:
             semantic_parameters=raw_parameters,
             created_at=diagnostics["created_at"],
             created_by=diagnostics["created_by"],
+            final_holdout_criteria=(
+                FinalHoldoutCriteriaV1.from_payload(raw_final_holdout_criteria)
+                if isinstance(raw_final_holdout_criteria, Mapping)
+                else None
+            ),
         )
         if manifest.manifest_semantic_hash != claimed_manifest_hash:
             raise ManifestV2ValidationError("manifest semantic identity mismatch")
@@ -1202,12 +1390,17 @@ def build_experiment_manifest_v2(
     semantic_parameters: Mapping[str, object],
     created_at: str,
     created_by: str,
+    final_holdout_criteria: FinalHoldoutCriteriaV1 | None = None,
 ) -> ExperimentManifestV2:
     """Build a V2 contract and verify dataset identities without reading rows.
 
     This pure prerequisite does not verify Proposal Intake acceptance, authorize
     execution, write audit, or freeze the hypothesis. Those controls belong to
     the future trusted Experiment Manifest Creation workflow.
+
+    ``final_holdout_criteria`` defaults to ``None`` (no automated final-holdout
+    decision rule declared) for backward compatibility with every existing
+    caller; it is never derived from ``evaluation_criteria``.
     """
     manifest = ExperimentManifestV2(
         hypothesis_id=hypothesis_id,
@@ -1230,6 +1423,7 @@ def build_experiment_manifest_v2(
         semantic_parameters=semantic_parameters,
         created_at=created_at,
         created_by=created_by,
+        final_holdout_criteria=final_holdout_criteria,
     )
     manifest.verify_datasets(artifact_store)
     return manifest
