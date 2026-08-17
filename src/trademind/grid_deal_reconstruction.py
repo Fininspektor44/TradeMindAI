@@ -1,10 +1,21 @@
-"""Reconstruct grid baskets from a read-only MT5 deal export."""
+"""Reconstruct multi-leg deal baskets from a read-only MT5 deal export.
+
+The obsolete grid-strategy CLI wrapper and reporting pipeline that used to sit
+on top of this module (grid_basket_analytics.py, grid_basket_audit.py,
+grid_snapshot_drawdown.py, robot_control_center.py,
+control_center_watchdog.py, and this module's own ``run_reconstruction``/
+``main`` CLI entrypoint) were removed once the grid trading strategy was
+retired from the product. ``reconstruct_grid_legs`` itself is retained: it
+groups deals into baskets purely by (magic, symbol, side) -- generic
+multi-leg/position-grouping logic with no grid-specific averaging, step, or
+lot-progression rules -- and remains a real, active dependency of
+``trademind.breakeven_counterfactual``'s basket break-even analysis, which
+has nothing to do with the retired grid strategy.
+"""
 
 from __future__ import annotations
 
-import argparse
 import csv
-import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -84,28 +95,9 @@ def _iso_from_millis(value: Any) -> str:
     return datetime.fromtimestamp(milliseconds / 1000.0, tz=timezone.utc).isoformat()
 
 
-def _atomic_csv(path: Path, fields: Sequence[str], rows: Sequence[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    temporary.replace(path)
-
-
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
-    )
-    temporary.replace(path)
-
-
 def _load_deals(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
-        raise ValueError(f"MT5 grid deal file not found: {path}")
+        raise ValueError(f"MT5 deal file not found: {path}")
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         fields = tuple(reader.fieldnames or ())
@@ -114,7 +106,7 @@ def _load_deals(path: Path) -> list[dict[str, Any]]:
             raise ValueError(f"MT5 deal file misses fields: {', '.join(missing)}")
         rows = [dict(row) for row in reader]
     if not rows:
-        raise ValueError(f"MT5 grid deal file is empty: {path}")
+        raise ValueError(f"MT5 deal file is empty: {path}")
     seen: set[int] = set()
     for row in rows:
         ticket = _int(row.get("ticket"))
@@ -259,64 +251,3 @@ def reconstruct_grid_legs(deals: Sequence[dict[str, Any]]) -> tuple[list[dict[st
         "unsupported_inout": unsupported_inout,
     }
     return legs, stats
-
-
-@dataclass(frozen=True, slots=True)
-class ReconstructionSummary:
-    output_path: Path
-    status_path: Path
-    stats: dict[str, int]
-
-
-def run_reconstruction(deals_path: Path, output_path: Path) -> ReconstructionSummary:
-    deals = _load_deals(deals_path)
-    legs, stats = reconstruct_grid_legs(deals)
-    if not legs:
-        raise ValueError("No grid opening legs could be reconstructed from the MT5 deal export")
-    _atomic_csv(output_path, LEG_FIELDS, legs)
-    status_path = output_path.with_name("reconstruction_status.json")
-    status = {
-        "schema_version": SCHEMA_VERSION,
-        "state": "OK" if stats["unsupported_inout"] == 0 else "WARN",
-        "source_path": str(deals_path),
-        "output_path": str(output_path),
-        "orders_enabled": False,
-        "source_modified": False,
-        "signal_generation_enabled": False,
-        **stats,
-    }
-    _atomic_json(status_path, status)
-    return ReconstructionSummary(output_path=output_path, status_path=status_path, stats=stats)
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Reconstruct TradeMind grid baskets from MT5 deals")
-    parser.add_argument(
-        "--deals",
-        type=Path,
-        default=Path("data/grid_deals_v1_15/grid_deals.csv"),
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("data/grid_basket_v1_15/basket_legs.csv"),
-    )
-    args = parser.parse_args(argv)
-    try:
-        summary = run_reconstruction(
-            args.deals.expanduser().resolve(),
-            args.output.expanduser().resolve(),
-        )
-    except (OSError, ValueError, csv.Error, json.JSONDecodeError) as exc:
-        print(f"Grid deal reconstruction failed: {exc}")
-        return 1
-    print("TradeMind v1.15 MT5 Grid Deal Reconstruction")
-    print("Read-only. No signals. No orders. Source deal CSV unchanged.")
-    for key, value in summary.stats.items():
-        print(f"{key}: {value}")
-    print(f"Output: {summary.output_path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+# grid_deal_reconstruction retains only its generic (magic, symbol, side)
+# basket/leg reconstruction utility -- unrelated to the retired grid trading
+# strategy -- specifically because this module depends on it. See that
+# module's own docstring.
 from trademind.grid_deal_reconstruction import _load_deals, reconstruct_grid_legs
 
 VERSION = "1.29.0"

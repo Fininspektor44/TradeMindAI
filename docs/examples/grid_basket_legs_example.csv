@@ -1,3 +1,0 @@
-basket_id,robot,magic,symbol,side,leg_no,opened_at,price,volume,closed_at,gross_profit,commission,swap,net_profit,exit_reason,max_drawdown_money,max_drawdown_pct,max_adverse_points,atr_points,spread_points,session,trend_h1,trend_h4,news_window
-GRID-20260805-0001,AOExtremum,445501,EURCAD,BUY,1,2026-08-05T00:10:00Z,1.60500,0.01,2026-08-05T06:30:00Z,18.40,-1.20,-0.10,17.10,TP,42.00,2.10,420,180,22,ASIA,UP,UP,0
-GRID-20260805-0001,AOExtremum,445501,EURCAD,BUY,2,2026-08-05T01:10:00Z,1.60250,0.02,2026-08-05T06:30:00Z,18.40,-1.20,-0.10,17.10,TP,42.00,2.10,420,190,25,ASIA,UP,UP,0
