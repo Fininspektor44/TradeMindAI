@@ -283,7 +283,9 @@ def verify_frozen_manifest(
     if stored != actual:
         raise ManifestIntegrityError("frozen manifest self-hash mismatch")
     if actual != expected_manifest_hash:
-        raise ManifestIntegrityError("frozen manifest does not match externally frozen manifest_hash")
+        raise ManifestIntegrityError(
+            "frozen manifest does not match externally frozen manifest_hash"
+        )
 
     try:
         family_definition = payload["family_definition"]
@@ -304,9 +306,13 @@ def verify_frozen_manifest(
     except (KeyError, TypeError, ValueError) as exc:
         raise ManifestIntegrityError("manifest identity fields are invalid") from exc
     if payload.get("hypothesis_family_id") != derived_family_id:
-        raise ManifestIntegrityError("manifest hypothesis_family_id is not derived from family_definition")
+        raise ManifestIntegrityError(
+            "manifest hypothesis_family_id is not derived from family_definition"
+        )
     if payload.get("content_hash") != derived_content_hash:
-        raise ManifestIntegrityError("manifest content_hash is not derived from frozen hypothesis content")
+        raise ManifestIntegrityError(
+            "manifest content_hash is not derived from frozen hypothesis content"
+        )
 
     raw_datasets = payload.get("datasets")
     if not isinstance(raw_datasets, list) or not raw_datasets:

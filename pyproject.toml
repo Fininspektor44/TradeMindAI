@@ -73,6 +73,7 @@ trademind-breakeven-counterfactual = "trademind.breakeven_counterfactual:main"
 trademind-breakeven-runtime = "trademind.breakeven_runtime:main"
 trademind-breakeven-report = "trademind.breakeven_decision_report:main"
 trademind-orchestrator-mock = "trademind.orchestrator.mock_runner:main"
+trademind-mt5-prospective-monitor = "trademind.mt5_prospective_monitor:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
