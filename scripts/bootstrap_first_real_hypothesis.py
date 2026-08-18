@@ -100,6 +100,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import hashlib
 import json
 import sys
@@ -763,6 +764,78 @@ def _print_review(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3b: deterministic SQLite resource release for the temporary review
+# chain.
+#
+# AUDIT: every DB-owning object ``run_bootstrap_chain`` constructs
+# (``HypothesisRegistry``, ``ArtifactStore``, ``ControlPlane``,
+# ``BudgetManager``, ``ResearchExecutionControl``,
+# ``ResearchProposalIntakeControl``, ``ResearchExperimentSpecificationControl``)
+# already connects to SQLite per-call (``with self._connect() as db: ...``)
+# rather than holding one persistent connection as instance state --
+# ``ArtifactStore`` uses no SQLite at all and already closes every OS file
+# descriptor it opens via ``os.close``/``with os.fdopen(...) as handle``.
+# None of these classes expose (or need) a public ``close()``/context-manager
+# API of their own, because none of them owns a long-lived connection to
+# close -- each per-call ``sqlite3.Connection`` is a local variable whose
+# underlying OS handle CPython's own reference counting releases the
+# instant every reference to it is gone.
+#
+# The real Windows failure traces to exactly the case reference counting
+# does NOT resolve immediately: when an exception propagates out of
+# ``run_bootstrap_chain`` while still inside the caller's
+# ``with tempfile.TemporaryDirectory(...)`` block, the exception's own
+# ``__traceback__`` keeps every frame between the failure point and the
+# catch site alive -- including any still-open per-call
+# ``sqlite3.Connection`` local to those frames -- for as long as the
+# exception object itself is referenced. If that exception (or a new one
+# chained ``from`` it) is left to propagate through the ``with`` block's own
+# ``__exit__`` (which deletes the directory), those connections are still
+# open at the exact moment Windows refuses the delete.
+#
+# The smallest fix that needs no change to any of the six already-closed,
+# already-audited production modules above is therefore local to this
+# script: run the chain, and on ANY outcome, catch the exception (letting
+# Python's own ``except ... as exc:`` machinery clear that binding at the
+# end of the block), drop every local reference, and force a garbage
+# collection pass -- all strictly BEFORE returning control to the caller's
+# ``with tempfile.TemporaryDirectory(...)`` block, so every SQLite handle
+# is released deterministically before that block's own ``__exit__`` ever
+# runs. No WinError 32 is suppressed or ignored: this fix prevents the
+# handle from still being open when deletion is attempted, it does not
+# catch or ignore a deletion failure.
+# ---------------------------------------------------------------------------
+
+
+def _run_review_chain(
+    args: argparse.Namespace,
+    *,
+    tmp_path: Path,
+    observed_rows: int,
+    dataset_csv_path: Path,
+    bound_dataset: BoundDataset,
+) -> tuple[BootstrapResult | None, str | None]:
+    """Run the bootstrap chain against the throwaway review directory and
+    deterministically release every SQLite handle it opened -- on success
+    AND on failure -- before returning. Never raises: the caller is
+    expected to still be inside the
+    ``with tempfile.TemporaryDirectory(...)`` block when this returns, and
+    must not re-raise until AFTER that block has exited, so that no
+    exception's traceback is alive while the directory is being deleted."""
+    try:
+        result = run_bootstrap_chain(
+            args, db_path=tmp_path / "registry.db", artifact_root=tmp_path / "artifacts",
+            orchestrator_db_path=tmp_path / "registry.db", observed_rows=observed_rows,
+            dataset_csv_path=dataset_csv_path, bound_dataset=bound_dataset,
+        )
+        return result, None
+    except Exception as exc:  # noqa: BLE001 -- every exception path must still release its DB handles before the caller's tempdir cleanup runs.
+        return None, f"{type(exc).__name__}: {exc}"
+    finally:
+        gc.collect()
+
+
+# ---------------------------------------------------------------------------
 # Entry point.
 # ---------------------------------------------------------------------------
 
@@ -855,11 +928,20 @@ def run(args: argparse.Namespace) -> int:
             tmp_path = Path(tmp)
             dataset_csv_path = tmp_path / f"{bound_dataset.dataset_hash}.csv"
             dataset_csv_path.write_bytes(bound_dataset.csv_bytes)
-            result = run_bootstrap_chain(
-                args, db_path=tmp_path / "registry.db", artifact_root=tmp_path / "artifacts",
-                orchestrator_db_path=tmp_path / "registry.db", observed_rows=observed_rows,
+            result, chain_error = _run_review_chain(
+                args, tmp_path=tmp_path, observed_rows=observed_rows,
                 dataset_csv_path=dataset_csv_path, bound_dataset=bound_dataset,
             )
+        # Every SQLite handle opened inside the chain above has already been
+        # released (see _run_review_chain's own docstring) BEFORE this point
+        # -- the `with` block's __exit__ (directory deletion) has already
+        # run successfully by the time we get here. Only now, outside that
+        # block, is it safe to surface a failure as a fresh exception (never
+        # chained `from` the original, so no stale traceback/frame is kept
+        # alive by this new one either).
+        if chain_error is not None:
+            raise BootstrapGapError([chain_error])
+        assert result is not None
         _print_review(result, coverage_count=observed_rows, key=key, bound_dataset=bound_dataset)
         print()
         print("Nothing was written to the real registry. Re-run with --approve to freeze for real.")

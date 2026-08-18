@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ast
+import gc
 import importlib
 import json
+import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -536,3 +539,106 @@ def test_no_numeric_literal_hardcoded_in_bind_function() -> None:
                     pytest.fail(
                         "bind_dataset_to_outcome_journal_scope must never hardcode a numeric dict value"
                     )
+
+
+# ---------------------------------------------------------------------------
+# SQLite resource lifecycle: REVIEW must close every DB handle before its
+# TemporaryDirectory is deleted (the real Windows WinError 32 failure this
+# task fixes).
+# ---------------------------------------------------------------------------
+
+
+def _review_temp_dirs() -> set[Path]:
+    root = Path(tempfile.gettempdir())
+    return {path for path in root.glob("ser8-bootstrap-review-*") if path.is_dir()}
+
+
+def _live_sqlite_connections() -> list[sqlite3.Connection]:
+    gc.collect()
+    return [obj for obj in gc.get_objects() if isinstance(obj, sqlite3.Connection)]
+
+
+def test_review_completes_successfully(genuine_scope: Path) -> None:
+    exit_code = bootstrap_module.main(_full_argv(genuine_scope))
+    assert exit_code == 0
+
+
+def test_temporary_review_directory_is_actually_deleted(genuine_scope: Path) -> None:
+    before = _review_temp_dirs()
+    exit_code = bootstrap_module.main(_full_argv(genuine_scope))
+    assert exit_code == 0
+    after = _review_temp_dirs()
+    # No new ser8-bootstrap-review-* directory survives the call -- proves
+    # tempfile.TemporaryDirectory's own cleanup actually succeeded rather
+    # than being silently skipped or suppressed.
+    assert after == before
+
+
+def test_repeated_review_runs_do_not_leak_sqlite_connections(genuine_scope: Path) -> None:
+    baseline = len(_live_sqlite_connections())
+    for _ in range(5):
+        exit_code = bootstrap_module.main(_full_argv(genuine_scope))
+        assert exit_code == 0
+        # After each individual review run, every SQLite connection that
+        # run opened must already be gone -- not merely "eventually
+        # collected" by the time the whole test finishes.
+        assert len(_live_sqlite_connections()) == baseline
+    assert len(_live_sqlite_connections()) == baseline
+
+
+def test_exception_path_releases_db_handles_and_still_deletes_directory(
+    genuine_scope: Path, monkeypatch, capsys
+) -> None:
+    """Force a failure INSIDE run_bootstrap_chain, well after several real
+    SQLite connections have already been opened (HypothesisRegistry,
+    ControlPlane, BudgetManager, ResearchExecutionControl,
+    ResearchProposalIntakeControl, ResearchExperimentSpecificationControl
+    are all constructed before chronological_split is ever called) -- the
+    exact scenario that produced WinError 32 on Windows."""
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("synthetic failure deep inside the authoritative chain")
+
+    monkeypatch.setattr(bootstrap_module, "chronological_split", _boom)
+
+    before_dirs = _review_temp_dirs()
+    baseline_connections = len(_live_sqlite_connections())
+
+    exit_code = bootstrap_module.main(_full_argv(genuine_scope))
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "synthetic failure deep inside the authoritative chain" in captured.err
+
+    after_dirs = _review_temp_dirs()
+    assert after_dirs == before_dirs  # the temp directory was still deleted despite the failure.
+    assert len(_live_sqlite_connections()) == baseline_connections  # every handle was still released.
+
+
+def test_review_and_approve_hashes_unchanged_by_the_lifecycle_fix(genuine_scope: Path, capsys) -> None:
+    """The exact same invariant tests/test_bootstrap_first_real_hypothesis.py
+    already proved before this fix -- re-asserted here to make the
+    "unchanged by this task" requirement an explicit, standalone test."""
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv)
+    review_out = capsys.readouterr().out
+    review_id = next(line for line in review_out.splitlines() if "hypothesis_id" in line).split("=")[1].strip()
+    review_hash = next(line for line in review_out.splitlines() if line.startswith("DATASET HASH:")).split(":", 1)[1].strip()
+
+    bootstrap_module.main(argv + ["--approve"])
+    approve_out = capsys.readouterr().out
+    approve_id = next(line for line in approve_out.splitlines() if "hypothesis_id" in line).split("=")[1].strip()
+    approve_hash_line = next(line for line in approve_out.splitlines() if "dataset_hash" in line)
+
+    assert review_id == approve_id
+    assert review_hash in approve_hash_line
+
+
+def test_approve_mode_untouched_by_lifecycle_fix() -> None:
+    """--approve never uses tempfile.TemporaryDirectory or
+    _run_review_chain at all -- its own control flow is unmodified."""
+    source = Path(bootstrap_module.__file__).read_text(encoding="utf-8")
+    approve_block_start = source.index("if args.approve:")
+    approve_block = source[approve_block_start : source.index("with tempfile.TemporaryDirectory")]
+    assert "_run_review_chain" not in approve_block
+    assert "TemporaryDirectory" not in approve_block
