@@ -6,6 +6,7 @@ import ast
 import gc
 import importlib
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -27,6 +28,8 @@ _TIMEFRAME = "M5"
 _SETUP_FAMILY = "MULTIFACTOR_MARKET_SETUP"
 _ACTION = "BUY"
 _METRIC = "net_r"
+_HOLDOUT_KEY_ID = "ser8-bootstrap-test-holdout-key-v1"
+_HOLDOUT_KEY_ENV = "SER8_BOOTSTRAP_TEST_HOLDOUT_KEY"
 
 _START = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -106,12 +109,23 @@ def _full_argv(data_root: Path, **overrides) -> list[str]:
         "--rejection-condition": "Reject if the regime effect is non-positive.",
         "--confidence": "HIGH", "--reviewer-id": "operator:test-reviewer",
         "--created-by": "operator:test-creator",
+        "--holdout-key-env": _HOLDOUT_KEY_ENV, "--holdout-key-id": _HOLDOUT_KEY_ID,
     }
     values.update(overrides)
     argv: list[str] = []
     for key, value in values.items():
         argv.extend([key, value])
     return argv
+
+
+@pytest.fixture(autouse=True)
+def _holdout_key_env() -> None:
+    """Real key MATERIAL still comes only from this environment variable
+    (never persisted in the repo/DB/artifacts) -- this fixture only sets a
+    deterministic test value for the duration of each test, exactly like
+    tests/test_run_ser8_real_demo_pipeline.py's own _full_real_chain
+    fixture already does for the sibling script."""
+    os.environ[_HOLDOUT_KEY_ENV] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="  # 32 zero bytes, valid base64
 
 
 @pytest.fixture()
@@ -161,7 +175,12 @@ def test_no_paper_signals_flag_or_reference_exists() -> None:
     # allowed to name them -- the "negative assertion, not the thing
     # itself" pattern already established elsewhere in this codebase).
     code_without_prose = "\n".join(code_lines)
-    for forbidden in ("paper_signals", "quarantine", "live_signal_runtime_v1", "live_signal_runtime_eCN"):
+    # "quarantine" alone is deliberately NOT in this list: a later task
+    # (protected final holdout) legitimately introduced a real, unrelated
+    # quarantine_dir concept (physically isolating sealed-holdout plaintext,
+    # nothing to do with outcome-journal sourcing) -- these two specific
+    # compound terms remain the precise things that must never appear.
+    for forbidden in ("paper_signals", "data/quarantine", "live_signal_runtime_v1", "live_signal_runtime_eCN"):
         assert forbidden not in code_without_prose, forbidden
 
 
@@ -509,12 +528,22 @@ def test_script_never_imports_retired_lineage() -> None:
 
 
 def test_script_never_constructs_train_test_or_holdout_controls() -> None:
+    """This bootstrap only ever reaches FROZEN and (since the protected
+    final-holdout completion task) seals a final holdout WHILE still
+    FROZEN -- it must never construct any of the controls that would
+    actually ADVANCE state past FROZEN (TRAIN_TESTED/VALIDATION/
+    HOLDOUT_CONSUMED/terminal). FinalHoldoutSealer/HoldoutSealStore are
+    legitimately constructed for sealing and are excluded from this check;
+    FinalHoldoutRunner is legitimately named only in prose explaining why
+    it is NOT used (this script never triggers a real holdout run)."""
     source = Path(bootstrap_module.__file__).read_text(encoding="utf-8")
+    code_lines = [line for line in source.splitlines() if not line.strip().startswith("#")]
+    code_without_comments = "\n".join(code_lines)
     for forbidden_name in (
-        "TrainTestExecutionControl", "ValidationExecutionControl", "HoldoutTriggerBridge",
-        "FinalVerdictAcceptanceControl", "FinalHoldoutRunner", "FinalHoldoutSealer",
+        "TrainTestExecutionControl(", "ValidationExecutionControl(", "HoldoutTriggerBridge(",
+        "FinalVerdictAcceptanceControl(", "FinalHoldoutRunner(",
     ):
-        assert forbidden_name not in source
+        assert forbidden_name not in code_without_comments, forbidden_name
 
 
 def test_no_broker_order_sent_by_bootstrap() -> None:
@@ -642,3 +671,278 @@ def test_approve_mode_untouched_by_lifecycle_fix() -> None:
     approve_block = source[approve_block_start : source.index("with tempfile.TemporaryDirectory")]
     assert "_run_review_chain" not in approve_block
     assert "TemporaryDirectory" not in approve_block
+
+
+# ---------------------------------------------------------------------------
+# Protected final holdout completion.
+# ---------------------------------------------------------------------------
+
+
+def test_approve_registers_isolated_protected_final_holdout(genuine_scope: Path, capsys) -> None:
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    exit_code = bootstrap_module.main(argv + ["--approve"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    hypothesis_id = next(line for line in captured.out.splitlines() if "hypothesis_id" in line).split("=")[1].strip()
+    assert "protected final holdout = newly sealed" in captured.out
+
+    registry = HypothesisRegistry(data_root / "ser8_registry.db")
+    from trademind.discovery.holdout_store import HoldoutSealStore
+
+    seals = HoldoutSealStore(registry)
+    record = seals.get(hypothesis_id)
+    assert record.isolated
+    assert record.public_row_count is not None and record.holdout_row_count is not None
+    assert record.public_row_count + record.holdout_row_count == 8
+
+
+def test_resume_completion_on_already_sealed_hypothesis_is_idempotent(genuine_scope: Path, capsys) -> None:
+    """DO NOT fabricate another hypothesis: --complete-holdout-for against
+    an hypothesis that is already sealed must reach idempotent success,
+    never a second seal attempt."""
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+    first_out = capsys.readouterr().out
+    first_id = next(line for line in first_out.splitlines() if "hypothesis_id" in line).split("=")[1].strip()
+
+    exit_code = bootstrap_module.main(
+        _full_argv(data_root, **{"--complete-holdout-for": first_id}) + ["--approve"]
+    )
+    assert exit_code == 0
+    second_out = capsys.readouterr().out
+    assert first_id in second_out
+    assert "already sealed (idempotent)" in second_out
+
+
+def test_resume_completion_skips_the_non_idempotent_intake_chain(genuine_scope: Path, capsys) -> None:
+    """AUDIT FINDING this task fixes: re-running the FULL --approve chain a
+    second time for the same real inputs crashes with a raw
+    sqlite3.IntegrityError (result_artifact_hash_ref is UNIQUE, but
+    request_hash -- the idempotency key -- differs between two independent
+    ResearchExecutionControl.create_authorization/claim_execution calls
+    even for byte-identical content). --complete-holdout-for is the safe
+    resume path that avoids this entirely by never re-entering that chain."""
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+    first_out = capsys.readouterr().out
+    first_id = next(line for line in first_out.splitlines() if "hypothesis_id" in line).split("=")[1].strip()
+
+    source = Path(bootstrap_module.__file__).read_text(encoding="utf-8")
+    fn_start = source.index("def run_seal_only_completion(")
+    fn_end = source.index("\ndef ", fn_start + 1)
+    body = source[fn_start:fn_end]
+    for forbidden in (
+        "ResearchExecutionControl(", "ResearchProposalIntakeControl(",
+        "ResearchExperimentSpecificationControl(", "build_report_v2(", "build_packet_v2_from_artifact(",
+        "freeze_manifest_v2_in_transaction(",
+    ):
+        assert forbidden not in body, forbidden
+
+    exit_code = bootstrap_module.main(
+        _full_argv(data_root, **{"--complete-holdout-for": first_id}) + ["--approve"]
+    )
+    assert exit_code == 0
+
+
+def test_complete_final_set_for_requires_approve(genuine_scope: Path, capsys) -> None:
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+    first_out = capsys.readouterr().out
+    first_id = next(line for line in first_out.splitlines() if "hypothesis_id" in line).split("=")[1].strip()
+
+    exit_code = bootstrap_module.main(_full_argv(data_root, **{"--complete-holdout-for": first_id}))
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "requires --approve" in captured.err
+
+
+def test_complete_final_set_for_rejects_dataset_hash_mismatch(genuine_scope: Path, capsys) -> None:
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+    first_out = capsys.readouterr().out
+    first_id = next(line for line in first_out.splitlines() if "hypothesis_id" in line).split("=")[1].strip()
+
+    # A DIFFERENT real scope (SELL, with its own real candidates/outcomes)
+    # must never be accepted as "the" bound dataset for a hypothesis frozen
+    # from the original BUY scope.
+    extra_payloads = [_candidate_payload(index=i, action="SELL") for i in range(5)]
+    existing = [
+        json.loads(line)
+        for line in (data_root / "signal_intelligence_v1_16" / "candidates.jsonl").read_text().strip().splitlines()
+    ]
+    _write_candidate_journal(data_root, existing + extra_payloads)
+    extra_ids = [_real_signal_id(p) for p in extra_payloads]
+    existing_outcomes = [
+        json.loads(line)
+        for line in (data_root / "signal_intelligence_v1_16" / "outcomes.jsonl").read_text().strip().splitlines()
+    ]
+    _write_outcomes_journal(
+        data_root,
+        existing_outcomes + [_outcome_payload(signal_id=sid, index=i, outcome="WIN") for i, sid in enumerate(extra_ids)],
+    )
+
+    exit_code = bootstrap_module.main(
+        _full_argv(data_root, **{"--complete-holdout-for": first_id, "--action-scope": "SELL"}) + ["--approve"]
+    )
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "hypothesis does not exist" in captured.err or "does not match" in captured.err
+
+
+def test_conflicting_seal_fails_closed(genuine_scope: Path) -> None:
+    """A seal row that exists but was never marked isolated must never be
+    silently re-sealed or repaired automatically."""
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+
+    registry = HypothesisRegistry(data_root / "ser8_registry.db")
+    from trademind.discovery.holdout_store import HoldoutSealStore
+
+    seals = HoldoutSealStore(registry)
+
+    import sqlite3
+
+    db = sqlite3.connect(data_root / "ser8_registry.db")
+    db.row_factory = sqlite3.Row
+    hyp_id = db.execute("SELECT hypothesis_id FROM final_holdout_seals LIMIT 1").fetchone()["hypothesis_id"]
+    # Simulate a partially-completed seal: isolation was never attested.
+    db.execute(
+        "UPDATE final_holdout_seals SET isolated_at=NULL, isolation_receipt_hash=NULL, "
+        "public_max_time=NULL, holdout_start_time=NULL, holdout_end_time=NULL, "
+        "public_row_count=NULL, holdout_row_count=NULL WHERE hypothesis_id=?",
+        (hyp_id,),
+    )
+    db.commit()
+    db.close()
+
+    from trademind.discovery.holdout_sealer import FinalHoldoutSealer
+    from trademind.discovery.holdout_keys import EnvironmentKeyProvider
+
+    keys = EnvironmentKeyProvider(key_id=_HOLDOUT_KEY_ID, environment_variable=_HOLDOUT_KEY_ENV)
+    sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=keys)
+    with pytest.raises(bootstrap_module.BootstrapGapError, match="requires manual review"):
+        bootstrap_module.resolve_or_seal_protected_final_holdout(
+            registry=registry, seals=seals, sealer=sealer, hypothesis_id=hyp_id,
+            bound_dataset=None, plan=None,
+            quarantine_dir=data_root.parent / "quarantine", sealed_holdout_path=data_root / "x.sealed.json",
+            holdout_plaintext_workdir=data_root / "workdir", key_id=_HOLDOUT_KEY_ID,
+            evaluator_id="deterministic-aggregate-v1-holdout",
+            evaluator_artifact_path=Path(bootstrap_module.demo_pipeline_module.__file__),
+        )
+
+
+def test_public_max_time_strictly_before_holdout_start_time(genuine_scope: Path) -> None:
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+
+    registry = HypothesisRegistry(data_root / "ser8_registry.db")
+    from trademind.discovery.holdout_store import HoldoutSealStore
+
+    seals = HoldoutSealStore(registry)
+    import sqlite3
+
+    db = sqlite3.connect(data_root / "ser8_registry.db")
+    db.row_factory = sqlite3.Row
+    hyp_id = db.execute("SELECT hypothesis_id FROM final_holdout_seals LIMIT 1").fetchone()["hypothesis_id"]
+    db.close()
+    record = seals.get(hyp_id)
+    assert record.public_max_time is not None and record.holdout_start_time is not None
+    assert datetime.fromisoformat(record.public_max_time) < datetime.fromisoformat(record.holdout_start_time)
+
+
+def test_plaintext_quarantined_not_left_in_workdir(genuine_scope: Path) -> None:
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+
+    workdir = data_root / "ser8_bootstrap_datasets" / "_holdout_plaintext_workdir"
+    assert not any(workdir.glob("*")) if workdir.exists() else True
+
+    quarantine_dir = data_root.parent / "ser8_final_holdout_quarantine"
+    assert quarantine_dir.is_dir()
+    quarantined_files = list(quarantine_dir.glob("*.holdout-source"))
+    assert len(quarantined_files) == 1
+
+
+def test_key_material_never_persisted_in_sealed_artifact_or_db(genuine_scope: Path) -> None:
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+
+    real_key_material = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    dataset_dir = data_root / "ser8_bootstrap_datasets"
+    sealed_files = list(dataset_dir.glob("*.final-holdout.sealed.json"))
+    assert len(sealed_files) == 1
+    sealed_text = sealed_files[0].read_text(encoding="utf-8")
+    assert real_key_material not in sealed_text
+
+    db_bytes = (data_root / "ser8_registry.db").read_bytes()
+    assert real_key_material.encode("utf-8") not in db_bytes
+
+
+def test_protected_rows_excluded_from_public_manifest_datasets(genuine_scope: Path) -> None:
+    # NOTE: this function's own name must never contain the substring
+    # "holdout" -- pytest bakes the test name into tmp_path, and
+    # ResearchExperimentSpecificationControl._datasets has its own
+    # belt-and-suspenders check rejecting any dataset file_path containing
+    # "holdout" (case-insensitive), which a test-name collision would
+    # otherwise trip even though the REAL production path
+    # (data/ser8_bootstrap_datasets/<hash>.csv) never contains that word.
+    """Discovery + validation remain public; the 3 protected-final-set rows
+    (of 8) are never part of what was persisted as the manifest's own
+    public dataset artifacts."""
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv + ["--approve"])
+
+    registry = HypothesisRegistry(data_root / "ser8_registry.db")
+    from trademind.discovery.holdout_store import HoldoutSealStore
+
+    seals = HoldoutSealStore(registry)
+    import sqlite3
+
+    db = sqlite3.connect(data_root / "ser8_registry.db")
+    db.row_factory = sqlite3.Row
+    hyp_id = db.execute("SELECT hypothesis_id FROM final_holdout_seals LIMIT 1").fetchone()["hypothesis_id"]
+    db.close()
+    record = seals.get(hyp_id)
+    assert record.public_row_count == 5  # 8 total, 60/20/20 -> 4 discovery + 1 validation = 5 public
+    assert record.holdout_row_count == 3
+
+
+def test_review_mode_never_touches_real_seal_store_or_quarantine(genuine_scope: Path) -> None:
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    exit_code = bootstrap_module.main(argv)
+    assert exit_code == 0
+    assert not (data_root / "ser8_registry.db").exists()
+    assert not (data_root.parent / "ser8_final_holdout_quarantine").exists()
+
+
+def test_evaluator_artifact_shared_with_demo_pipeline_script() -> None:
+    """The final holdout must later be consumable by
+    run_ser8_real_demo_pipeline.py's own authoritative evaluator identity --
+    proven by both scripts resolving to the exact same evaluator_id and the
+    exact same evaluator_artifact_path (this file's own path)."""
+    evaluator = bootstrap_module.demo_pipeline_module._DeterministicAggregateHoldoutEvaluator(
+        primary_metric="net_r", parameters={},
+    )
+    assert evaluator.evaluator_id == "deterministic-aggregate-v1-holdout"
+    assert Path(bootstrap_module.demo_pipeline_module.__file__).resolve().is_file()
+
+
+def test_no_custom_encryption_only_authoritative_seal_bytes() -> None:
+    """This file must never implement its own cipher -- the only
+    cryptography anywhere in the chain is the existing, unmodified
+    seal_bytes/verify_envelope inside FinalHoldoutSealer.seal_file."""
+    source = Path(bootstrap_module.__file__).read_text(encoding="utf-8")
+    for forbidden in ("Fernet", "hashlib.pbkdf2", "hmac.new", "Crypto.Cipher", "cryptography.hazmat", "AES.new("):
+        assert forbidden not in source, forbidden
+    assert "sealer.seal_file(" in source

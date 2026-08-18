@@ -103,6 +103,8 @@ import csv
 import gc
 import hashlib
 import json
+import os
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -111,8 +113,14 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from trademind.discovery.hypothesis_registry import HypothesisRegistry  # noqa: E402
+from trademind.discovery.holdout_sealer import (  # noqa: E402
+    FinalHoldoutSealer,
+    HoldoutSealerError,
+)
+from trademind.discovery.holdout_store import HoldoutSealError, HoldoutSealRecord, HoldoutSealStore  # noqa: E402
+from trademind.discovery.hypothesis_registry import HypothesisRegistry, HypothesisState  # noqa: E402
 from trademind.discovery.manifest import (  # noqa: E402
     CriteriaMode,
     CriterionOperator,
@@ -156,6 +164,17 @@ from trademind.signal_statistics_provenance import (  # noqa: E402
     sha256_bytes,
 )
 from trademind.signal_statistics_report import build_report_v2, persist_report_v2  # noqa: E402
+
+# The final holdout must later be CONSUMED by the exact same authoritative
+# evaluator identity run_ser8_real_demo_pipeline.py's own advance_research_state
+# uses (HoldoutTriggerBridge.trigger -> FinalHoldoutRunner.run_once verifies
+# evaluator_id/evaluator_hash against what was registered at seal time) -- so
+# this script imports that SAME sibling module and reuses its evaluator class
+# and default key identifiers verbatim rather than defining a second,
+# possibly-drifting evaluator. This is audited/enforced at call time: sealing
+# fails closed (FileNotFoundError) if that module's own file cannot be found
+# and hashed.
+import run_ser8_real_demo_pipeline as demo_pipeline_module  # noqa: E402
 
 SCHEMA_VERSION = "ser8-bootstrap-first-real-hypothesis-v1"
 
@@ -511,6 +530,198 @@ class BootstrapResult:
     final_holdout_criteria: FinalHoldoutCriteriaV1
     action_scope: str
     manifest_artifact_hash_ref: str
+    holdout_seal: HoldoutSealRecord | None = None
+    holdout_seal_was_new: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Phase 3b: protected final-holdout completion -- the gap this file's own
+# task closes. A FROZEN hypothesis is not yet safe to advance
+# (TRAIN_TESTED/VALIDATION/HOLDOUT_CONSUMED) until DiscoveryOrchestratorBridge
+# can see a registered, isolated protected final holdout for it; this was
+# previously never created by this script at all.
+#
+# ``FinalHoldoutSealer.seal_and_quarantine`` is the existing, documented
+# "production-safe path" for this -- but its own boundary check
+# (``_verify_public_manifest_boundary`` -> ``manifest.verify_frozen_manifest``)
+# is hard-wired to the LEGACY V1 ``ExperimentManifest`` JSON shape
+# (``payload["family_definition"]``, ``payload["datasets"][].file_path``,
+# etc.), not the V2 manifest (``ExperimentManifestV2``,
+# ``DatasetArtifactV2.artifact_hash_ref``) this bootstrap -- and every other
+# real hypothesis this session has ever frozen -- actually produces; calling
+# it directly against a V2-frozen hypothesis's manifest raises
+# ManifestIntegrityError on the very first field it reads. Reusing it as-is
+# is therefore not possible without either fabricating a fake V1-shaped
+# manifest file (a far worse violation of "no custom encryption/no
+# fabrication" than reimplementing an orchestration wrapper) or modifying
+# ``holdout_sealer.py`` itself (out of scope, and risks the one existing,
+# already-audited V1 call path).
+#
+# The function below therefore reuses every ACTUAL cryptographic/storage
+# primitive unchanged -- ``FinalHoldoutSealer.seal_file`` (the real,
+# unmodified sealing + registration; never a hand-rolled cipher) and
+# ``HoldoutSealStore.get``/``mark_isolated`` (the real, unmodified isolation
+# ledger) -- and only reimplements ``seal_and_quarantine``'s OWN
+# orchestration (temporal-boundary verification, quarantine move,
+# attestation shape) adapted to read the V2-bound dataset this script
+# already has in hand, rather than re-parsing a V1-shaped manifest file from
+# disk. No encryption of any kind is implemented here.
+# ---------------------------------------------------------------------------
+
+
+def resolve_or_seal_protected_final_holdout(
+    *,
+    registry: HypothesisRegistry,
+    seals: HoldoutSealStore,
+    sealer: FinalHoldoutSealer,
+    hypothesis_id: str,
+    bound_dataset: BoundDataset,
+    plan,
+    quarantine_dir: Path,
+    sealed_holdout_path: Path,
+    holdout_plaintext_workdir: Path,
+    key_id: str,
+    evaluator_id: str,
+    evaluator_artifact_path: Path,
+) -> tuple[HoldoutSealRecord, bool]:
+    """Idempotent resume-safe completion of the protected final holdout for
+    an ALREADY-FROZEN hypothesis. Returns (seal_record, was_newly_created).
+
+    - FROZEN + no seal row at all -> creates and isolates a new seal.
+    - FROZEN + an already-isolated seal whose manifest_hash matches the
+      registry's current record -> idempotent success, nothing re-sealed.
+    - FROZEN + a seal row that is either not isolated, or whose
+      manifest_hash disagrees with the registry -> fails closed; this
+      script never guesses how to repair a half-completed or conflicting
+      seal, and never attempts a second seal_file call for the same
+      hypothesis_id (its own PRIMARY KEY on hypothesis_id in
+      final_holdout_seals makes a second attempt impossible anyway).
+    - Not FROZEN at all -> fails closed; this function only ever acts on an
+      already-frozen hypothesis, never advances state itself.
+    """
+    record = registry.get(hypothesis_id)
+    if record.state is not HypothesisState.FROZEN:
+        raise BootstrapGapError(
+            [f"hypothesis {hypothesis_id} is not FROZEN (state={record.state.value}); "
+             "protected final holdout completion only ever acts on a FROZEN hypothesis"]
+        )
+
+    try:
+        existing = seals.get(hypothesis_id)
+    except KeyError:
+        existing = None
+
+    if existing is not None:
+        if existing.isolated:
+            if existing.manifest_hash != record.manifest_hash:
+                raise BootstrapGapError(
+                    [f"conflicting final-holdout seal for {hypothesis_id}: sealed manifest_hash "
+                     f"{existing.manifest_hash!r} does not match the registry's current "
+                     f"manifest_hash {record.manifest_hash!r}"]
+                )
+            return existing, False  # idempotent success -- already fully complete.
+        raise BootstrapGapError(
+            [f"a final-holdout seal already exists for {hypothesis_id} "
+             f"(envelope_hash={existing.envelope_hash}) but was never marked isolated; this is a "
+             "conflicting/partial state that requires manual review, not automatic re-sealing"]
+        )
+
+    total_public = plan.discovery_count + plan.validation_count
+    public_rows = bound_dataset.rows[:total_public]
+    holdout_rows = bound_dataset.rows[total_public:]
+    if not public_rows or not holdout_rows:
+        raise BootstrapGapError(
+            ["the bound dataset's split has an empty public or holdout portion; refusing to seal"]
+        )
+
+    public_max_time = max(row["time"] for row in public_rows)
+    holdout_start_time = min(row["time"] for row in holdout_rows)
+    holdout_end_time = max(row["time"] for row in holdout_rows)
+    if not (public_max_time < holdout_start_time):
+        raise BootstrapGapError(
+            [f"public_max_time {public_max_time!r} is not strictly before holdout_start_time "
+             f"{holdout_start_time!r}; refusing to seal a holdout that is not temporally isolated "
+             "from the public discovery/validation datasets"]
+        )
+
+    holdout_plaintext_workdir.mkdir(parents=True, exist_ok=True)
+    safe_id = hashlib.sha256(hypothesis_id.encode("utf-8")).hexdigest()
+    plaintext_path = holdout_plaintext_workdir / f"{safe_id}.holdout-plaintext.csv"
+    if plaintext_path.exists():
+        raise BootstrapGapError([f"stale holdout plaintext file already exists: {plaintext_path}"])
+    with plaintext_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(bound_dataset.fieldnames))
+        writer.writeheader()
+        writer.writerows(holdout_rows)
+
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        receipt = sealer.seal_file(
+            hypothesis_id=hypothesis_id,
+            plaintext_path=plaintext_path,
+            destination_path=sealed_holdout_path,
+            key_id=key_id,
+            evaluator_id=evaluator_id,
+            evaluator_artifact_path=evaluator_artifact_path,
+        )
+
+        source_hash = receipt.plaintext_sha256
+        quarantine_target = quarantine_dir / f"{source_hash}.holdout-source"
+        if quarantine_target.exists():
+            raise BootstrapGapError([f"quarantine target already exists: {quarantine_target}"])
+        shutil.move(str(plaintext_path), str(quarantine_target))
+        if plaintext_path.exists() or not quarantine_target.is_file():
+            raise BootstrapGapError(["plaintext quarantine move did not complete"])
+        if hashlib.sha256(quarantine_target.read_bytes()).hexdigest() != source_hash:
+            raise BootstrapGapError(["quarantined plaintext hash mismatch"])
+        try:
+            os.chmod(quarantine_target, 0o600)
+        except OSError:
+            pass
+
+        attestation = {
+            "schema_version": "final-holdout-isolation-attestation-v1",
+            "hypothesis_id": receipt.hypothesis_id,
+            "hypothesis_family_id": receipt.hypothesis_family_id,
+            "manifest_hash": receipt.manifest_hash,
+            "envelope_hash": receipt.envelope_hash,
+            "evaluator_id": receipt.evaluator_id,
+            "evaluator_hash": receipt.evaluator_hash,
+            "plaintext_sha256": receipt.plaintext_sha256,
+            "plaintext_size": receipt.plaintext_size,
+            "source_absent_from_research_root": True,
+            "public_max_time": public_max_time,
+            "holdout_start_time": holdout_start_time,
+            "holdout_end_time": holdout_end_time,
+            "public_row_count": len(public_rows),
+            "holdout_row_count": len(holdout_rows),
+        }
+        encoded = json.dumps(
+            attestation, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+        isolation_hash = hashlib.sha256(encoded).hexdigest()
+        stored = seals.mark_isolated(
+            hypothesis_id,
+            isolation_receipt_hash=isolation_hash,
+            public_max_time=public_max_time,
+            holdout_start_time=holdout_start_time,
+            holdout_end_time=holdout_end_time,
+            public_row_count=len(public_rows),
+            holdout_row_count=len(holdout_rows),
+        )
+        if not stored.isolated:
+            raise BootstrapGapError(["final holdout isolation attestation was not persisted"])
+    except (HoldoutSealerError, HoldoutSealError) as exc:
+        raise BootstrapGapError([f"final holdout sealing failed: {exc}"]) from exc
+    finally:
+        if plaintext_path.exists():
+            # Never leave plaintext lying around outside quarantine, even on
+            # a failure path -- it must not remain reachable by discovery/
+            # validation execution.
+            plaintext_path.unlink(missing_ok=True)
+
+    return stored, True
 
 
 def _code_provenance() -> CodeProvenance:
@@ -531,6 +742,9 @@ def run_bootstrap_chain(
     observed_rows: int,
     dataset_csv_path: Path,
     bound_dataset: BoundDataset,
+    quarantine_dir: Path,
+    sealed_holdout_path: Path,
+    holdout_plaintext_workdir: Path,
 ) -> BootstrapResult:
     store = ArtifactStore(artifact_root)
     control = ControlPlane(orchestrator_db_path)
@@ -702,6 +916,8 @@ def run_bootstrap_chain(
     )
     manifest_artifact = persist_experiment_manifest_v2(manifest, artifact_store=store)
 
+    holdout_seal: HoldoutSealRecord | None = None
+    holdout_seal_was_new = False
     if args.approve:
         import sqlite3
 
@@ -720,6 +936,28 @@ def run_bootstrap_chain(
         finally:
             db.close()
 
+        # GOAL of this task: a genuine FROZEN hypothesis is not yet safe to
+        # advance until it has a registered, isolated protected final
+        # holdout. Complete that here, idempotently, for the SAME
+        # hypothesis_id just frozen above (or already frozen from a prior
+        # run -- safe resume, never a second hypothesis).
+        keys = demo_pipeline_module.EnvironmentKeyProvider(
+            key_id=args.holdout_key_id or demo_pipeline_module.DEFAULT_HOLDOUT_KEY_ID,
+            environment_variable=args.holdout_key_env or demo_pipeline_module.DEFAULT_HOLDOUT_KEY_ENV,
+        )
+        holdout_seals = HoldoutSealStore(registry)
+        sealer = FinalHoldoutSealer(registry=registry, seals=holdout_seals, keys=keys)
+        evaluator = demo_pipeline_module._DeterministicAggregateHoldoutEvaluator(
+            primary_metric=args.primary_metric, parameters={},
+        )
+        holdout_seal, holdout_seal_was_new = resolve_or_seal_protected_final_holdout(
+            registry=registry, seals=holdout_seals, sealer=sealer, hypothesis_id=spec.hypothesis_id,
+            bound_dataset=bound_dataset, plan=plan, quarantine_dir=quarantine_dir,
+            sealed_holdout_path=sealed_holdout_path, holdout_plaintext_workdir=holdout_plaintext_workdir,
+            key_id=keys.key_id, evaluator_id=evaluator.evaluator_id,
+            evaluator_artifact_path=Path(demo_pipeline_module.__file__).resolve(),
+        )
+
     return BootstrapResult(
         hypothesis_id=spec.hypothesis_id,
         hypothesis_family_id=spec.hypothesis_family_id,
@@ -731,6 +969,8 @@ def run_bootstrap_chain(
         final_holdout_criteria=final_holdout_criteria,
         action_scope=args.action_scope,
         manifest_artifact_hash_ref=manifest_artifact.hash_ref,
+        holdout_seal=holdout_seal,
+        holdout_seal_was_new=holdout_seal_was_new,
     )
 
 
@@ -814,6 +1054,9 @@ def _run_review_chain(
     observed_rows: int,
     dataset_csv_path: Path,
     bound_dataset: BoundDataset,
+    quarantine_dir: Path,
+    sealed_holdout_path: Path,
+    holdout_plaintext_workdir: Path,
 ) -> tuple[BootstrapResult | None, str | None]:
     """Run the bootstrap chain against the throwaway review directory and
     deterministically release every SQLite handle it opened -- on success
@@ -827,6 +1070,8 @@ def _run_review_chain(
             args, db_path=tmp_path / "registry.db", artifact_root=tmp_path / "artifacts",
             orchestrator_db_path=tmp_path / "registry.db", observed_rows=observed_rows,
             dataset_csv_path=dataset_csv_path, bound_dataset=bound_dataset,
+            quarantine_dir=quarantine_dir, sealed_holdout_path=sealed_holdout_path,
+            holdout_plaintext_workdir=holdout_plaintext_workdir,
         )
         return result, None
     except Exception as exc:  # noqa: BLE001 -- every exception path must still release its DB handles before the caller's tempdir cleanup runs.
@@ -838,6 +1083,144 @@ def _run_review_chain(
 # ---------------------------------------------------------------------------
 # Entry point.
 # ---------------------------------------------------------------------------
+
+
+def run_seal_only_completion(args: argparse.Namespace) -> int:
+    """AUDIT FINDING that makes this function necessary: re-running the FULL
+    bootstrap chain (report -> packet -> Orchestrator task -> authorization ->
+    claim -> intake -> accept -> specification -> manifest freeze) a second
+    time for an ALREADY-FROZEN hypothesis does NOT safely no-op end to end --
+    ``ResearchProposalIntakeControl.ingest_succeeded_research_execution_v1``'s
+    own idempotent-retry detection keys off ``execution.request_hash``, but a
+    second, independent ``ResearchExecutionControl.create_authorization`` ->
+    ``claim_execution`` call produces a DIFFERENT request_hash than the first
+    run even for byte-identical content (proven directly by test), while the
+    content-derived ``result_artifact_hash_ref`` column IS identical and IS
+    UNIQUE-constrained -- so a second full run genuinely crashes with a raw
+    ``sqlite3.IntegrityError`` before ever reaching a sealing step, rather
+    than safely resuming. This function is the safe alternative: given an
+    hypothesis_id that is ALREADY FROZEN, it skips that entire non-idempotent
+    chain and goes straight to completing (or idempotently confirming) the
+    protected final holdout, using ONLY the registry's own already-frozen
+    manifest plus a freshly, deterministically recomputed bound dataset --
+    never creating, re-proposing, or re-freezing anything.
+    """
+    if not args.approve:
+        print(
+            "genuine inputs / required human choices are insufficient:\n"
+            "  - --complete-holdout-for requires --approve (there is no review mode for "
+            "completing a holdout on an already-real hypothesis)",
+            file=sys.stderr,
+        )
+        return 2
+
+    repo_root = Path(__file__).resolve().parent.parent
+    data_root = Path(args.data_root).expanduser() if args.data_root else repo_root / "data"
+    candidates_path = (
+        Path(args.candidates).expanduser() if args.candidates
+        else data_root / "signal_intelligence_v1_16" / "candidates.jsonl"
+    )
+    outcomes_path = (
+        Path(args.outcomes).expanduser() if args.outcomes
+        else data_root / "signal_intelligence_v1_16" / "outcomes.jsonl"
+    )
+    hypothesis_id = args.complete_holdout_for
+
+    try:
+        missing = [
+            f"--{name.replace('_', '-')}"
+            for name in ("symbol", "timeframe", "setup_family", "action_scope", "primary_metric")
+            if getattr(args, name, None) in (None, "")
+        ]
+        if missing:
+            raise BootstrapGapError(
+                [f"{flag} is required (no hidden default) to recompute the exact bound dataset "
+                 "this hypothesis was frozen from" for flag in missing]
+            )
+
+        key = CoverageKey(
+            symbol=args.symbol, timeframe=args.timeframe, setup_family=args.setup_family,
+            action_scope=args.action_scope,
+        )
+        scoped_candidates = select_candidates_by_scope(candidates_path, key)
+        outcome_records = load_outcome_records(outcomes_path)
+        bound_dataset = bind_dataset_to_outcome_journal_scope(scoped_candidates, outcome_records, key=key)
+
+        db_path = Path(args.db).expanduser() if args.db else data_root / "ser8_registry.db"
+        artifact_root = Path(args.artifact_root).expanduser() if args.artifact_root else data_root / "ser8_artifacts"
+        registry = HypothesisRegistry(db_path)
+
+        try:
+            record = registry.get(hypothesis_id)
+        except KeyError as exc:
+            raise BootstrapGapError([f"hypothesis does not exist in {db_path}: {exc}"]) from exc
+        if record.state is not HypothesisState.FROZEN:
+            raise BootstrapGapError(
+                [f"hypothesis {hypothesis_id} is not FROZEN (state={record.state.value}); "
+                 "--complete-holdout-for only ever acts on an already-FROZEN hypothesis"]
+            )
+
+        store = ArtifactStore(artifact_root)
+        manifest = registry.load_bound_manifest_v2(hypothesis_id, artifact_store=store)
+        recorded_hash = str(manifest.semantic_parameters.get("dataset_hash", ""))
+        if recorded_hash != bound_dataset.dataset_hash:
+            raise BootstrapGapError(
+                [f"recomputed dataset_hash sha256:{bound_dataset.dataset_hash} does not match the "
+                 f"dataset_hash {recorded_hash!r} recorded in the frozen manifest for {hypothesis_id}; "
+                 "refusing to seal a holdout that is not provably derived from the exact dataset this "
+                 "hypothesis was frozen from"]
+            )
+        plan = chronological_split([datetime.fromisoformat(row["time"]) for row in bound_dataset.rows])
+        if (
+            plan.discovery_count != manifest.split_plan.discovery_count
+            or plan.validation_count != manifest.split_plan.validation_count
+            or plan.holdout_count != manifest.split_plan.holdout_count
+        ):
+            raise BootstrapGapError(
+                ["recomputed chronological split does not match the split_plan recorded in the frozen "
+                 "manifest; refusing to invent a different split"]
+            )
+
+        quarantine_dir = (
+            Path(args.quarantine_dir).expanduser() if args.quarantine_dir
+            else data_root.parent / "ser8_final_holdout_quarantine"
+        )
+        dataset_dir = data_root / "ser8_bootstrap_datasets"
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        sealed_holdout_path = dataset_dir / f"{bound_dataset.dataset_hash}.final-holdout.sealed.json"
+        holdout_plaintext_workdir = dataset_dir / "_holdout_plaintext_workdir"
+
+        keys = demo_pipeline_module.EnvironmentKeyProvider(
+            key_id=args.holdout_key_id or demo_pipeline_module.DEFAULT_HOLDOUT_KEY_ID,
+            environment_variable=args.holdout_key_env or demo_pipeline_module.DEFAULT_HOLDOUT_KEY_ENV,
+        )
+        seals = HoldoutSealStore(registry)
+        sealer = FinalHoldoutSealer(registry=registry, seals=seals, keys=keys)
+        evaluator = demo_pipeline_module._DeterministicAggregateHoldoutEvaluator(
+            primary_metric=args.primary_metric, parameters={},
+        )
+        seal, was_new = resolve_or_seal_protected_final_holdout(
+            registry=registry, seals=seals, sealer=sealer, hypothesis_id=hypothesis_id,
+            bound_dataset=bound_dataset, plan=plan, quarantine_dir=quarantine_dir,
+            sealed_holdout_path=sealed_holdout_path, holdout_plaintext_workdir=holdout_plaintext_workdir,
+            key_id=keys.key_id, evaluator_id=evaluator.evaluator_id,
+            evaluator_artifact_path=Path(demo_pipeline_module.__file__).resolve(),
+        )
+
+        print("SER8 BOOTSTRAP PROTECTED FINAL HOLDOUT -- COMPLETE")
+        print(f"  hypothesis_id           = {hypothesis_id}")
+        print(f"  protected final holdout = {'newly sealed' if was_new else 'already sealed (idempotent)'}")
+        print(f"    envelope_hash          = {seal.envelope_hash}")
+        print(f"    isolation_receipt_hash = {seal.isolation_receipt_hash}")
+        print(
+            "    public_max_time / holdout_start_time / holdout_end_time = "
+            f"{seal.public_max_time} / {seal.holdout_start_time} / {seal.holdout_end_time}"
+        )
+        print(f"    public_row_count / holdout_row_count = {seal.public_row_count} / {seal.holdout_row_count}")
+        return 0
+    except BootstrapGapError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 def run(args: argparse.Namespace) -> int:
@@ -901,20 +1284,48 @@ def run(args: argparse.Namespace) -> int:
         # therefore default to the SAME path unless explicitly overridden.
         orchestrator_db_path = Path(args.orchestrator_db).expanduser() if args.orchestrator_db else db_path
 
+        # Quarantine directory MUST be disjoint from data_root (the
+        # "research_root" plaintext lives inside) -- a sibling of data/,
+        # never nested inside it.
+        quarantine_dir = (
+            Path(args.quarantine_dir).expanduser() if args.quarantine_dir
+            else data_root.parent / "ser8_final_holdout_quarantine"
+        )
+
         if args.approve:
             dataset_dir = data_root / "ser8_bootstrap_datasets"
             dataset_dir.mkdir(parents=True, exist_ok=True)
             dataset_csv_path = dataset_dir / f"{bound_dataset.dataset_hash}.csv"
             dataset_csv_path.write_bytes(bound_dataset.csv_bytes)
+            sealed_holdout_path = dataset_dir / f"{bound_dataset.dataset_hash}.final-holdout.sealed.json"
+            holdout_plaintext_workdir = dataset_dir / "_holdout_plaintext_workdir"
 
             result = run_bootstrap_chain(
                 args, db_path=db_path, artifact_root=artifact_root,
                 orchestrator_db_path=orchestrator_db_path, observed_rows=observed_rows,
                 dataset_csv_path=dataset_csv_path, bound_dataset=bound_dataset,
+                quarantine_dir=quarantine_dir, sealed_holdout_path=sealed_holdout_path,
+                holdout_plaintext_workdir=holdout_plaintext_workdir,
             )
             print("SER8 FIRST REAL HYPOTHESIS BOOTSTRAP -- FROZEN")
             print(f"  hypothesis_id = {result.hypothesis_id}")
             print(f"  dataset_hash  = sha256:{result.dataset_hash}")
+            if result.holdout_seal is not None:
+                print(
+                    "  protected final holdout = "
+                    f"{'newly sealed' if result.holdout_seal_was_new else 'already sealed (idempotent)'}"
+                )
+                print(f"    envelope_hash          = {result.holdout_seal.envelope_hash}")
+                print(f"    isolation_receipt_hash = {result.holdout_seal.isolation_receipt_hash}")
+                print(
+                    "    public_max_time / holdout_start_time / holdout_end_time = "
+                    f"{result.holdout_seal.public_max_time} / {result.holdout_seal.holdout_start_time} / "
+                    f"{result.holdout_seal.holdout_end_time}"
+                )
+                print(
+                    "    public_row_count / holdout_row_count = "
+                    f"{result.holdout_seal.public_row_count} / {result.holdout_seal.holdout_row_count}"
+                )
             print()
             print("Next: preview this hypothesis on the real MT5 demo account:")
             print(
@@ -931,6 +1342,9 @@ def run(args: argparse.Namespace) -> int:
             result, chain_error = _run_review_chain(
                 args, tmp_path=tmp_path, observed_rows=observed_rows,
                 dataset_csv_path=dataset_csv_path, bound_dataset=bound_dataset,
+                quarantine_dir=tmp_path / "quarantine",
+                sealed_holdout_path=tmp_path / "final-holdout.sealed.json",
+                holdout_plaintext_workdir=tmp_path / "holdout_plaintext_workdir",
             )
         # Every SQLite handle opened inside the chain above has already been
         # released (see _run_review_chain's own docstring) BEFORE this point
@@ -959,6 +1373,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", type=Path, default=None)
     parser.add_argument("--artifact-root", type=Path, default=None)
     parser.add_argument("--orchestrator-db", type=Path, default=None)
+    parser.add_argument("--quarantine-dir", type=Path, default=None)
+    parser.add_argument(
+        "--holdout-key-env", default=None,
+        help=f"Env var holding the base64 AES-256 holdout key (default: {demo_pipeline_module.DEFAULT_HOLDOUT_KEY_ENV}).",
+    )
+    parser.add_argument(
+        "--holdout-key-id", default=None,
+        help=f"Holdout key identifier (default: {demo_pipeline_module.DEFAULT_HOLDOUT_KEY_ID}).",
+    )
 
     parser.add_argument("--symbol", default=None)
     parser.add_argument("--timeframe", default=None)
@@ -986,12 +1409,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--created-by", default=None)
 
     parser.add_argument("--approve", action="store_true")
+    parser.add_argument(
+        "--complete-holdout-for", default=None, metavar="HYPOTHESIS_ID",
+        help=(
+            "Resume mode: complete the protected final holdout for an hypothesis that is "
+            "ALREADY FROZEN (e.g. from a run predating this script's own holdout-sealing "
+            "step). Never re-runs the report/packet/execution/intake/spec/freeze chain and "
+            "never creates a new hypothesis. Requires --approve. Only --data-root/--candidates/"
+            "--outcomes/--db/--artifact-root/--orchestrator-db/--quarantine-dir/--holdout-key-env/"
+            "--holdout-key-id and --symbol/--timeframe/--setup-family/--action-scope/"
+            "--primary-metric (needed to recompute the exact bound dataset and evaluator) are used "
+            "in this mode; every other research-parameter flag is ignored."
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.complete_holdout_for:
+        return run_seal_only_completion(args)
     return run(args)
 
 
