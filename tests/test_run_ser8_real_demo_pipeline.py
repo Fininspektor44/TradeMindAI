@@ -329,8 +329,18 @@ def _full_real_chain(tmp_path: Path) -> _Chain:
     )
 
 
-def _write_candidate_journal(data_root: Path, *, signal_id: str = "sig-1") -> None:
-    candidates_dir = data_root / "signal_intelligence_v1_16"
+def _write_candidate_journal(
+    data_root: Path, *, signal_id: str = "sig-1", runtime_root: Path | None = None
+) -> Path:
+    """Write a genuine live-candidate journal at the ONE canonical live
+    runtime-root location (default: <data_root>/live_signal_runtime_v1),
+    the SAME default scripts/run_ser8_real_demo_pipeline.py's own
+    discover_inputs() now uses -- never the historical/research
+    data/signal_intelligence_v1_16/ archive (see
+    test_historical_research_journal_not_silently_used_for_live_execution
+    in tests/test_ser8_live_candidate_runtime_entrypoint.py for the
+    dedicated proof of that separation)."""
+    candidates_dir = (runtime_root or (data_root / "live_signal_runtime_v1"))
     candidates_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now(timezone.utc).isoformat()
     payload = {
@@ -356,9 +366,9 @@ def _write_candidate_journal(data_root: Path, *, signal_id: str = "sig-1") -> No
         "generated_from_market_data": True,
         "robot_context_only": {},
     }
-    (candidates_dir / "candidates.jsonl").write_text(
-        json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    journal_path = candidates_dir / "candidates.jsonl"
+    journal_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return journal_path
 
 
 def _msc(value: datetime) -> int:

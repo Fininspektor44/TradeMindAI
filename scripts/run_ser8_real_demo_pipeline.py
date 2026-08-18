@@ -32,13 +32,31 @@ ONE consolidated message, never one file at a time):
 
 AUTO-DISCOVERED REAL RUNTIME INPUTS (never fabricated, never a test fixture):
 
-  <data-root>/signal_intelligence_v1_16/candidates.jsonl
+  <runtime-root>/candidates.jsonl   (default runtime-root: <data-root>/live_signal_runtime_v1)
       One genuine SignalCandidate JSON payload per line (the exact shape
-      ``trademind.signal_intelligence.candidate_from_dict`` already expects
-      and every existing production consumer -- ``live_signal_runtime.py``,
-      ``signal_passport_factory.py``, ``fx_signal_adapter.py`` -- already
-      reads). This script never constructs a ``SignalCandidate`` itself; it
-      only loads one that a real, already-running signal adapter journaled.
+      ``trademind.signal_intelligence.candidate_from_dict`` already expects),
+      written by the real, continuously scheduled LIVE candidate runtime --
+      ``scripts/run_v121_live_signal_watch.ps1`` / ``run_v121_live_signal_
+      runtime.ps1`` driving ``trademind.live_signal_runtime_v122`` (which in
+      turn requires ``trademind.live_signal_runtime`` for its v1.21
+      incremental-watermark logic) -- via ``--runtime-root`` /
+      ``$RuntimeRoot``, the SAME deterministic runtime-root convention this
+      script now shares with those PowerShell entrypoints. This script never
+      constructs a ``SignalCandidate`` itself; it only loads one that the
+      real live runtime already journaled.
+
+      ``<data-root>/signal_intelligence_v1_16/candidates.jsonl`` is a
+      DIFFERENT, purely historical/research-lineage archive (the input the
+      already-closed Discovery Engine bootstrap chain reads to freeze new
+      hypotheses) and is deliberately NEVER the default here -- an earlier
+      version of this auto-discovery pointed at it by mistake, which caused
+      SER8 to evaluate stale historical candidates until ``--candidates``
+      was manually overridden with the real live journal path on each run.
+      Override the live journal explicitly with ``--candidates``, or point
+      at a non-default live workspace with ``--runtime-root`` (must match
+      whatever ``-RuntimeRoot`` the live runtime was actually installed
+      with, e.g. an ECN market-data account's own
+      ``live_signal_runtime_ecN_<login>`` root -- see requirement 11 below).
   <data-root>/mt5/mt5_risk_account_utc_<login>.csv
   <data-root>/mt5/mt5_risk_positions_utc_<login>.csv
   <data-root>/mt5/mt5_risk_symbols_utc_<login>.csv
@@ -201,6 +219,7 @@ class PipelineGapError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class DiscoveredInputs:
     data_root: Path
+    runtime_root: Path
     db_path: Path
     candidates_path: Path
     account_csv: Path
@@ -213,6 +232,7 @@ class DiscoveredInputs:
 def discover_inputs(
     *,
     data_root: Path,
+    runtime_root: Path | None,
     db_path: Path | None,
     candidates_path: Path | None,
     mt5_export_dir: Path | None,
@@ -225,14 +245,24 @@ def discover_inputs(
 
     resolved_db = (db_path or (data_root / "ser8_registry.db")).expanduser()
 
+    # The ONE canonical live-candidate journal location, shared with
+    # run_v121_live_signal_watch.ps1 / run_v121_live_signal_runtime.ps1's own
+    # -RuntimeRoot (default data\live_signal_runtime_v1 on both sides). This
+    # is deliberately NOT data/signal_intelligence_v1_16/ -- that path is the
+    # historical/research archive the Discovery Engine bootstrap chain reads
+    # to freeze hypotheses, never the live-execution default (see the module
+    # docstring's audit note above).
+    resolved_runtime_root = (runtime_root or (data_root / "live_signal_runtime_v1")).expanduser()
+
     resolved_candidates = (
-        candidates_path or (data_root / "signal_intelligence_v1_16" / "candidates.jsonl")
+        candidates_path or (resolved_runtime_root / "candidates.jsonl")
     ).expanduser()
     if not resolved_candidates.is_file():
         problems.append(
             f"candidate journal not found: {resolved_candidates} "
-            "(expected the real signal_intelligence_v1_16/candidates.jsonl journal; "
-            "override with --candidates)"
+            "(expected the real live candidates.jsonl journal written by "
+            "run_v121_live_signal_watch.ps1 / run_v121_live_signal_runtime.ps1 "
+            "under --runtime-root; override with --candidates or --runtime-root)"
         )
 
     mt5_dir = (mt5_export_dir or (data_root / "mt5")).expanduser()
@@ -277,6 +307,7 @@ def discover_inputs(
 
     return DiscoveredInputs(
         data_root=data_root,
+        runtime_root=resolved_runtime_root,
         db_path=resolved_db,
         candidates_path=resolved_candidates,
         account_csv=account_csv,
@@ -639,6 +670,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     try:
         inputs = discover_inputs(
             data_root=data_root,
+            runtime_root=Path(args.runtime_root).expanduser() if args.runtime_root else None,
             db_path=Path(args.db).expanduser() if args.db else None,
             candidates_path=Path(args.candidates).expanduser() if args.candidates else None,
             mt5_export_dir=Path(args.mt5_export_dir).expanduser() if args.mt5_export_dir else None,
@@ -815,6 +847,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--artifact-root", type=Path, default=None)
     parser.add_argument("--hypothesis-id", required=True)
     parser.add_argument("--account", required=True, help="MT5 demo login/account id")
+    parser.add_argument(
+        "--runtime-root",
+        type=Path,
+        default=None,
+        help=(
+            "Live candidate runtime root (default: <data-root>/live_signal_runtime_v1). "
+            "Must match whatever -RuntimeRoot the live runtime "
+            "(run_v121_live_signal_watch.ps1 / run_v121_live_signal_runtime.ps1) was "
+            "actually installed with -- e.g. an ECN market-data account's own "
+            "live_signal_runtime_ecN_<login> root. The default candidate journal is "
+            "<runtime-root>/candidates.jsonl, never data/signal_intelligence_v1_16/."
+        ),
+    )
     parser.add_argument("--candidates", type=Path, default=None)
     parser.add_argument("--signal-id", default=None)
     parser.add_argument("--mt5-export-dir", type=Path, default=None)

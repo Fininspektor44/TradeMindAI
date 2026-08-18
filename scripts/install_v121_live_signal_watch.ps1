@@ -11,6 +11,16 @@ param(
     [Parameter(Mandatory=$false)]
     [int]$ServerUTCOffsetHours = 3,
 
+    # Threaded straight through to run_v121_live_signal_watch.ps1's own
+    # -RuntimeRoot (see that script for why). Set this explicitly when
+    # installing a task for an account whose live workspace must not be
+    # the shared default (e.g. an ECN market-data account's own
+    # data\live_signal_runtime_ecN_<login> root) -- this is the ONE
+    # installer for this Scheduled Task; there is no other supported way
+    # to wire a non-default RuntimeRoot into it.
+    [Parameter(Mandatory=$false)]
+    [string]$RuntimeRoot = ".\data\live_signal_runtime_v1",
+
     [switch]$Remove
 )
 
@@ -40,12 +50,13 @@ if (-not (Test-Path $watchScript)) {
 }
 
 $powershell = Join-Path $PSHOME "powershell.exe"
-$taskCommand = "`"$powershell`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`" -Login `"$Login`" -ServerUTCOffsetHours $ServerUTCOffsetHours"
+$taskCommand = "`"$powershell`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`" -Login `"$Login`" -ServerUTCOffsetHours $ServerUTCOffsetHours -RuntimeRoot `"$RuntimeRoot`""
 
 Write-Host "Installing scheduled task: $TaskName" -ForegroundColor Cyan
 Write-Host "Interval: every $IntervalMinutes minute(s)"
 Write-Host "Account: $Login"
 Write-Host "Broker server UTC offset: $ServerUTCOffsetHours"
+Write-Host "Runtime root: $RuntimeRoot"
 
 & schtasks.exe /Create `
     /TN $TaskName `
@@ -66,6 +77,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "`nInstalled: $TaskName" -ForegroundColor Green
 Write-Host "The runtime checks every $IntervalMinutes minute(s), but processes only a new closed M5 bar."
-Write-Host "Status: $(Join-Path $repo 'data\live_signal_runtime_v1\status.json')"
-Write-Host "Log: $(Join-Path $repo 'data\live_signal_runtime_v1\logs\live_signal_watch.log')"
+Write-Host "Status: $(Join-Path $repo (Join-Path $RuntimeRoot 'status.json'))"
+Write-Host "Log: $(Join-Path $repo (Join-Path $RuntimeRoot 'logs\live_signal_watch.log'))"
+Write-Host "Live candidates.jsonl: $(Join-Path $repo (Join-Path $RuntimeRoot 'candidates.jsonl'))"
 Write-Host "Read-only. Orders OFF. Publication OFF." -ForegroundColor Green
