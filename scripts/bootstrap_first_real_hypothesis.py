@@ -18,16 +18,32 @@ imported or reachable from this script (that lineage only ever mattered
 for TRAIN_TESTED/VALIDATION_PASSED/HOLDOUT_CONSUMED/terminal transitions,
 none of which this script performs).
 
+DATASET SCOPE BINDING (this file's own gap-closing fix): the research
+dataset used for TRAIN_TEST/VALIDATION is never an arbitrary,
+operator-supplied CSV. It is derived ONLY from genuine, already-persisted
+runtime evidence, joined by real identity, never by coincidence:
+
+    candidates.jsonl (signal_id)
+        -> filtered EXACTLY by --symbol/--timeframe/--setup-family/--action-scope
+        -> joined to paper_signals/signals.csv (source_signal_id)
+        -> only rows whose source_signal_id is one of the filtered
+           candidates' own signal_id, and whose OWN symbol/timeframe/action
+           independently agree with that candidate (a second, independent
+           check -- this script never trusts the join key alone), survive.
+
+No synthetic row is ever added, and no candidate/paper-signal outside this
+exact scope can leak into the dataset -- proven directly by test. The
+derived CSV is content-addressed (its SHA-256 is part of the review output)
+and is used directly as the DatasetArtifact for both TRAIN_TEST and
+VALIDATION dataset roles; there is no longer any CLI flag that accepts an
+unrelated, arbitrary research CSV for this bootstrap.
+
 WHAT THIS SCRIPT WILL NEVER DO:
 
-  - Fabricate a SignalCandidate or a trading observation. The candidate
-    identity (symbol/timeframe/setup_family/action) this script proposes
-    a hypothesis for is chosen by the operator (``--symbol``/``--timeframe``/
-    ``--setup-family``/``--action-scope``) from among combinations this
-    script has ACTUALLY counted in the real candidate journal -- never a
-    combination invented or guessed. ``CandidateContentV2.metrics`` carries
-    only a real, counted ``observed_journal_rows`` figure, never an invented
-    win-rate or expectancy number.
+  - Fabricate a SignalCandidate, a paper-signal outcome row, or a trading
+    observation. Every row in the derived dataset is a genuine,
+    already-persisted paper-signal row that survived the exact-scope join
+    above; nothing is invented, interpolated, or synthesized.
   - Silently choose a statistical/research parameter. Every value that
     shapes what is being tested (test_family, primary_metric, validation
     criterion + threshold, final-holdout criterion + threshold, alpha, q,
@@ -37,23 +53,26 @@ WHAT THIS SCRIPT WILL NEVER DO:
     REQUIRED command-line argument with no hidden default. If any are
     missing, this script prints every one of them together, once, as ONE
     ready-to-fill command template -- never a series of one-at-a-time
-    prompts.
+    prompts. ``--primary-metric`` is additionally validated against the
+    dataset's own genuinely-available numeric columns (printed as
+    ``AVAILABLE NUMERIC METRICS`` in review) -- never auto-selected.
   - Send a broker order. This script only ever reaches FROZEN.
 
 DEFAULT MODE = REVIEW ONLY. Nothing is written to the real registry/
 artifact store/orchestrator database named by ``--db``/``--artifact-root``/
-``--orchestrator-db``. The full chain above IS actually run (so the printed
-review -- including the exact ``hypothesis_id`` that would be created -- is
-not a guess), but against a throwaway, automatically-discarded temporary
-directory; the deterministic identifiers involved (result/packet/report
-hashes, and the ``hypothesis_id`` derived from them) depend only on the
-CONTENT supplied, never on which directory holds the files, so the
-temporary run produces byte-identical identifiers to a real ``--approve``
-run given the same inputs (proven directly by test).
+``--orchestrator-db``, and no derived dataset file is written outside a
+throwaway, automatically-discarded temporary directory. The full chain
+above IS actually run there (so the printed review -- including the exact
+``hypothesis_id`` and dataset hash that would be created -- is not a
+guess); the deterministic identifiers involved depend only on the CONTENT
+supplied, never on which directory holds the files, so the temporary run
+produces byte-identical identifiers to a real ``--approve`` run given the
+same inputs (proven directly by test).
 
 Creating the hypothesis for real requires the explicit ``--approve`` flag,
 which re-runs the exact same chain against the real ``--db``/
-``--artifact-root``/``--orchestrator-db`` paths.
+``--artifact-root``/``--orchestrator-db`` paths, and persists the derived
+dataset CSV to a content-addressed path under ``--data-root``.
 """
 
 from __future__ import annotations
@@ -64,10 +83,10 @@ import hashlib
 import json
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -98,7 +117,7 @@ from trademind.research_proposal_response import (  # noqa: E402
     RESEARCH_PROPOSAL_RESPONSE_SCHEMA_VERSION,
     ResearchProposalResponseV1,
 )
-from trademind.signal_intelligence import candidate_from_dict  # noqa: E402
+from trademind.signal_intelligence import SignalCandidate, candidate_from_dict  # noqa: E402
 from trademind.signal_statistics_agent_packet import (  # noqa: E402
     build_packet_v2_from_artifact,
     persist_packet_v2,
@@ -116,6 +135,20 @@ from trademind.signal_statistics_provenance import (  # noqa: E402
 from trademind.signal_statistics_report import build_report_v2, persist_report_v2  # noqa: E402
 
 SCHEMA_VERSION = "ser8-bootstrap-first-real-hypothesis-v1"
+
+# Minimum derived-dataset row count before a 60/20/20 chronological split can
+# put at least one row in every phase (int(5 * 0.2) == 1).
+MINIMUM_DATASET_ROWS = 5
+
+# Columns copied verbatim from a matched paper-signal row that are identity/
+# bookkeeping fields, never a candidate research metric.
+_NON_METRIC_COLUMNS = frozenset(
+    {
+        "paper_signal_id", "generated_at", "rule_id", "tier", "source_signal_id",
+        "signal_time", "symbol", "timeframe", "action", "label", "training_status",
+        "exit_time", "outcome", "time",
+    }
+)
 
 
 class BootstrapGapError(RuntimeError):
@@ -145,13 +178,10 @@ class CoverageKey:
     action_scope: str
 
 
-def inspect_candidate_journal_coverage(candidates_path: Path) -> dict[CoverageKey, int]:
-    """Read the REAL candidate journal and count real (symbol, timeframe,
-    setup_family, action) combinations actually observed. Never invents a
-    combination; a combination not counted here cannot be selected."""
+def _load_candidates(candidates_path: Path) -> dict[str, SignalCandidate]:
     if not candidates_path.is_file():
         raise BootstrapGapError([f"candidate journal not found: {candidates_path}"])
-    coverage: dict[CoverageKey, int] = {}
+    candidates: dict[str, SignalCandidate] = {}
     for line_number, line in enumerate(
         candidates_path.read_text(encoding="utf-8-sig").splitlines(), start=1
     ):
@@ -164,6 +194,19 @@ def inspect_candidate_journal_coverage(candidates_path: Path) -> dict[CoverageKe
                 [f"{candidates_path}:{line_number}: candidate journal line is not valid JSON: {exc}"]
             ) from exc
         candidate = candidate_from_dict(payload)
+        candidates[candidate.signal_id] = candidate
+    if not candidates:
+        raise BootstrapGapError([f"candidate journal has no rows: {candidates_path}"])
+    return candidates
+
+
+def inspect_candidate_journal_coverage(candidates_path: Path) -> dict[CoverageKey, int]:
+    """Read the REAL candidate journal and count real (symbol, timeframe,
+    setup_family, action) combinations actually observed. Never invents a
+    combination; a combination not counted here cannot be selected."""
+    candidates = _load_candidates(candidates_path)
+    coverage: dict[CoverageKey, int] = {}
+    for candidate in candidates.values():
         key = CoverageKey(
             symbol=candidate.symbol,
             timeframe=candidate.timeframe,
@@ -171,9 +214,186 @@ def inspect_candidate_journal_coverage(candidates_path: Path) -> dict[CoverageKe
             action_scope=candidate.plan.action,
         )
         coverage[key] = coverage.get(key, 0) + 1
-    if not coverage:
-        raise BootstrapGapError([f"candidate journal has no rows: {candidates_path}"])
     return coverage
+
+
+def select_candidates_by_scope(
+    candidates_path: Path, key: CoverageKey
+) -> dict[str, SignalCandidate]:
+    """Return exactly the real candidates matching ``key``, keyed by their
+    own genuine ``signal_id`` -- never a fabricated or guessed identity."""
+    candidates = _load_candidates(candidates_path)
+    return {
+        signal_id: candidate
+        for signal_id, candidate in candidates.items()
+        if candidate.symbol == key.symbol
+        and candidate.timeframe == key.timeframe
+        and candidate.setup_family == key.setup_family
+        and candidate.plan.action == key.action_scope
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 0b: dataset scope binding -- candidates.jsonl x paper_signals/signals.csv.
+# ---------------------------------------------------------------------------
+
+
+def load_paper_signal_rows(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        raise BootstrapGapError([f"paper-signals journal not found: {path}"])
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        for required in ("source_signal_id", "signal_time", "symbol", "timeframe", "action"):
+            if required not in fieldnames:
+                raise BootstrapGapError(
+                    [f"{path} is missing required column {required!r} (found: {fieldnames})"]
+                )
+        rows = list(reader)
+    if not rows:
+        raise BootstrapGapError([f"paper-signals journal has no rows: {path}"])
+    return rows
+
+
+@dataclass(frozen=True, slots=True)
+class BoundDataset:
+    matched_candidates: int
+    matched_outcome_rows: int
+    unmatched_candidates: int
+    unmatched_candidate_ids: tuple[str, ...]
+    fieldnames: tuple[str, ...]
+    rows: tuple[dict[str, str], ...] = field(repr=False)
+    numeric_metrics: tuple[str, ...]
+    csv_bytes: bytes = field(repr=False)
+    dataset_hash: str
+
+
+def _is_float(value: str) -> bool:
+    if value is None or value == "":
+        return False
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
+
+
+def bind_dataset_to_candidate_scope(
+    candidates: Mapping[str, SignalCandidate],
+    paper_rows: Sequence[Mapping[str, str]],
+    *,
+    key: CoverageKey,
+) -> BoundDataset:
+    """Join real candidates to real paper-signal outcome rows by genuine
+    identity ONLY (``candidate.signal_id == row['source_signal_id']``), then
+    independently re-verify the joined row's OWN symbol/timeframe/action
+    agree with the candidate it claims to belong to -- a row is never
+    trusted on the join key alone. No synthetic row is ever produced; every
+    surviving row is copied verbatim from ``paper_rows``."""
+    rows_by_source_id: dict[str, list[Mapping[str, str]]] = {}
+    for row in paper_rows:
+        source_id = row.get("source_signal_id", "")
+        if source_id:
+            rows_by_source_id.setdefault(source_id, []).append(row)
+
+    matched_outcome_rows = 0
+    selected_rows: list[dict[str, str]] = []
+    unmatched_candidate_ids: list[str] = []
+
+    for signal_id, candidate in sorted(candidates.items()):
+        joined = rows_by_source_id.get(signal_id, [])
+        verified = [
+            row
+            for row in joined
+            if row.get("symbol", "") == candidate.symbol
+            and row.get("timeframe", "") == candidate.timeframe
+            and row.get("action", "") == candidate.plan.action
+        ]
+        if not verified:
+            unmatched_candidate_ids.append(signal_id)
+            continue
+        matched_outcome_rows += len(verified)
+        # Deterministic, non-inventive selection of exactly one already-real
+        # row per candidate for the research dataset itself (chronological
+        # split requires one timestamp per row); every joined row is still
+        # counted in matched_outcome_rows above for full auditability.
+        chosen = sorted(verified, key=lambda row: (row.get("rule_id", ""), row.get("paper_signal_id", "")))[0]
+        selected_rows.append(dict(chosen))
+
+    matched_candidates = len(selected_rows)
+    unmatched_candidates = len(unmatched_candidate_ids)
+
+    if matched_candidates == 0:
+        raise BootstrapGapError(
+            [
+                f"zero paper-signal rows matched the {matched_candidates + unmatched_candidates} "
+                f"candidate(s) in scope symbol={key.symbol!r}/timeframe={key.timeframe!r}/"
+                f"setup_family={key.setup_family!r}/action={key.action_scope!r} -- no unrelated "
+                "dataset can be substituted"
+            ]
+        )
+    if matched_candidates < MINIMUM_DATASET_ROWS:
+        raise BootstrapGapError(
+            [
+                f"only {matched_candidates} genuinely matched row(s) are available for this scope, "
+                f"fewer than the minimum {MINIMUM_DATASET_ROWS} required for a 60/20/20 chronological "
+                "split to place at least one row in every phase"
+            ]
+        )
+
+    # Canonical `time` column, derived only from the genuine signal_time.
+    for row in selected_rows:
+        raw_time = row.get("signal_time", "")
+        try:
+            row["time"] = datetime.fromisoformat(raw_time).astimezone(timezone.utc).isoformat()
+        except ValueError as exc:
+            raise BootstrapGapError(
+                [f"source_signal_id={row.get('source_signal_id')!r}: invalid signal_time {raw_time!r}"]
+            ) from exc
+
+    selected_rows.sort(key=lambda row: (row["time"], row.get("source_signal_id", "")))
+    times = [row["time"] for row in selected_rows]
+    if len(set(times)) != len(times):
+        raise BootstrapGapError(
+            ["two or more matched rows share the identical genuine signal_time; refusing to "
+             "invent a tiebreaker for a chronological split"]
+        )
+
+    numeric_metrics = tuple(
+        sorted(
+            column
+            for column in (selected_rows[0].keys() if selected_rows else ())
+            if column not in _NON_METRIC_COLUMNS
+            and all(_is_float(row.get(column, "")) for row in selected_rows)
+        )
+    )
+
+    identity_columns = ["time", "source_signal_id", "symbol", "timeframe", "action"]
+    fieldnames = identity_columns + [
+        column for column in numeric_metrics if column not in identity_columns
+    ]
+    output_rows = [{column: row.get(column, "") for column in fieldnames} for row in selected_rows]
+
+    import io as _io
+
+    buffer = _io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(output_rows)
+    csv_bytes = buffer.getvalue().encode("utf-8")
+    dataset_hash = hashlib.sha256(csv_bytes).hexdigest()
+
+    return BoundDataset(
+        matched_candidates=matched_candidates,
+        matched_outcome_rows=matched_outcome_rows,
+        unmatched_candidates=unmatched_candidates,
+        unmatched_candidate_ids=tuple(sorted(unmatched_candidate_ids)),
+        fieldnames=tuple(fieldnames),
+        rows=tuple(output_rows),
+        numeric_metrics=numeric_metrics,
+        csv_bytes=csv_bytes,
+        dataset_hash=dataset_hash,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +405,6 @@ _RESEARCH_PARAMETER_ARGS = (
     "test_family", "primary_metric", "criterion_threshold",
     "final_holdout_metric", "final_holdout_threshold",
     "alpha", "q", "minimum_effect_size", "max_hypotheses_tests",
-    "research_source_csv",
     "title", "rationale", "falsifiable_claim", "proposed_test",
     "rejection_condition", "confidence", "reviewer_id", "created_by",
 )
@@ -216,36 +435,11 @@ def require_research_parameters(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: dataset (real, operator-supplied CSV -- never fabricated).
+# Phase 2: chain building blocks.
 # ---------------------------------------------------------------------------
 
 
-def read_source_timestamps(source_csv: Path, *, primary_metric: str) -> list[datetime]:
-    if not source_csv.is_file():
-        raise BootstrapGapError([f"--research-source-csv not found: {source_csv}"])
-    with source_csv.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = reader.fieldnames or []
-        if "time" not in fieldnames:
-            raise BootstrapGapError([f"{source_csv} has no 'time' column (found: {fieldnames})"])
-        if primary_metric not in fieldnames:
-            raise BootstrapGapError(
-                [f"{source_csv} has no column named --primary-metric={primary_metric!r} (found: {fieldnames})"]
-            )
-        rows = list(reader)
-    if not rows:
-        raise BootstrapGapError([f"{source_csv} has no data rows"])
-    timestamps: list[datetime] = []
-    for row_number, row in enumerate(rows, start=2):
-        raw = row.get("time", "")
-        try:
-            timestamps.append(datetime.fromisoformat(raw).astimezone(timezone.utc))
-        except ValueError as exc:
-            raise BootstrapGapError([f"{source_csv}:{row_number}: invalid ISO 'time' value {raw!r}"]) from exc
-    return timestamps
-
-
-def _csv_bytes_for_rows(source_csv: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> bytes:
+def _csv_bytes_for_rows(rows: list[dict[str, str]], fieldnames: list[str]) -> bytes:
     import io as _io
 
     buffer = _io.StringIO()
@@ -264,9 +458,7 @@ def _csv_bytes_for_rows(source_csv: Path, rows: list[dict[str, str]], fieldnames
 class BootstrapResult:
     hypothesis_id: str
     hypothesis_family_id: str
-    family_definition: Mapping[str, Any]
-    content_definition: Mapping[str, Any]
-    dataset_source: str
+    dataset_hash: str
     split_plan_counts: tuple[int, int, int]
     test_family: str
     primary_metric: str
@@ -292,6 +484,8 @@ def run_bootstrap_chain(
     artifact_root: Path,
     orchestrator_db_path: Path,
     observed_rows: int,
+    dataset_csv_path: Path,
+    bound_dataset: BoundDataset,
 ) -> BootstrapResult:
     store = ArtifactStore(artifact_root)
     control = ControlPlane(orchestrator_db_path)
@@ -313,6 +507,7 @@ def run_bootstrap_chain(
                 "criterion_threshold": args.criterion_threshold,
                 "final_holdout_metric": args.final_holdout_metric,
                 "final_holdout_threshold": args.final_holdout_threshold,
+                "dataset_hash": bound_dataset.dataset_hash,
             }
         )
     )
@@ -329,12 +524,16 @@ def run_bootstrap_chain(
             evaluation_method_version="ser8-bootstrap-v1",
         ),
         evaluation_policy_hash=evaluation_policy_hash,
-        metrics={"observed_journal_rows": observed_rows},
+        metrics={
+            "observed_journal_rows": observed_rows,
+            "matched_candidates": bound_dataset.matched_candidates,
+            "matched_outcome_rows": bound_dataset.matched_outcome_rows,
+        },
         status="RESEARCH_CANDIDATE",
         reason_codes=(),
     )
 
-    source_hash_ref = "sha256:" + hashlib.sha256(args.research_source_csv.read_bytes()).hexdigest()
+    source_hash_ref = "sha256:" + bound_dataset.dataset_hash
     report = build_report_v2(
         (candidate,),
         source_snapshot_hash_ref=source_hash_ref,
@@ -382,36 +581,32 @@ def run_bootstrap_chain(
     intake_control = ResearchProposalIntakeControl(execution_control=execution_control, hypothesis_registry=registry)
     spec_control = ResearchExperimentSpecificationControl(intake_control=intake_control, hypothesis_registry=registry)
     pending = intake_control.ingest_succeeded_research_execution_v1(execution.request_hash)[0]
-    accepted, hypothesis_record = intake_control.accept_for_hypothesis(pending.intake_id, reviewer_id=args.reviewer_id)
+    accepted, _hypothesis_record = intake_control.accept_for_hypothesis(pending.intake_id, reviewer_id=args.reviewer_id)
 
     from trademind.discovery.manifest import DatasetArtifact as DatasetArtifactV1
 
-    v1_dataset = DatasetArtifactV1.from_path(args.research_source_csv)
+    v1_dataset = DatasetArtifactV1.from_path(dataset_csv_path)
     spec = spec_control.create_specification(
         accepted.intake_id, reviewer_id=args.reviewer_id, test_family=args.test_family,
         primary_metric=args.primary_metric, alpha=args.alpha, q=args.q,
         minimum_effect_size=args.minimum_effect_size, max_hypotheses_tests=args.max_hypotheses_tests,
-        datasets=(v1_dataset,), parameters={"horizon": args.horizon},
+        datasets=(v1_dataset,), parameters={"horizon": args.horizon, "dataset_hash": bound_dataset.dataset_hash},
     )
 
-    timestamps = read_source_timestamps(args.research_source_csv, primary_metric=args.primary_metric)
+    timestamps = [datetime.fromisoformat(row["time"]) for row in bound_dataset.rows]
     plan = chronological_split(timestamps)
-    with args.research_source_csv.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = list(reader.fieldnames or [])
-        rows = list(reader)
+    rows = [dict(row) for row in bound_dataset.rows]
+    fieldnames = list(bound_dataset.fieldnames)
     discovery_rows = rows[: plan.discovery_count]
     validation_rows = rows[plan.discovery_count : plan.discovery_count + plan.validation_count]
 
     import io as _io
 
     discovery_artifact = store.import_snapshot(
-        _io.BytesIO(_csv_bytes_for_rows(args.research_source_csv, discovery_rows, fieldnames)),
-        media_type="text/csv",
+        _io.BytesIO(_csv_bytes_for_rows(discovery_rows, fieldnames)), media_type="text/csv",
     )
     validation_artifact = store.import_snapshot(
-        _io.BytesIO(_csv_bytes_for_rows(args.research_source_csv, validation_rows, fieldnames)),
-        media_type="text/csv",
+        _io.BytesIO(_csv_bytes_for_rows(validation_rows, fieldnames)), media_type="text/csv",
     )
     discovery_role = "ser8-bootstrap-discovery-v1"
     validation_role = "ser8-bootstrap-validation-v1"
@@ -462,7 +657,6 @@ def run_bootstrap_chain(
     )
     manifest_artifact = persist_experiment_manifest_v2(manifest, artifact_store=store)
 
-    frozen_state = {"result": None}
     if args.approve:
         import sqlite3
 
@@ -480,16 +674,11 @@ def run_bootstrap_chain(
             raise
         finally:
             db.close()
-        frozen_state["result"] = "FROZEN"
 
     return BootstrapResult(
         hypothesis_id=spec.hypothesis_id,
         hypothesis_family_id=spec.hypothesis_family_id,
-        family_definition=hypothesis_record.family_definition
-        if hasattr(hypothesis_record, "family_definition")
-        else {},
-        content_definition={},
-        dataset_source=str(args.research_source_csv),
+        dataset_hash=bound_dataset.dataset_hash,
         split_plan_counts=(plan.discovery_count, plan.validation_count, plan.holdout_count),
         test_family=args.test_family,
         primary_metric=args.primary_metric,
@@ -500,12 +689,22 @@ def run_bootstrap_chain(
     )
 
 
-def _print_review(result: BootstrapResult, coverage_count: int) -> None:
+def _print_review(
+    result: BootstrapResult, *, coverage_count: int, key: CoverageKey, bound_dataset: BoundDataset,
+) -> None:
     print("SER8 FIRST REAL HYPOTHESIS BOOTSTRAP -- REVIEW (NOTHING WRITTEN TO REGISTRY)")
     print(f"  hypothesis_id            = {result.hypothesis_id}")
     print(f"  hypothesis_family_id     = {result.hypothesis_family_id}")
     print(f"  observed journal rows    = {coverage_count}")
-    print(f"  dataset source           = {result.dataset_source}")
+    print(
+        "CANDIDATE SCOPE:"
+        f" symbol={key.symbol} timeframe={key.timeframe} setup_family={key.setup_family} action={key.action_scope}"
+    )
+    print(f"MATCHED CANDIDATES: {bound_dataset.matched_candidates}")
+    print(f"MATCHED OUTCOME ROWS: {bound_dataset.matched_outcome_rows}")
+    print(f"UNMATCHED CANDIDATES: {bound_dataset.unmatched_candidates}")
+    print(f"DATASET HASH: sha256:{bound_dataset.dataset_hash}")
+    print(f"AVAILABLE NUMERIC METRICS: {', '.join(bound_dataset.numeric_metrics)}")
     print(
         "  split plan (discovery/validation/holdout) = "
         f"{result.split_plan_counts[0]}/{result.split_plan_counts[1]}/{result.split_plan_counts[2]}"
@@ -531,6 +730,11 @@ def run(args: argparse.Namespace) -> int:
         if args.candidates
         else data_root / "signal_intelligence_v1_16" / "candidates.jsonl"
     )
+    paper_signals_path = (
+        Path(args.paper_signals).expanduser()
+        if args.paper_signals
+        else data_root / "paper_signals" / "signals.csv"
+    )
 
     try:
         require_research_parameters(args)
@@ -555,6 +759,18 @@ def run(args: argparse.Namespace) -> int:
                 ]
             )
 
+        scoped_candidates = select_candidates_by_scope(candidates_path, key)
+        paper_rows = load_paper_signal_rows(paper_signals_path)
+        bound_dataset = bind_dataset_to_candidate_scope(scoped_candidates, paper_rows, key=key)
+
+        if args.primary_metric not in bound_dataset.numeric_metrics:
+            raise BootstrapGapError(
+                [
+                    f"--primary-metric={args.primary_metric!r} is not one of the genuinely available "
+                    f"numeric metrics in the scope-bound dataset: {', '.join(bound_dataset.numeric_metrics)}"
+                ]
+            )
+
         db_path = Path(args.db).expanduser() if args.db else data_root / "ser8_registry.db"
         artifact_root = Path(args.artifact_root).expanduser() if args.artifact_root else data_root / "ser8_artifacts"
         # ResearchProposalIntakeControl requires ResearchExecutionControl and
@@ -565,12 +781,19 @@ def run(args: argparse.Namespace) -> int:
         orchestrator_db_path = Path(args.orchestrator_db).expanduser() if args.orchestrator_db else db_path
 
         if args.approve:
+            dataset_dir = data_root / "ser8_bootstrap_datasets"
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            dataset_csv_path = dataset_dir / f"{bound_dataset.dataset_hash}.csv"
+            dataset_csv_path.write_bytes(bound_dataset.csv_bytes)
+
             result = run_bootstrap_chain(
                 args, db_path=db_path, artifact_root=artifact_root,
                 orchestrator_db_path=orchestrator_db_path, observed_rows=observed_rows,
+                dataset_csv_path=dataset_csv_path, bound_dataset=bound_dataset,
             )
             print("SER8 FIRST REAL HYPOTHESIS BOOTSTRAP -- FROZEN")
             print(f"  hypothesis_id = {result.hypothesis_id}")
+            print(f"  dataset_hash  = sha256:{result.dataset_hash}")
             print()
             print("Next: preview this hypothesis on the real MT5 demo account:")
             print(
@@ -582,11 +805,14 @@ def run(args: argparse.Namespace) -> int:
 
         with tempfile.TemporaryDirectory(prefix="ser8-bootstrap-review-") as tmp:
             tmp_path = Path(tmp)
+            dataset_csv_path = tmp_path / f"{bound_dataset.dataset_hash}.csv"
+            dataset_csv_path.write_bytes(bound_dataset.csv_bytes)
             result = run_bootstrap_chain(
                 args, db_path=tmp_path / "registry.db", artifact_root=tmp_path / "artifacts",
                 orchestrator_db_path=tmp_path / "registry.db", observed_rows=observed_rows,
+                dataset_csv_path=dataset_csv_path, bound_dataset=bound_dataset,
             )
-        _print_review(result, observed_rows)
+        _print_review(result, coverage_count=observed_rows, key=key, bound_dataset=bound_dataset)
         print()
         print("Nothing was written to the real registry. Re-run with --approve to freeze for real.")
         return 0
@@ -599,6 +825,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--candidates", type=Path, default=None)
+    parser.add_argument("--paper-signals", type=Path, default=None)
     parser.add_argument("--db", type=Path, default=None)
     parser.add_argument("--artifact-root", type=Path, default=None)
     parser.add_argument("--orchestrator-db", type=Path, default=None)
@@ -618,7 +845,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q", type=float, default=None)
     parser.add_argument("--minimum-effect-size", type=float, default=None)
     parser.add_argument("--max-hypotheses-tests", type=int, default=None)
-    parser.add_argument("--research-source-csv", type=Path, default=None)
 
     parser.add_argument("--title", default=None)
     parser.add_argument("--rationale", default=None)
