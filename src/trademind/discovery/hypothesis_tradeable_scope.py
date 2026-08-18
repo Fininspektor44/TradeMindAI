@@ -30,15 +30,25 @@ or BOTH; every identity/hash field must be well-formed) -- it does not know
 or care where its fields came from, so it stays a general, honestly-testable
 identity contract. :func:`bind_hypothesis_tradeable_scope` owns the TRUST
 policy for deriving that structure from research provenance: the candidate's
-``action_scope`` vocabulary is deliberately narrow -- an exhaustive
-repository-wide grep at the time this module was written found
-``action_scope`` is used with exactly one literal value everywhere in this
-codebase, ``"BUY_SELL_DIRECTIONAL"`` -- so the builder recognizes only that
-value, mapped to :attr:`AllowedActionScope.BOTH`. Any other source value
-fails closed there rather than being silently interpreted, broadened, or
-narrowed by this builder. A future source of BUY-only or SELL-only scopes is
-possible without touching the dataclass -- only the builder's explicit
-mapping would need a new, equally explicit entry.
+``action_scope`` vocabulary is deliberately narrow and closed. Originally an
+exhaustive repository-wide grep found ``action_scope`` used with exactly one
+literal value everywhere in this codebase, ``"BUY_SELL_DIRECTIONAL"``, mapped
+to :attr:`AllowedActionScope.BOTH`. ``scripts/bootstrap_first_real_hypothesis.py``
+later introduced a SECOND, genuinely distinct, exact one-to-one source: it
+sets ``CandidateDefinitionV2.action_scope`` directly to the SAME literal
+directional value (``"BUY"`` or ``"SELL"``) its own ``--action-scope`` CLI
+argument already uses to filter live candidates by ``SignalCandidate.plan.
+action`` -- i.e. ``signal_intelligence.VALID_ACTIONS``'s exact vocabulary,
+not a new or invented one. Both source values -- ``"BUY"`` and ``"SELL"`` --
+therefore map one-to-one, with NO broadening, to the identically-named
+:attr:`AllowedActionScope.BUY`/:attr:`AllowedActionScope.SELL` members this
+dataclass already validated and
+:func:`trademind.hypothesis_live_candidate_matching.verify_live_candidate_matches_scope`
+already enforced exactly (a BUY-scoped hypothesis never matched a SELL
+candidate, or vice versa, even before this mapping entry existed -- only the
+BUILDER's source-value recognition was the gap). Any OTHER source value
+still fails closed here rather than being silently interpreted, broadened,
+or narrowed by this builder.
 
 IMMUTABILITY: this module owns no new SQLite table, no new mutable state,
 and no "binding event" to persist. A hypothesis's manifest binding is
@@ -88,14 +98,33 @@ from .manifest import EXPERIMENT_MANIFEST_V2_SCHEMA_VERSION, load_experiment_man
 SCHEMA_VERSION = "discovery-hypothesis-tradeable-scope-v1"
 _SCOPE_HASH_DOMAIN = b"trademind:discovery:hypothesis-tradeable-scope:v1"
 
-# The only source ``action_scope`` value this codebase has ever produced
-# (verified by an exhaustive repository-wide grep for "action_scope" at the
-# time this module was written -- every CandidateDefinitionV2 fixture and
-# every production caller uses exactly this literal). Mapping is explicit
-# and closed: an unrecognized source value fails closed rather than being
-# silently interpreted, per this module's own "do not silently infer or
-# broaden it" requirement.
-_SOURCE_ACTION_SCOPE_MAP: Mapping[str, str] = {"BUY_SELL_DIRECTIONAL": "BOTH"}
+# Explicit, closed, one-to-one mapping from every source ``action_scope``
+# value this codebase actually produces to the ``AllowedActionScope`` it
+# means -- never inferred, never broadened, never derived from symbol/
+# setup-family/candidate/runtime state. Adding a new entry here is the ONLY
+# change this module's own docstring anticipates for a genuinely new source
+# vocabulary; an unrecognized value still fails closed unconditionally.
+#
+#   "BUY_SELL_DIRECTIONAL" -> BOTH
+#       The original, still-current source value from the LLM-driven
+#       research-proposal pipeline (signal_statistics_report.py's own
+#       candidate-definition builder) -- a directional-but-unrestricted
+#       statistical test scope, verified by exhaustive repository-wide grep
+#       to be the only value that pipeline has ever produced.
+#   "BUY"  -> BUY   (exact match, never broadened to BOTH or to SELL)
+#   "SELL" -> SELL  (exact match, never broadened to BOTH or to BUY)
+#       scripts/bootstrap_first_real_hypothesis.py's own
+#       ``CandidateDefinitionV2.action_scope`` is set directly to the
+#       identical literal value its ``--action-scope`` CLI argument already
+#       uses to filter live candidates by ``SignalCandidate.plan.action``
+#       (``signal_intelligence.VALID_ACTIONS`` = {"BUY", "SELL"}) -- an
+#       exact, pre-existing one-to-one vocabulary match, not a new or
+#       inferred category.
+_SOURCE_ACTION_SCOPE_MAP: Mapping[str, str] = {
+    "BUY_SELL_DIRECTIONAL": "BOTH",
+    "BUY": "BUY",
+    "SELL": "SELL",
+}
 
 
 class HypothesisTradeableScopeError(RuntimeError):

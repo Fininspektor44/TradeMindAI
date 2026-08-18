@@ -556,3 +556,147 @@ def test_module_never_builds_a_trade_plan_or_risk_decision() -> None:
         "OrderSend(",
     ):
         assert forbidden_call not in source, forbidden_call
+
+
+# ---------------------------------------------------------------------------
+# SER8 BUY/SELL TRADEABLE SCOPE COMPATIBILITY V1 -- regression tests.
+#
+# Root cause: scripts/bootstrap_first_real_hypothesis.py sets
+# CandidateDefinitionV2.action_scope directly to the SAME literal
+# BUY/SELL value SignalCandidate.plan.action already uses (an exact,
+# pre-existing one-to-one vocabulary match -- signal_intelligence.
+# VALID_ACTIONS), but bind_hypothesis_tradeable_scope's own source-value
+# recognition only ever knew "BUY_SELL_DIRECTIONAL" -> BOTH, so it failed
+# closed on the genuine "BUY"/"SELL" source values a real bootstrap-frozen
+# hypothesis actually carries. The matcher side
+# (verify_live_candidate_matches_scope) already enforced BUY-only/SELL-only
+# scopes correctly before this fix -- only the builder's recognized source
+# vocabulary was the gap.
+# ---------------------------------------------------------------------------
+
+
+def _real_candidate(*, action: str, symbol: str = "XAUUSD", timeframe: str = "M5", setup_family: str = "spread_pressure"):
+    from datetime import datetime, timedelta, timezone
+
+    from trademind.signal_intelligence import EntryOrder, SignalCandidate, TradePlan
+
+    now = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
+    return SignalCandidate(
+        observed_at=now - timedelta(seconds=70),
+        created_at=now - timedelta(seconds=60),
+        symbol=symbol,
+        timeframe=timeframe,
+        setup_family=setup_family,
+        scenario="buy sell tradeable scope compatibility test",
+        plan=TradePlan(
+            action=action,
+            entries=(EntryOrder(2000.0, 1.0, "confirmed entry", "MARKET"),),
+            stop_price=1990.0 if action == "BUY" else 2010.0,
+            targets=(2020.0,) if action == "BUY" else (1980.0,),
+            invalidation="protected level broken",
+            target_rationale=("external liquidity",),
+        ),
+        market_features={"structure": {"swing_bias": "BULLISH" if action == "BUY" else "BEARISH"}},
+        factor_scores={"structure": 0.9},
+        factor_reasons={"structure": ("BOS confirmed",)},
+        provenance=("FX_RESEARCH",),
+    )
+
+
+def test_genuine_source_action_scope_buy_binds_only_buy(tmp_path: Path) -> None:
+    """Requirement 1: genuine source action_scope BUY binds only BUY."""
+    context = _frozen(tmp_path, action_scope="BUY")
+    scope = bind_hypothesis_tradeable_scope(
+        context.spec.hypothesis_id, registry=context.registry, artifact_store=context.store
+    )
+    assert scope.source_action_scope == "BUY"
+    assert scope.allowed_action_scope == AllowedActionScope.BUY.value
+
+
+def test_genuine_source_action_scope_sell_binds_only_sell(tmp_path: Path) -> None:
+    """Requirement 2: genuine source action_scope SELL binds only SELL."""
+    context = _frozen(tmp_path, action_scope="SELL", db_name="orchestrator2.db")
+    scope = bind_hypothesis_tradeable_scope(
+        context.spec.hypothesis_id, registry=context.registry, artifact_store=context.store
+    )
+    assert scope.source_action_scope == "SELL"
+    assert scope.allowed_action_scope == AllowedActionScope.SELL.value
+
+
+def test_buy_candidate_cannot_pass_sell_scope_and_vice_versa(tmp_path: Path) -> None:
+    """Requirement 3: BUY candidate cannot pass SELL scope and vice versa --
+    exercised end to end through the real, now-fixed builder AND the
+    unmodified matcher, never a hand-constructed scope."""
+    from trademind.hypothesis_live_candidate_matching import verify_live_candidate_matches_scope
+
+    buy_context = _frozen(tmp_path, action_scope="BUY", db_name="buy.db")
+    buy_scope = bind_hypothesis_tradeable_scope(
+        buy_context.spec.hypothesis_id, registry=buy_context.registry, artifact_store=buy_context.store
+    )
+    sell_context = _frozen(tmp_path, action_scope="SELL", db_name="sell.db")
+    sell_scope = bind_hypothesis_tradeable_scope(
+        sell_context.spec.hypothesis_id, registry=sell_context.registry, artifact_store=sell_context.store
+    )
+
+    buy_candidate = _real_candidate(action="BUY")
+    sell_candidate = _real_candidate(action="SELL")
+
+    assert verify_live_candidate_matches_scope(buy_scope, buy_candidate) is True
+    assert verify_live_candidate_matches_scope(buy_scope, sell_candidate) is False
+    assert verify_live_candidate_matches_scope(sell_scope, sell_candidate) is True
+    assert verify_live_candidate_matches_scope(sell_scope, buy_candidate) is False
+
+
+def test_unknown_action_scope_still_fails_closed(tmp_path: Path) -> None:
+    """Requirement 4: unknown action scope still fails closed -- the same
+    pre-existing invariant, still true after adding BUY/SELL entries."""
+    context = _frozen(tmp_path, action_scope="LONG_SHORT_HEDGED", db_name="unknown.db")
+    with pytest.raises(HypothesisTradeableScopeError, match="unrecognized source action_scope"):
+        bind_hypothesis_tradeable_scope(
+            context.spec.hypothesis_id, registry=context.registry, artifact_store=context.store
+        )
+
+
+def test_bare_buy_or_sell_never_silently_widens_to_both(tmp_path: Path) -> None:
+    """Requirement 6: no broadening/wildcard behavior introduced -- a BUY
+    or SELL source scope must never be reported, or usable, as BOTH."""
+    buy_context = _frozen(tmp_path, action_scope="BUY", db_name="widen-buy.db")
+    buy_scope = bind_hypothesis_tradeable_scope(
+        buy_context.spec.hypothesis_id, registry=buy_context.registry, artifact_store=buy_context.store
+    )
+    sell_context = _frozen(tmp_path, action_scope="SELL", db_name="widen-sell.db")
+    sell_scope = bind_hypothesis_tradeable_scope(
+        sell_context.spec.hypothesis_id, registry=sell_context.registry, artifact_store=sell_context.store
+    )
+    assert buy_scope.allowed_action_scope != AllowedActionScope.BOTH.value
+    assert sell_scope.allowed_action_scope != AllowedActionScope.BOTH.value
+    assert buy_scope.allowed_action_scope == AllowedActionScope.BUY.value
+    assert sell_scope.allowed_action_scope == AllowedActionScope.SELL.value
+    # BUY_SELL_DIRECTIONAL is still the ONLY source value that ever maps to
+    # BOTH -- proven directly against the module's own closed vocabulary.
+    from trademind.discovery.hypothesis_tradeable_scope import _SOURCE_ACTION_SCOPE_MAP
+
+    assert _SOURCE_ACTION_SCOPE_MAP == {
+        "BUY_SELL_DIRECTIONAL": "BOTH",
+        "BUY": "BUY",
+        "SELL": "SELL",
+    }
+
+
+def test_current_style_frozen_manifest_requires_no_mutation(tmp_path: Path) -> None:
+    """Requirement 5: a hypothesis already frozen the way
+    scripts/bootstrap_first_real_hypothesis.py freezes real hypotheses
+    (CandidateDefinitionV2.action_scope literally "BUY") becomes usable by
+    this code fix ALONE -- calling the builder twice against the SAME,
+    completely untouched registry/manifest/CAS content (no re-freeze, no
+    registry write, no SQLite edit of any kind) must succeed both times
+    with the byte-identical scope_hash."""
+    context = _frozen(tmp_path, action_scope="BUY", db_name="resume.db")
+    first = bind_hypothesis_tradeable_scope(
+        context.spec.hypothesis_id, registry=context.registry, artifact_store=context.store
+    )
+    second = bind_hypothesis_tradeable_scope(
+        context.spec.hypothesis_id, registry=context.registry, artifact_store=context.store
+    )
+    assert first.scope_hash == second.scope_hash
+    assert first.allowed_action_scope == AllowedActionScope.BUY.value
