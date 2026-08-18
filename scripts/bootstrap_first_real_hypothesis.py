@@ -18,31 +18,52 @@ imported or reachable from this script (that lineage only ever mattered
 for TRAIN_TESTED/VALIDATION_PASSED/HOLDOUT_CONSUMED/terminal transitions,
 none of which this script performs).
 
-DATASET SCOPE BINDING (this file's own gap-closing fix): the research
-dataset used for TRAIN_TEST/VALIDATION is never an arbitrary,
+DATASET SCOPE BINDING (this file's own gap-closing fix, twice-revised): the
+research dataset used for TRAIN_TEST/VALIDATION is never an arbitrary,
 operator-supplied CSV. It is derived ONLY from genuine, already-persisted
 runtime evidence, joined by real identity, never by coincidence:
 
-    candidates.jsonl (signal_id)
+    data/signal_intelligence_v1_16/candidates.jsonl (signal_id)
         -> filtered EXACTLY by --symbol/--timeframe/--setup-family/--action-scope
-        -> joined to paper_signals/signals.csv (source_signal_id)
-        -> only rows whose source_signal_id is one of the filtered
-           candidates' own signal_id, and whose OWN symbol/timeframe/action
-           independently agree with that candidate (a second, independent
-           check -- this script never trusts the join key alone), survive.
+        -> joined to data/signal_intelligence_v1_16/outcomes.jsonl (signal_id)
+        -> only outcome records whose signal_id is one of the filtered
+           candidates' own, genuinely-computed signal_id survive.
 
-No synthetic row is ever added, and no candidate/paper-signal outside this
-exact scope can leak into the dataset -- proven directly by test. The
-derived CSV is content-addressed (its SHA-256 is part of the review output)
-and is used directly as the DatasetArtifact for both TRAIN_TEST and
-VALIDATION dataset roles; there is no longer any CLI flag that accepts an
-unrelated, arbitrary research CSV for this bootstrap.
+``outcomes.jsonl`` -- NOT ``paper_signals/signals.csv`` -- is the
+authoritative outcome source for this runtime path: real Windows evidence
+confirmed 315/323 candidates for a real scope have exact
+``SignalCandidate.signal_id`` matches in
+``data/signal_intelligence_v1_16/outcomes.jsonl`` (the same directory
+``candidates.jsonl`` already lives in, and the same canonical file
+``live_signal_runtime.py`` itself reads), while ``paper_signals/signals.csv``
+matched zero. This script therefore never reads ``paper_signals/`` at all,
+and never reads any quarantined or duplicate
+``live_signal_runtime_v1``/``live_signal_runtime_eCN_*`` outcome copy --
+there is no code path here that constructs any outcome path other than the
+one canonical file. Outcome record identity/vocabulary/sign-consistency is
+validated by reusing ``signal_evidence.OutcomeObservation.from_dict``
+unmodified -- the same authoritative schema/parser
+``live_signal_runtime.py`` itself already relies on (via
+``signal_evidence.load_outcomes``).
+
+No synthetic row is ever added, and no candidate/outcome outside this exact
+scope can leak into the dataset -- proven directly by test (an out-of-scope
+outcome could only join by an infeasible SHA-256 collision, since
+``SignalCandidate.signal_id`` is itself a content-derived hash covering
+symbol/timeframe/setup_family/action/observed_at/plan). The derived CSV is
+content-addressed (its SHA-256 is part of the review output) and is used
+directly as the DatasetArtifact for both TRAIN_TEST and VALIDATION dataset
+roles; there is no CLI flag that accepts an unrelated, arbitrary research
+CSV for this bootstrap. A scope where not every candidate has a matching
+outcome (e.g. 315 of 323) is accepted -- the unmatched candidates are
+excluded and reported (never fabricated); the join never invents a missing
+outcome.
 
 WHAT THIS SCRIPT WILL NEVER DO:
 
-  - Fabricate a SignalCandidate, a paper-signal outcome row, or a trading
+  - Fabricate a SignalCandidate, an outcome record, or a trading
     observation. Every row in the derived dataset is a genuine,
-    already-persisted paper-signal row that survived the exact-scope join
+    already-persisted outcome record that survived the exact-scope join
     above; nothing is invented, interpolated, or synthesized.
   - Silently choose a statistical/research parameter. Every value that
     shapes what is being tested (test_family, primary_metric, validation
@@ -117,6 +138,7 @@ from trademind.research_proposal_response import (  # noqa: E402
     RESEARCH_PROPOSAL_RESPONSE_SCHEMA_VERSION,
     ResearchProposalResponseV1,
 )
+from trademind.signal_evidence import OutcomeObservation  # noqa: E402
 from trademind.signal_intelligence import SignalCandidate, candidate_from_dict  # noqa: E402
 from trademind.signal_statistics_agent_packet import (  # noqa: E402
     build_packet_v2_from_artifact,
@@ -139,16 +161,6 @@ SCHEMA_VERSION = "ser8-bootstrap-first-real-hypothesis-v1"
 # Minimum derived-dataset row count before a 60/20/20 chronological split can
 # put at least one row in every phase (int(5 * 0.2) == 1).
 MINIMUM_DATASET_ROWS = 5
-
-# Columns copied verbatim from a matched paper-signal row that are identity/
-# bookkeeping fields, never a candidate research metric.
-_NON_METRIC_COLUMNS = frozenset(
-    {
-        "paper_signal_id", "generated_at", "rule_id", "tier", "source_signal_id",
-        "signal_time", "symbol", "timeframe", "action", "label", "training_status",
-        "exit_time", "outcome", "time",
-    }
-)
 
 
 class BootstrapGapError(RuntimeError):
@@ -234,33 +246,76 @@ def select_candidates_by_scope(
 
 
 # ---------------------------------------------------------------------------
-# Phase 0b: dataset scope binding -- candidates.jsonl x paper_signals/signals.csv.
+# Phase 0b: dataset scope binding -- candidates.jsonl x signal_intelligence_v1_16/outcomes.jsonl.
+#
+# ``paper_signals/signals.csv`` matched ZERO real outcomes for the real
+# scope this task was built against, and is therefore NOT the authoritative
+# outcome source for this runtime path -- this script no longer reads it at
+# all. The authoritative outcome journal is
+# ``data/signal_intelligence_v1_16/outcomes.jsonl``, the canonical file
+# ``live_signal_runtime.py`` itself reads via the same directory
+# ``candidates.jsonl`` already lives in. Its own public, already-closed
+# schema/parser (``trademind.signal_evidence.OutcomeObservation``) is reused
+# directly for identity/vocabulary/sign-consistency validation of every
+# outcome record. Quarantined files and the duplicate
+# ``live_signal_runtime_v1``/``live_signal_runtime_eCN_*`` outcome copies
+# are never read by this script -- there is no code path here that
+# constructs any path other than the one canonical file.
 # ---------------------------------------------------------------------------
 
 
-def load_paper_signal_rows(path: Path) -> list[dict[str, str]]:
+def load_outcome_records(path: Path) -> dict[str, dict[str, object]]:
+    """Read the ONE canonical outcome journal and return a real, genuine
+    outcome payload per signal_id. Reuses
+    ``signal_evidence.OutcomeObservation.from_dict`` to validate every
+    record's identity/vocabulary/sign-consistency exactly as the
+    authoritative production reader (``live_signal_runtime.py`` via
+    ``signal_evidence.load_outcomes``) already does. Fails closed on the
+    first malformed record or the first CONFLICTING duplicate signal_id (two
+    records with the same id but different content); a duplicate line that
+    is byte-identical to an earlier one is tolerated as a harmless
+    idempotent re-append and simply counted, never treated as a second
+    genuine outcome."""
     if not path.is_file():
-        raise BootstrapGapError([f"paper-signals journal not found: {path}"])
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = reader.fieldnames or []
-        for required in ("source_signal_id", "signal_time", "symbol", "timeframe", "action"):
-            if required not in fieldnames:
+        raise BootstrapGapError([f"outcome journal not found: {path}"])
+    by_id: dict[str, dict[str, object]] = {}
+    duplicate_count = 0
+    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise BootstrapGapError([f"{path}:{line_number}: outcome journal line is not valid JSON: {exc}"]) from exc
+        if not isinstance(payload, dict):
+            raise BootstrapGapError([f"{path}:{line_number}: outcome record must be an object"])
+        try:
+            OutcomeObservation.from_dict(payload)  # reuse the authoritative schema/validation, unmodified.
+        except ValueError as exc:
+            raise BootstrapGapError([f"{path}:{line_number}: malformed outcome record: {exc}"]) from exc
+        signal_id = str(payload.get("signal_id", ""))
+        existing = by_id.get(signal_id)
+        if existing is not None:
+            if existing != payload:
                 raise BootstrapGapError(
-                    [f"{path} is missing required column {required!r} (found: {fieldnames})"]
+                    [f"conflicting outcome identity for signal_id={signal_id!r} in {path} (line {line_number})"]
                 )
-        rows = list(reader)
-    if not rows:
-        raise BootstrapGapError([f"paper-signals journal has no rows: {path}"])
-    return rows
+            duplicate_count += 1
+            continue
+        by_id[signal_id] = payload
+    if not by_id:
+        raise BootstrapGapError([f"outcome journal has no rows: {path}"])
+    by_id["__duplicate_count__"] = duplicate_count  # type: ignore[assignment]
+    return by_id
 
 
 @dataclass(frozen=True, slots=True)
 class BoundDataset:
-    matched_candidates: int
-    matched_outcome_rows: int
+    scope_candidates: int
+    matched_outcomes: int
     unmatched_candidates: int
     unmatched_candidate_ids: tuple[str, ...]
+    duplicate_outcomes: int
     fieldnames: tuple[str, ...]
     rows: tuple[dict[str, str], ...] = field(repr=False)
     numeric_metrics: tuple[str, ...]
@@ -268,111 +323,99 @@ class BoundDataset:
     dataset_hash: str
 
 
-def _is_float(value: str) -> bool:
-    if value is None or value == "":
+def _is_float(value: object) -> bool:
+    if value is None or value == "" or isinstance(value, bool):
         return False
     try:
-        float(value)
-    except ValueError:
+        float(value)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
         return False
     return True
 
 
-def bind_dataset_to_candidate_scope(
+_OUTCOME_NON_METRIC_FIELDS = frozenset({"signal_id", "setup_key", "completed_at", "outcome", "exit_reason"})
+
+
+def bind_dataset_to_outcome_journal_scope(
     candidates: Mapping[str, SignalCandidate],
-    paper_rows: Sequence[Mapping[str, str]],
+    outcome_records: Mapping[str, object],
     *,
     key: CoverageKey,
 ) -> BoundDataset:
-    """Join real candidates to real paper-signal outcome rows by genuine
-    identity ONLY (``candidate.signal_id == row['source_signal_id']``), then
-    independently re-verify the joined row's OWN symbol/timeframe/action
-    agree with the candidate it claims to belong to -- a row is never
-    trusted on the join key alone. No synthetic row is ever produced; every
-    surviving row is copied verbatim from ``paper_rows``."""
-    rows_by_source_id: dict[str, list[Mapping[str, str]]] = {}
-    for row in paper_rows:
-        source_id = row.get("source_signal_id", "")
-        if source_id:
-            rows_by_source_id.setdefault(source_id, []).append(row)
+    """Join real candidates to real outcome records by genuine identity
+    ONLY (``candidate.signal_id == outcome['signal_id']``). Since
+    ``SignalCandidate.signal_id`` is itself a content-derived hash covering
+    symbol/timeframe/setup_family/action/observed_at/plan (see its own
+    ``@property`` definition), an out-of-scope outcome cannot accidentally
+    join here -- doing so would require a SHA-256 collision. No synthetic
+    row is ever produced; every surviving row is copied verbatim from the
+    real outcome payload."""
+    duplicate_outcomes = int(outcome_records.get("__duplicate_count__", 0))  # type: ignore[arg-type]
+    records = {key_: value for key_, value in outcome_records.items() if key_ != "__duplicate_count__"}
 
-    matched_outcome_rows = 0
-    selected_rows: list[dict[str, str]] = []
+    matched_rows: list[dict[str, object]] = []
     unmatched_candidate_ids: list[str] = []
 
     for signal_id, candidate in sorted(candidates.items()):
-        joined = rows_by_source_id.get(signal_id, [])
-        verified = [
-            row
-            for row in joined
-            if row.get("symbol", "") == candidate.symbol
-            and row.get("timeframe", "") == candidate.timeframe
-            and row.get("action", "") == candidate.plan.action
-        ]
-        if not verified:
+        record = records.get(signal_id)
+        if record is None:
             unmatched_candidate_ids.append(signal_id)
             continue
-        matched_outcome_rows += len(verified)
-        # Deterministic, non-inventive selection of exactly one already-real
-        # row per candidate for the research dataset itself (chronological
-        # split requires one timestamp per row); every joined row is still
-        # counted in matched_outcome_rows above for full auditability.
-        chosen = sorted(verified, key=lambda row: (row.get("rule_id", ""), row.get("paper_signal_id", "")))[0]
-        selected_rows.append(dict(chosen))
+        row = dict(record)  # type: ignore[arg-type]
+        row["candidate_observed_at"] = candidate.observed_at.astimezone(timezone.utc).isoformat()
+        matched_rows.append(row)
 
-    matched_candidates = len(selected_rows)
+    scope_candidates = len(candidates)
+    matched_outcomes = len(matched_rows)
     unmatched_candidates = len(unmatched_candidate_ids)
 
-    if matched_candidates == 0:
+    if matched_outcomes == 0:
         raise BootstrapGapError(
             [
-                f"zero paper-signal rows matched the {matched_candidates + unmatched_candidates} "
-                f"candidate(s) in scope symbol={key.symbol!r}/timeframe={key.timeframe!r}/"
-                f"setup_family={key.setup_family!r}/action={key.action_scope!r} -- no unrelated "
-                "dataset can be substituted"
+                f"zero outcome records matched the {scope_candidates} candidate(s) in scope "
+                f"symbol={key.symbol!r}/timeframe={key.timeframe!r}/setup_family={key.setup_family!r}/"
+                f"action={key.action_scope!r} -- no unrelated dataset can be substituted"
             ]
         )
-    if matched_candidates < MINIMUM_DATASET_ROWS:
+    if matched_outcomes < MINIMUM_DATASET_ROWS:
         raise BootstrapGapError(
             [
-                f"only {matched_candidates} genuinely matched row(s) are available for this scope, "
+                f"only {matched_outcomes} genuinely matched outcome(s) are available for this scope, "
                 f"fewer than the minimum {MINIMUM_DATASET_ROWS} required for a 60/20/20 chronological "
                 "split to place at least one row in every phase"
             ]
         )
 
-    # Canonical `time` column, derived only from the genuine signal_time.
-    for row in selected_rows:
-        raw_time = row.get("signal_time", "")
-        try:
-            row["time"] = datetime.fromisoformat(raw_time).astimezone(timezone.utc).isoformat()
-        except ValueError as exc:
-            raise BootstrapGapError(
-                [f"source_signal_id={row.get('source_signal_id')!r}: invalid signal_time {raw_time!r}"]
-            ) from exc
+    # Canonical `time` column, derived only from the genuine candidate
+    # observed_at timestamp (never invented); the outcome's own genuine
+    # completed_at is separately preserved verbatim, unchanged.
+    for row in matched_rows:
+        row["time"] = row["candidate_observed_at"]
 
-    selected_rows.sort(key=lambda row: (row["time"], row.get("source_signal_id", "")))
-    times = [row["time"] for row in selected_rows]
+    matched_rows.sort(key=lambda row: (str(row["time"]), str(row.get("signal_id", ""))))
+    times = [row["time"] for row in matched_rows]
     if len(set(times)) != len(times):
         raise BootstrapGapError(
-            ["two or more matched rows share the identical genuine signal_time; refusing to "
-             "invent a tiebreaker for a chronological split"]
+            ["two or more matched candidates share the identical genuine observed_at timestamp; "
+             "refusing to invent a tiebreaker for a chronological split"]
         )
 
     numeric_metrics = tuple(
         sorted(
             column
-            for column in (selected_rows[0].keys() if selected_rows else ())
-            if column not in _NON_METRIC_COLUMNS
-            and all(_is_float(row.get(column, "")) for row in selected_rows)
+            for column in (matched_rows[0].keys() if matched_rows else ())
+            if column not in _OUTCOME_NON_METRIC_FIELDS
+            and column not in ("time", "candidate_observed_at")
+            and all(_is_float(row.get(column)) for row in matched_rows)
         )
     )
 
-    identity_columns = ["time", "source_signal_id", "symbol", "timeframe", "action"]
-    fieldnames = identity_columns + [
-        column for column in numeric_metrics if column not in identity_columns
+    identity_columns = ["time", "signal_id", "completed_at", "outcome"]
+    fieldnames = identity_columns + [column for column in numeric_metrics if column not in identity_columns]
+    output_rows = [
+        {column: ("" if row.get(column) is None else str(row.get(column))) for column in fieldnames}
+        for row in matched_rows
     ]
-    output_rows = [{column: row.get(column, "") for column in fieldnames} for row in selected_rows]
 
     import io as _io
 
@@ -384,10 +427,11 @@ def bind_dataset_to_candidate_scope(
     dataset_hash = hashlib.sha256(csv_bytes).hexdigest()
 
     return BoundDataset(
-        matched_candidates=matched_candidates,
-        matched_outcome_rows=matched_outcome_rows,
+        scope_candidates=scope_candidates,
+        matched_outcomes=matched_outcomes,
         unmatched_candidates=unmatched_candidates,
         unmatched_candidate_ids=tuple(sorted(unmatched_candidate_ids)),
+        duplicate_outcomes=duplicate_outcomes,
         fieldnames=tuple(fieldnames),
         rows=tuple(output_rows),
         numeric_metrics=numeric_metrics,
@@ -526,8 +570,8 @@ def run_bootstrap_chain(
         evaluation_policy_hash=evaluation_policy_hash,
         metrics={
             "observed_journal_rows": observed_rows,
-            "matched_candidates": bound_dataset.matched_candidates,
-            "matched_outcome_rows": bound_dataset.matched_outcome_rows,
+            "scope_candidates": bound_dataset.scope_candidates,
+            "matched_outcomes": bound_dataset.matched_outcomes,
         },
         status="RESEARCH_CANDIDATE",
         reason_codes=(),
@@ -700,9 +744,10 @@ def _print_review(
         "CANDIDATE SCOPE:"
         f" symbol={key.symbol} timeframe={key.timeframe} setup_family={key.setup_family} action={key.action_scope}"
     )
-    print(f"MATCHED CANDIDATES: {bound_dataset.matched_candidates}")
-    print(f"MATCHED OUTCOME ROWS: {bound_dataset.matched_outcome_rows}")
+    print(f"SCOPE CANDIDATES: {bound_dataset.scope_candidates}")
+    print(f"MATCHED OUTCOMES: {bound_dataset.matched_outcomes}")
     print(f"UNMATCHED CANDIDATES: {bound_dataset.unmatched_candidates}")
+    print(f"DUPLICATE OUTCOMES: {bound_dataset.duplicate_outcomes}")
     print(f"DATASET HASH: sha256:{bound_dataset.dataset_hash}")
     print(f"AVAILABLE NUMERIC METRICS: {', '.join(bound_dataset.numeric_metrics)}")
     print(
@@ -730,10 +775,13 @@ def run(args: argparse.Namespace) -> int:
         if args.candidates
         else data_root / "signal_intelligence_v1_16" / "candidates.jsonl"
     )
-    paper_signals_path = (
-        Path(args.paper_signals).expanduser()
-        if args.paper_signals
-        else data_root / "paper_signals" / "signals.csv"
+    # The ONE canonical outcome journal -- never paper_signals/signals.csv,
+    # never a quarantined or live_runtime_v1/eCN duplicate copy. Lives in
+    # the exact same directory as candidates.jsonl.
+    outcomes_path = (
+        Path(args.outcomes).expanduser()
+        if args.outcomes
+        else data_root / "signal_intelligence_v1_16" / "outcomes.jsonl"
     )
 
     try:
@@ -760,8 +808,8 @@ def run(args: argparse.Namespace) -> int:
             )
 
         scoped_candidates = select_candidates_by_scope(candidates_path, key)
-        paper_rows = load_paper_signal_rows(paper_signals_path)
-        bound_dataset = bind_dataset_to_candidate_scope(scoped_candidates, paper_rows, key=key)
+        outcome_records = load_outcome_records(outcomes_path)
+        bound_dataset = bind_dataset_to_outcome_journal_scope(scoped_candidates, outcome_records, key=key)
 
         if args.primary_metric not in bound_dataset.numeric_metrics:
             raise BootstrapGapError(
@@ -825,7 +873,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--candidates", type=Path, default=None)
-    parser.add_argument("--paper-signals", type=Path, default=None)
+    parser.add_argument("--outcomes", type=Path, default=None)
     parser.add_argument("--db", type=Path, default=None)
     parser.add_argument("--artifact-root", type=Path, default=None)
     parser.add_argument("--orchestrator-db", type=Path, default=None)

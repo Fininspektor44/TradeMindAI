@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import csv
 import importlib
 import json
 import sys
@@ -20,21 +19,11 @@ bootstrap_module = importlib.import_module("bootstrap_first_real_hypothesis")
 from trademind.discovery.hypothesis_registry import HypothesisRegistry, HypothesisState  # noqa: E402
 from trademind.signal_intelligence import candidate_from_dict  # noqa: E402
 
-_SYMBOL = "XAUUSD"
+_SYMBOL = "EURUSD"
 _TIMEFRAME = "M5"
-_SETUP_FAMILY = "spread_pressure"
+_SETUP_FAMILY = "MULTIFACTOR_MARKET_SETUP"
 _ACTION = "BUY"
-_METRIC = "net_move"
-
-_PAPER_FIELDS = (
-    "paper_signal_id", "generated_at", "rule_id", "tier", "source_signal_id", "signal_time",
-    "symbol", "timeframe", "action", "label", "horizon", "entry_price", "score", "confidence",
-    "spread_points", "spread_cost_atr", "training_status", "training_trades", "training_days",
-    "training_win_rate", "training_pf_atr", "training_avg_net_atr", "training_early_avg_net_atr",
-    "training_late_avg_net_atr", "training_max_drawdown_atr", "training_max_loss_streak",
-    "training_ci_low", "training_ci_high", "training_p_value", "training_q_value", "exit_time",
-    "net_move", "progress_atr", "mfe_atr", "mae_atr", "outcome",
-)
+_METRIC = "net_r"
 
 _START = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -43,15 +32,15 @@ def _candidate_payload(*, index: int, symbol: str = _SYMBOL, timeframe: str = _T
                         setup_family: str = _SETUP_FAMILY, action: str = _ACTION) -> dict:
     t = (_START + timedelta(hours=index)).isoformat()
     if action == "SELL":
-        stop_price, targets, invalidation = 2010.0, [1980.0], "close above stop"
+        stop_price, targets, invalidation = 1.12, [1.08], "close above stop"
     else:
-        stop_price, targets, invalidation = 1990.0, [2020.0], "close below stop"
+        stop_price, targets, invalidation = 1.08, [1.12], "close below stop"
     return {
         "observed_at": t, "created_at": t, "symbol": symbol, "timeframe": timeframe,
         "setup_family": setup_family, "scenario": "continuation",
         "plan": {
             "action": action,
-            "entries": [{"price": 2000.0, "allocation": 1.0, "rationale": "test", "order_type": "MARKET"}],
+            "entries": [{"price": 1.10, "allocation": 1.0, "rationale": "test", "order_type": "MARKET"}],
             "stop_price": stop_price, "targets": targets, "invalidation": invalidation,
             "target_rationale": ["r1"],
         },
@@ -61,9 +50,6 @@ def _candidate_payload(*, index: int, symbol: str = _SYMBOL, timeframe: str = _T
 
 
 def _real_signal_id(payload: dict) -> str:
-    """The genuine, deterministically-computed SignalCandidate.signal_id --
-    never a value hand-typed into the payload's own (ignored) 'signal_id'
-    key."""
     return candidate_from_dict(payload).signal_id
 
 
@@ -74,33 +60,31 @@ def _write_candidate_journal(data_root: Path, payloads: list[dict]) -> None:
     (candidates_dir / "candidates.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _paper_row(*, source_signal_id: str, index: int, symbol: str = _SYMBOL, timeframe: str = _TIMEFRAME,
-               action: str = _ACTION, net_move: float | None = None) -> dict:
-    t = (_START + timedelta(hours=index)).isoformat()
-    row = {field: "" for field in _PAPER_FIELDS}
-    row.update({
-        "paper_signal_id": f"{source_signal_id}|r1|H1", "generated_at": t, "rule_id": "r1", "tier": "A",
-        "source_signal_id": source_signal_id, "signal_time": t, "symbol": symbol, "timeframe": timeframe,
-        "action": action, "label": "X", "horizon": "1", "entry_price": "2000", "score": "1",
-        "confidence": "1", "spread_points": "1", "spread_cost_atr": "0.01", "training_status": "OK",
-        "training_trades": "10", "training_days": "5", "training_win_rate": "0.5",
-        "training_pf_atr": "1.2", "training_avg_net_atr": "0.1", "training_early_avg_net_atr": "0.1",
-        "training_late_avg_net_atr": "0.1", "training_max_drawdown_atr": "0.1",
-        "training_max_loss_streak": "1", "training_ci_low": "0", "training_ci_high": "0.2",
-        "training_p_value": "0.05", "training_q_value": "0.05", "exit_time": t,
-        "net_move": str(1.0 + index if net_move is None else net_move),
-        "progress_atr": "0.5", "mfe_atr": str(2.0 + index), "mae_atr": str(-1.0 - index * 0.1),
-        "outcome": "WIN",
-    })
-    return row
+def _outcome_payload(*, signal_id: str, index: int, outcome: str = "WIN", net_r: float | None = None) -> dict:
+    completed_at = (_START + timedelta(hours=index, minutes=30)).isoformat()
+    return {
+        "schema_version": "shadow-v1",
+        "signal_id": signal_id,
+        "setup_key": "sk-test",
+        "completed_at": completed_at,
+        "outcome": outcome,
+        "net_r": (1.0 + index if net_r is None else net_r) if outcome != "LOSS" else -(1.0 + index),
+        "exit_reason": "TARGET",
+        "exit_price": 1.12,
+        "filled_entries": 1,
+        "allocation_filled": 1.0,
+        "average_entry": 1.10,
+        "mfe_r": 2.0 + index,
+        "mae_r": -0.5 - index * 0.1,
+        "bars_observed": 10,
+    }
 
 
-def _write_paper_signals(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(_PAPER_FIELDS))
-        writer.writeheader()
-        writer.writerows(rows)
+def _write_outcomes_journal(data_root: Path, payloads: list[dict]) -> None:
+    outcomes_dir = data_root / "signal_intelligence_v1_16"
+    outcomes_dir.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(payload, sort_keys=True) for payload in payloads]
+    (outcomes_dir / "outcomes.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _full_argv(data_root: Path, **overrides) -> list[str]:
@@ -130,84 +114,138 @@ def _full_argv(data_root: Path, **overrides) -> list[str]:
 @pytest.fixture()
 def genuine_scope(tmp_path: Path) -> Path:
     """A real candidate journal (8 in-scope candidates) genuinely joined to
-    a real paper-signals journal (one matching outcome row per candidate),
-    using the SAME real, deterministically-computed signal_id both files
+    a real canonical outcome journal (one matching outcome per candidate),
+    keyed by the SAME real, deterministically-computed signal_id both files
     must share to join at all."""
     data_root = tmp_path / "data"
     payloads = [_candidate_payload(index=i) for i in range(8)]
     _write_candidate_journal(data_root, payloads)
     real_ids = [_real_signal_id(p) for p in payloads]
-    rows = [_paper_row(source_signal_id=sid, index=i) for i, sid in enumerate(real_ids)]
-    _write_paper_signals(data_root / "paper_signals" / "signals.csv", rows)
+    outcomes = [
+        _outcome_payload(signal_id=sid, index=i, outcome="WIN" if i % 2 == 0 else "LOSS")
+        for i, sid in enumerate(real_ids)
+    ]
+    _write_outcomes_journal(data_root, outcomes)
     return data_root
 
 
 # ---------------------------------------------------------------------------
-# 1. Unrelated CSV cannot be used.
+# 1. Canonical outcome journal only -- paper_signals never used, no quarantine.
 # ---------------------------------------------------------------------------
 
 
-def test_no_research_source_csv_flag_exists() -> None:
+def test_no_paper_signals_flag_or_reference_exists() -> None:
     parser = bootstrap_module.build_arg_parser()
     flags = {action.option_strings[0] for action in parser._actions if action.option_strings}
+    assert "--paper-signals" not in flags
     assert "--research-source-csv" not in flags
-
-
-def test_no_arbitrary_path_argument_reaches_dataset_artifact_construction() -> None:
     source = Path(bootstrap_module.__file__).read_text(encoding="utf-8")
-    assert "args.research_source_csv" not in source
-    assert "research_source_csv" not in source
+    lines = source.splitlines()
+    tree = ast.parse(source)
+    docstring_line_numbers: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.ClassDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                docstring_line_numbers.update(range(body[0].lineno, (body[0].end_lineno or body[0].lineno) + 1))
+    code_lines = [
+        line for index, line in enumerate(lines, start=1)
+        if index not in docstring_line_numbers and not line.strip().startswith("#")
+    ]
+    # Executable, non-comment/non-docstring code must never open a
+    # paper_signals path or a quarantine/live_runtime_v1/eCN duplicate
+    # outcome path (the prose explaining WHY, in comments/docstrings, is
+    # allowed to name them -- the "negative assertion, not the thing
+    # itself" pattern already established elsewhere in this codebase).
+    code_without_prose = "\n".join(code_lines)
+    for forbidden in ("paper_signals", "quarantine", "live_signal_runtime_v1", "live_signal_runtime_eCN"):
+        assert forbidden not in code_without_prose, forbidden
+
+
+def test_default_outcomes_path_is_the_canonical_journal() -> None:
+    parser = bootstrap_module.build_arg_parser()
+    args = parser.parse_args(["--data-root", "/tmp/somewhere"] + [])
+    assert args.outcomes is None  # no hidden override; run() computes the canonical default itself
+    source = Path(bootstrap_module.__file__).read_text(encoding="utf-8")
+    assert 'data_root / "signal_intelligence_v1_16" / "outcomes.jsonl"' in source
 
 
 # ---------------------------------------------------------------------------
-# 2. Wrong symbol/timeframe/setup/action cannot leak rows; genuine join only.
+# 2. Audit requirement: reuse the existing authoritative schema/parser.
 # ---------------------------------------------------------------------------
 
 
-def test_wrong_symbol_paper_row_cannot_leak_in(genuine_scope: Path) -> None:
+def test_reuses_outcome_observation_schema() -> None:
+    source = Path(bootstrap_module.__file__).read_text(encoding="utf-8")
+    assert "from trademind.signal_evidence import OutcomeObservation" in source
+    assert "OutcomeObservation.from_dict" in source
+
+
+# ---------------------------------------------------------------------------
+# 3. Filter candidates exactly by symbol/timeframe/setup_family/action.
+# ---------------------------------------------------------------------------
+
+
+def test_out_of_scope_candidate_never_joins(genuine_scope: Path) -> None:
     data_root = genuine_scope
-    candidates_path = data_root / "signal_intelligence_v1_16" / "candidates.jsonl"
+    # Add one more candidate with a DIFFERENT setup_family and its own real
+    # outcome -- it must never appear in the EURUSD/M5/MULTIFACTOR_MARKET_SETUP/BUY dataset.
+    outlier_payload = _candidate_payload(index=50, setup_family="OTHER_SETUP")
+    all_payloads = [
+        json.loads(line)
+        for line in (data_root / "signal_intelligence_v1_16" / "candidates.jsonl").read_text().strip().splitlines()
+    ] + [outlier_payload]
+    _write_candidate_journal(data_root, all_payloads)
+    outlier_id = _real_signal_id(outlier_payload)
+    existing_outcomes = [
+        json.loads(line)
+        for line in (data_root / "signal_intelligence_v1_16" / "outcomes.jsonl").read_text().strip().splitlines()
+    ]
+    _write_outcomes_journal(
+        data_root, existing_outcomes + [_outcome_payload(signal_id=outlier_id, index=50, net_r=99999.0)]
+    )
+
     key = bootstrap_module.CoverageKey(
         symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope=_ACTION
     )
-    candidates = bootstrap_module.select_candidates_by_scope(candidates_path, key)
-    paper_rows = bootstrap_module.load_paper_signal_rows(data_root / "paper_signals" / "signals.csv")
-    # Inject one paper row whose source_signal_id happens to collide with a
-    # real candidate's signal_id but whose OWN symbol disagrees.
-    tampered = list(paper_rows)
-    victim_id = next(iter(candidates))
-    tampered.append(_paper_row(source_signal_id=victim_id, index=99, symbol="EURUSD", net_move=999.0))
-    bound = bootstrap_module.bind_dataset_to_candidate_scope(candidates, tampered, key=key)
-    assert "999.0" not in bound.csv_bytes.decode("utf-8")
-    assert bound.matched_outcome_rows == 8  # the tampered row is rejected, not counted
+    candidates = bootstrap_module.select_candidates_by_scope(
+        data_root / "signal_intelligence_v1_16" / "candidates.jsonl", key
+    )
+    assert outlier_id not in candidates
+    records = bootstrap_module.load_outcome_records(data_root / "signal_intelligence_v1_16" / "outcomes.jsonl")
+    bound = bootstrap_module.bind_dataset_to_outcome_journal_scope(candidates, records, key=key)
+    assert "99999.0" not in bound.csv_bytes.decode("utf-8")
+    assert bound.scope_candidates == 8
 
 
-def test_unmatched_candidate_not_in_dataset(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# 4. Genuine signal_id join only; 5,10: 315/323-style partial match accepted.
+# ---------------------------------------------------------------------------
+
+
+def test_partial_match_accepted_and_reported(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
-    payloads = [_candidate_payload(index=i) for i in range(5)]
+    payloads = [_candidate_payload(index=i) for i in range(8)]
     _write_candidate_journal(data_root, payloads)
     real_ids = [_real_signal_id(p) for p in payloads]
-    # Only 5 rows so 4 of 5 candidates match (below the minimum), plus one
-    # extra unrelated candidate outside scope entirely (different symbol).
-    rows = [_paper_row(source_signal_id=sid, index=i) for i, sid in enumerate(real_ids[:4])]
-    _write_paper_signals(data_root / "paper_signals" / "signals.csv", rows)
+    # Only 6 of 8 candidates get a genuine outcome -- 2 unmatched, never fabricated.
+    outcomes = [_outcome_payload(signal_id=sid, index=i) for i, sid in enumerate(real_ids[:6])]
+    _write_outcomes_journal(data_root, outcomes)
     key = bootstrap_module.CoverageKey(
         symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope=_ACTION
     )
     candidates = bootstrap_module.select_candidates_by_scope(
         data_root / "signal_intelligence_v1_16" / "candidates.jsonl", key
     )
-    paper_rows = bootstrap_module.load_paper_signal_rows(data_root / "paper_signals" / "signals.csv")
-    # 4 matched candidates, below MINIMUM_DATASET_ROWS -- must fail closed,
-    # never silently proceed with an undersized dataset.
-    with pytest.raises(bootstrap_module.BootstrapGapError):
-        bootstrap_module.bind_dataset_to_candidate_scope(candidates, paper_rows, key=key)
+    records = bootstrap_module.load_outcome_records(data_root / "signal_intelligence_v1_16" / "outcomes.jsonl")
+    bound = bootstrap_module.bind_dataset_to_outcome_journal_scope(candidates, records, key=key)
+    assert bound.scope_candidates == 8
+    assert bound.matched_outcomes == 6
+    assert bound.unmatched_candidates == 2
+    assert len(bound.unmatched_candidate_ids) == 2
 
 
-def test_join_uses_only_signal_id_source_signal_id(genuine_scope: Path) -> None:
-    """A paper row that matches by symbol/timeframe/action but whose
-    source_signal_id does not correspond to ANY real candidate must never
-    be pulled in."""
+def test_join_uses_only_signal_id_no_fuzzy_matching(genuine_scope: Path) -> None:
     data_root = genuine_scope
     key = bootstrap_module.CoverageKey(
         symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope=_ACTION
@@ -215,19 +253,27 @@ def test_join_uses_only_signal_id_source_signal_id(genuine_scope: Path) -> None:
     candidates = bootstrap_module.select_candidates_by_scope(
         data_root / "signal_intelligence_v1_16" / "candidates.jsonl", key
     )
-    paper_rows = bootstrap_module.load_paper_signal_rows(data_root / "paper_signals" / "signals.csv")
-    paper_rows = list(paper_rows) + [_paper_row(source_signal_id="TM-NOT-A-REAL-CANDIDATE", index=50, net_move=12345.0)]
-    bound = bootstrap_module.bind_dataset_to_candidate_scope(candidates, paper_rows, key=key)
+    records = dict(
+        bootstrap_module.load_outcome_records(data_root / "signal_intelligence_v1_16" / "outcomes.jsonl")
+    )
+    # An outcome for a signal_id that matches NO real candidate must never
+    # be pulled in, even though its other fields look plausible.
+    records["TM-NOT-A-REAL-CANDIDATE"] = _outcome_payload(
+        signal_id="TM-NOT-A-REAL-CANDIDATE", index=99, net_r=12345.0
+    )
+    bound = bootstrap_module.bind_dataset_to_outcome_journal_scope(candidates, records, key=key)
     assert "12345.0" not in bound.csv_bytes.decode("utf-8")
-    assert bound.matched_candidates == 8
+    assert bound.matched_outcomes == 8
 
 
 # ---------------------------------------------------------------------------
-# 3. Canonical time derived from real signal_time.
+# 6. Canonical time derived only from genuine persisted timestamps.
 # ---------------------------------------------------------------------------
 
 
-def test_canonical_time_derived_from_real_signal_time(genuine_scope: Path) -> None:
+def test_canonical_time_derived_from_real_candidate_observed_at(genuine_scope: Path) -> None:
+    import csv
+
     data_root = genuine_scope
     key = bootstrap_module.CoverageKey(
         symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope=_ACTION
@@ -235,98 +281,146 @@ def test_canonical_time_derived_from_real_signal_time(genuine_scope: Path) -> No
     candidates = bootstrap_module.select_candidates_by_scope(
         data_root / "signal_intelligence_v1_16" / "candidates.jsonl", key
     )
-    paper_rows = bootstrap_module.load_paper_signal_rows(data_root / "paper_signals" / "signals.csv")
-    bound = bootstrap_module.bind_dataset_to_candidate_scope(candidates, paper_rows, key=key)
+    records = bootstrap_module.load_outcome_records(data_root / "signal_intelligence_v1_16" / "outcomes.jsonl")
+    bound = bootstrap_module.bind_dataset_to_outcome_journal_scope(candidates, records, key=key)
     reader = csv.DictReader(bound.csv_bytes.decode("utf-8").splitlines())
     rows = list(reader)
     assert "time" in reader.fieldnames
+    assert "completed_at" in reader.fieldnames
     for row in rows:
-        # Every printed time must equal a real signal_time from the fixture.
         parsed = datetime.fromisoformat(row["time"])
         assert _START <= parsed <= _START + timedelta(hours=7)
     times = [row["time"] for row in rows]
     assert times == sorted(times)
 
 
-def test_invalid_signal_time_fails_closed(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# 7. Deterministic dataset hash.
+# ---------------------------------------------------------------------------
+
+
+def test_dataset_hash_deterministic_across_runs(genuine_scope: Path) -> None:
+    data_root = genuine_scope
+    key = bootstrap_module.CoverageKey(
+        symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope=_ACTION
+    )
+    candidates_path = data_root / "signal_intelligence_v1_16" / "candidates.jsonl"
+    outcomes_path = data_root / "signal_intelligence_v1_16" / "outcomes.jsonl"
+
+    bound_1 = bootstrap_module.bind_dataset_to_outcome_journal_scope(
+        bootstrap_module.select_candidates_by_scope(candidates_path, key),
+        bootstrap_module.load_outcome_records(outcomes_path), key=key,
+    )
+    bound_2 = bootstrap_module.bind_dataset_to_outcome_journal_scope(
+        bootstrap_module.select_candidates_by_scope(candidates_path, key),
+        bootstrap_module.load_outcome_records(outcomes_path), key=key,
+    )
+    assert bound_1.dataset_hash == bound_2.dataset_hash
+    assert bound_1.csv_bytes == bound_2.csv_bytes
+
+
+# ---------------------------------------------------------------------------
+# 8/9. No synthetic metrics/rows/timestamps/fills; fail closed on malformed/
+# duplicate/conflicting outcome identity.
+# ---------------------------------------------------------------------------
+
+
+def test_conflicting_duplicate_outcome_fails_closed(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
-    payloads = [_candidate_payload(index=i) for i in range(5)]
+    payloads = [_candidate_payload(index=i) for i in range(6)]
     _write_candidate_journal(data_root, payloads)
     real_ids = [_real_signal_id(p) for p in payloads]
-    rows = [_paper_row(source_signal_id=sid, index=i) for i, sid in enumerate(real_ids)]
-    rows[0]["signal_time"] = "not-a-real-timestamp"
+    outcomes = [_outcome_payload(signal_id=sid, index=i) for i, sid in enumerate(real_ids)]
+    # Append a SECOND, CONFLICTING record for the same signal_id (different net_r).
+    conflicting = dict(outcomes[0])
+    conflicting["net_r"] = 999.0
+    outcomes.append(conflicting)
+    _write_outcomes_journal(data_root, outcomes)
+    with pytest.raises(bootstrap_module.BootstrapGapError, match="conflicting outcome identity"):
+        bootstrap_module.load_outcome_records(data_root / "signal_intelligence_v1_16" / "outcomes.jsonl")
+
+
+def test_identical_duplicate_outcome_line_is_tolerated_and_counted(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    payloads = [_candidate_payload(index=i) for i in range(6)]
+    _write_candidate_journal(data_root, payloads)
+    real_ids = [_real_signal_id(p) for p in payloads]
+    outcomes = [_outcome_payload(signal_id=sid, index=i) for i, sid in enumerate(real_ids)]
+    outcomes.append(dict(outcomes[0]))  # byte-identical idempotent re-append
+    _write_outcomes_journal(data_root, outcomes)
+    records = bootstrap_module.load_outcome_records(data_root / "signal_intelligence_v1_16" / "outcomes.jsonl")
+    assert records["__duplicate_count__"] == 1
+
+
+def test_malformed_outcome_record_fails_closed(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    payloads = [_candidate_payload(index=i) for i in range(6)]
+    _write_candidate_journal(data_root, payloads)
+    real_ids = [_real_signal_id(p) for p in payloads]
+    outcomes = [_outcome_payload(signal_id=sid, index=i) for i, sid in enumerate(real_ids)]
+    outcomes[0]["outcome"] = "MAYBE"  # not in VALID_OUTCOMES
+    _write_outcomes_journal(data_root, outcomes)
+    with pytest.raises(bootstrap_module.BootstrapGapError, match="malformed outcome record"):
+        bootstrap_module.load_outcome_records(data_root / "signal_intelligence_v1_16" / "outcomes.jsonl")
+
+
+def test_undersized_matched_set_fails_closed(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    payloads = [_candidate_payload(index=i) for i in range(8)]
+    _write_candidate_journal(data_root, payloads)
+    real_ids = [_real_signal_id(p) for p in payloads]
+    outcomes = [_outcome_payload(signal_id=sid, index=i) for i, sid in enumerate(real_ids[:4])]
+    _write_outcomes_journal(data_root, outcomes)
     key = bootstrap_module.CoverageKey(
         symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope=_ACTION
     )
     candidates = bootstrap_module.select_candidates_by_scope(
         data_root / "signal_intelligence_v1_16" / "candidates.jsonl", key
     )
+    records = bootstrap_module.load_outcome_records(data_root / "signal_intelligence_v1_16" / "outcomes.jsonl")
     with pytest.raises(bootstrap_module.BootstrapGapError):
-        bootstrap_module.bind_dataset_to_candidate_scope(candidates, rows, key=key)
+        bootstrap_module.bind_dataset_to_outcome_journal_scope(candidates, records, key=key)
+
+
+def test_zero_matched_outcomes_fails_closed(tmp_path: Path, capsys) -> None:
+    data_root = tmp_path / "data"
+    payloads = [_candidate_payload(index=i) for i in range(6)]
+    _write_candidate_journal(data_root, payloads)
+    _write_outcomes_journal(
+        data_root, [_outcome_payload(signal_id=f"TM-UNRELATED-{i:04d}", index=i) for i in range(6)]
+    )
+    argv = _full_argv(data_root)
+    exit_code = bootstrap_module.main(argv)
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "zero outcome records matched" in captured.err
+    assert not (data_root / "ser8_registry.db").exists()
 
 
 # ---------------------------------------------------------------------------
-# 4. Deterministic derived dataset hash.
+# 11. Human still chooses primary metric.
 # ---------------------------------------------------------------------------
 
 
-def test_dataset_hash_is_deterministic(genuine_scope: Path) -> None:
+def test_primary_metric_must_be_genuinely_available(genuine_scope: Path, capsys) -> None:
     data_root = genuine_scope
-    key = bootstrap_module.CoverageKey(
-        symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope=_ACTION
-    )
-    candidates_path = data_root / "signal_intelligence_v1_16" / "candidates.jsonl"
-    paper_path = data_root / "paper_signals" / "signals.csv"
-    candidates_1 = bootstrap_module.select_candidates_by_scope(candidates_path, key)
-    rows_1 = bootstrap_module.load_paper_signal_rows(paper_path)
-    bound_1 = bootstrap_module.bind_dataset_to_candidate_scope(candidates_1, rows_1, key=key)
-
-    candidates_2 = bootstrap_module.select_candidates_by_scope(candidates_path, key)
-    rows_2 = bootstrap_module.load_paper_signal_rows(paper_path)
-    bound_2 = bootstrap_module.bind_dataset_to_candidate_scope(candidates_2, rows_2, key=key)
-
-    assert bound_1.dataset_hash == bound_2.dataset_hash
-    assert bound_1.csv_bytes == bound_2.csv_bytes
+    argv = _full_argv(data_root, **{"--primary-metric": "invented_metric"})
+    exit_code = bootstrap_module.main(argv)
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "not one of the genuinely available numeric metrics" in captured.err
+    assert "net_r" in captured.err
 
 
-def test_dataset_hash_changes_with_different_scope(genuine_scope: Path) -> None:
-    data_root = genuine_scope
-    # Add a second, disjoint scope (SELL instead of BUY) with its own real
-    # candidates/paper rows so the two derived datasets must hash differently.
-    payloads_sell = [_candidate_payload(index=i, action="SELL") for i in range(5)]
-    existing = json.loads(
-        "[" + ",".join((data_root / "signal_intelligence_v1_16" / "candidates.jsonl").read_text().strip().splitlines()) + "]"
-    )
-    all_payloads = existing + payloads_sell
-    _write_candidate_journal(data_root, all_payloads)
-    real_ids_sell = [_real_signal_id(p) for p in payloads_sell]
-    existing_rows = bootstrap_module.load_paper_signal_rows(data_root / "paper_signals" / "signals.csv")
-    new_rows = [_paper_row(source_signal_id=sid, index=i, action="SELL") for i, sid in enumerate(real_ids_sell)]
-    _write_paper_signals(data_root / "paper_signals" / "signals.csv", list(existing_rows) + new_rows)
-
-    key_buy = bootstrap_module.CoverageKey(
-        symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope="BUY"
-    )
-    key_sell = bootstrap_module.CoverageKey(
-        symbol=_SYMBOL, timeframe=_TIMEFRAME, setup_family=_SETUP_FAMILY, action_scope="SELL"
-    )
-    candidates_path = data_root / "signal_intelligence_v1_16" / "candidates.jsonl"
-    paper_path = data_root / "paper_signals" / "signals.csv"
-    bound_buy = bootstrap_module.bind_dataset_to_candidate_scope(
-        bootstrap_module.select_candidates_by_scope(candidates_path, key_buy),
-        bootstrap_module.load_paper_signal_rows(paper_path), key=key_buy,
-    )
-    # Exactly 5 SELL candidates -- meets MINIMUM_DATASET_ROWS, so this must
-    # succeed and produce a dataset hash that differs from the BUY scope's.
-    bound_sell = bootstrap_module.bind_dataset_to_candidate_scope(
-        bootstrap_module.select_candidates_by_scope(candidates_path, key_sell),
-        bootstrap_module.load_paper_signal_rows(paper_path), key=key_sell,
-    )
-    assert bound_buy.dataset_hash != bound_sell.dataset_hash
+def test_no_hidden_default_for_any_research_parameter() -> None:
+    parser = bootstrap_module.build_arg_parser()
+    for action in parser._actions:
+        if action.dest in bootstrap_module._RESEARCH_PARAMETER_ARGS:
+            assert action.default is None, f"{action.dest} must have no hidden default"
 
 
 # ---------------------------------------------------------------------------
-# 5. Review writes no real state.
+# 12/13. Review writes no real state; --approve required for FROZEN.
 # ---------------------------------------------------------------------------
 
 
@@ -339,15 +433,33 @@ def test_review_mode_writes_zero_registry_state(genuine_scope: Path, capsys) -> 
     assert not (data_root / "ser8_artifacts").exists()
     assert not (data_root / "ser8_bootstrap_datasets").exists()
     captured = capsys.readouterr()
-    assert "MATCHED CANDIDATES: 8" in captured.out
-    assert "MATCHED OUTCOME ROWS: 8" in captured.out
+    assert "SCOPE CANDIDATES: 8" in captured.out
+    assert "MATCHED OUTCOMES: 8" in captured.out
     assert "UNMATCHED CANDIDATES: 0" in captured.out
+    assert "DUPLICATE OUTCOMES: 0" in captured.out
     assert "DATASET HASH: sha256:" in captured.out
     assert "AVAILABLE NUMERIC METRICS:" in captured.out
-    assert "CANDIDATE SCOPE:" in captured.out
+    assert "net_r" in captured.out
 
 
-def test_review_and_approve_produce_identical_hypothesis_and_dataset_hash(genuine_scope: Path, capsys) -> None:
+def test_approve_required_for_real_creation_and_reaches_frozen(genuine_scope: Path, capsys) -> None:
+    data_root = genuine_scope
+    argv = _full_argv(data_root)
+    bootstrap_module.main(argv)
+    assert not (data_root / "ser8_registry.db").exists()
+
+    exit_code = bootstrap_module.main(argv + ["--approve"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    hypothesis_id = next(line for line in captured.out.splitlines() if "hypothesis_id" in line).split("=")[1].strip()
+    registry = HypothesisRegistry(data_root / "ser8_registry.db")
+    assert registry.get(hypothesis_id).state is HypothesisState.FROZEN
+    assert (data_root / "ser8_bootstrap_datasets").is_dir()
+    assert "run_ser8_real_demo_pipeline.py" in captured.out
+    assert "--account 67206924" in captured.out
+
+
+def test_review_and_approve_identical_hypothesis_and_dataset_hash(genuine_scope: Path, capsys) -> None:
     data_root = genuine_scope
     argv = _full_argv(data_root)
     bootstrap_module.main(argv)
@@ -362,39 +474,11 @@ def test_review_and_approve_produce_identical_hypothesis_and_dataset_hash(genuin
 
     assert review_id == approve_id
     assert review_hash in approve_hash_line
-    assert (data_root / "ser8_bootstrap_datasets").is_dir()
-
-    registry = HypothesisRegistry(data_root / "ser8_registry.db")
-    assert registry.get(approve_id).state is HypothesisState.FROZEN
-
-
-def test_primary_metric_must_be_a_genuinely_available_metric(genuine_scope: Path, capsys) -> None:
-    data_root = genuine_scope
-    argv = _full_argv(data_root, **{"--primary-metric": "totally_invented_metric"})
-    exit_code = bootstrap_module.main(argv)
-    assert exit_code == 2
-    captured = capsys.readouterr()
-    assert "not one of the genuinely available numeric metrics" in captured.err
-
-
-def test_zero_matched_rows_fails_closed(tmp_path: Path, capsys) -> None:
-    data_root = tmp_path / "data"
-    payloads = [_candidate_payload(index=i) for i in range(6)]
-    _write_candidate_journal(data_root, payloads)
-    # Paper journal has rows, but for a completely different, unrelated set
-    # of source_signal_id values -- zero genuine matches.
-    rows = [_paper_row(source_signal_id="TM-UNRELATED-0000", index=i) for i in range(6)]
-    _write_paper_signals(data_root / "paper_signals" / "signals.csv", rows)
-    argv = _full_argv(data_root)
-    exit_code = bootstrap_module.main(argv)
-    assert exit_code == 2
-    captured = capsys.readouterr()
-    assert "zero paper-signal rows matched" in captured.err
-    assert not (data_root / "ser8_registry.db").exists()
 
 
 # ---------------------------------------------------------------------------
-# 6. AST/source-scan invariants (authoritative path, no synthetic rows).
+# 14/15. No broker execution; authoritative lifecycle unchanged/unreachable
+# past FROZEN.
 # ---------------------------------------------------------------------------
 
 
@@ -436,27 +520,19 @@ def test_no_broker_order_sent_by_bootstrap() -> None:
         assert term not in source
 
 
-def test_no_hidden_default_for_any_research_parameter() -> None:
-    parser = bootstrap_module.build_arg_parser()
-    for action in parser._actions:
-        if action.dest in bootstrap_module._RESEARCH_PARAMETER_ARGS:
-            assert action.default is None, f"{action.dest} must have no hidden default"
-
-
-def test_no_synthetic_row_construction_in_bind_function() -> None:
-    """bind_dataset_to_candidate_scope must only ever COPY an existing
-    paper_rows entry; it must never construct a numeric metric value from a
-    hardcoded literal (an empty-dict/list initializer is fine)."""
+def test_no_numeric_literal_hardcoded_in_bind_function() -> None:
+    """bind_dataset_to_outcome_journal_scope must only ever COPY real
+    outcome payload values; it must never invent a numeric metric."""
     source = Path(bootstrap_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     function = next(
         node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "bind_dataset_to_candidate_scope"
+        if isinstance(node, ast.FunctionDef) and node.name == "bind_dataset_to_outcome_journal_scope"
     )
     for node in ast.walk(function):
         if isinstance(node, ast.Dict) and node.values:
             for value in node.values:
                 if isinstance(value, ast.Constant) and isinstance(value.value, (int, float)):
                     pytest.fail(
-                        "bind_dataset_to_candidate_scope must never hardcode a numeric dict value"
+                        "bind_dataset_to_outcome_journal_scope must never hardcode a numeric dict value"
                     )
