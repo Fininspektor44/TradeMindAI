@@ -683,3 +683,59 @@ def test_advance_is_noop_for_already_accepted(tmp_path: Path) -> None:
         sealed_holdout_path=chain.sealed_holdout_path,
     )
     assert pipeline.registry.get(chain.hypothesis_id).state is HypothesisState.ACCEPTED
+
+
+# ---------------------------------------------------------------------------
+# SER8 SUPERVISED DEMO RISK PROFILE + BLOCK DIAGNOSTICS V1 -- integration
+# tests against the REAL, checked-in profile files.
+# ---------------------------------------------------------------------------
+
+_REAL_STANDARD_PROFILE = REPO_ROOT / "config" / "risk_profiles" / "standard_v1.json"
+_REAL_SUPERVISED_DEMO_PROFILE = REPO_ROOT / "config" / "risk_profiles" / "ser8_supervised_demo_v1.json"
+
+
+def test_real_default_standard_profile_blocks_with_full_diagnostics_no_authorization(
+    tmp_path: Path, capsys
+) -> None:
+    """The real, unmodified default (config/risk_profiles/standard_v1.json)
+    must never silently become usable for the SER8 APPROVED_MANUAL channel
+    -- and a BLOCK must never be a bare one-liner, and must never reach
+    authorization/claim/order-send."""
+    chain = _full_real_chain(tmp_path)
+    _write_candidate_journal(chain.data_root)
+    _write_mt5_exports(chain.data_root)
+
+    args = _base_args(chain, risk_profile=_REAL_STANDARD_PROFILE)
+    exit_code = pipeline_module.run_pipeline(args)
+    assert exit_code == 3
+    captured = capsys.readouterr()
+    assert "SIGNAL_NOT_APPROVED" in captured.out
+    assert "failed checks" in captured.out
+    assert "reasons (" in captured.out
+    assert captured.err.strip() != ""  # the short refusal line is still printed to stderr too.
+
+    db = sqlite3.connect(chain.db_path)
+    db.row_factory = sqlite3.Row
+    for table in ("ser8_execution_authorizations", "ser8_execution_authorization_claims", "ser8_mt5_demo_order_receipts"):
+        rows = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchall()
+        assert rows == [], table
+    db.close()
+
+
+def test_real_supervised_demo_profile_reaches_allow_and_preview(tmp_path: Path, capsys) -> None:
+    """The real, checked-in supervised-demo profile, selected EXPLICITLY,
+    reaches a genuine ALLOW and a full preview -- proving the new profile
+    file is the one that actually unblocks the SER8 demo path, not a
+    weakening of the default."""
+    chain = _full_real_chain(tmp_path)
+    _write_candidate_journal(chain.data_root)
+    _write_mt5_exports(chain.data_root)
+
+    args = _base_args(chain, risk_profile=_REAL_SUPERVISED_DEMO_PROFILE)
+    exit_code = pipeline_module.run_pipeline(args)
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "PREVIEW (NO ORDER SENT)" in captured.out
+    assert "RiskDecision.state   = ALLOW" in captured.out

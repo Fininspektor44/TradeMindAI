@@ -99,6 +99,7 @@ import io
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -147,7 +148,7 @@ from trademind.hypothesis_live_candidate_matching import (  # noqa: E402
     verify_live_candidate_matches_scope,
 )
 from trademind.orchestrator.artifact_store import ArtifactStore  # noqa: E402
-from trademind.risk_manager import RiskProfile, profile_from_dict  # noqa: E402
+from trademind.risk_manager import RiskDecision, RiskProfile, profile_from_dict  # noqa: E402
 from trademind.ser8_demo_account_safety_gate import (  # noqa: E402
     DemoAccountAllowlistV1,
     DemoAccountSafetyGateError,
@@ -559,6 +560,63 @@ class Preview:
     price: float
 
 
+def _account_snapshot_age_seconds(account_csv: Path, *, now: datetime | None = None) -> float | None:
+    """Diagnostic-only read of the real, already-discovered account export's
+    own most recent time_msc column -- never fed back into the actual
+    RiskDecision (that computation belongs entirely to
+    mt5_risk_adapter.adapt_mt5_exports, called separately, unmodified,
+    inside evaluate_ser8_research_risk_gate). Returns None rather than
+    guessing if the file is missing or malformed; this is BLOCK-diagnostic
+    context only, never a second source of truth for the decision itself."""
+    try:
+        with account_csv.open("r", encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        if not rows:
+            return None
+        latest_msc = max(int(row["time_msc"]) for row in rows if row.get("time_msc"))
+        captured_at = datetime.fromtimestamp(latest_msc / 1000, tz=timezone.utc)
+        return ((now or datetime.now(timezone.utc)) - captured_at).total_seconds()
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _print_block_diagnostics(
+    decision: RiskDecision, *, candidate: SignalCandidate, account_csv: Path,
+) -> None:
+    """Never hides a BLOCK behind a generic message. Prints every reason
+    this task explicitly requires, then still returns BLOCK -- this
+    function has no return value and authorizes nothing."""
+    print("SER8 REAL DEMO PIPELINE -- BLOCK (RiskDecision.state != ALLOW)")
+    print(f"  decision_id           = {decision.decision_id}")
+    print(f"  candidate signal_id   = {candidate.signal_id}")
+    print(f"  requested_risk_pct    = {decision.requested_risk_pct}")
+
+    failed_checks = [name for name, passed in decision.checks.items() if not passed]
+    print(f"  failed checks ({len(failed_checks)}):")
+    for name in failed_checks:
+        print(f"    - {name}")
+
+    print(f"  reasons ({len(decision.reasons)}):")
+    for reason in decision.reasons:
+        print(f"    - [{reason.code}] {reason.message}")
+
+    print(f"  warnings ({len(decision.warnings)}):")
+    for warning in decision.warnings:
+        print(f"    - [{warning.code}] {warning.message}")
+
+    if decision.orders:
+        order = decision.orders[0]
+        print(f"  calculated volume     = {order.volume} ({order.order_type} @ {order.planned_price})")
+    else:
+        print("  calculated volume     = n/a (no SizedOrder was produced)")
+
+    account_age = _account_snapshot_age_seconds(account_csv)
+    print(f"  account snapshot age  = {f'{account_age:.1f}s' if account_age is not None else 'unavailable'}")
+
+    candidate_age = (datetime.now(timezone.utc) - candidate.observed_at.astimezone(timezone.utc)).total_seconds()
+    print(f"  candidate observed_at = {candidate.observed_at.isoformat()} (age {candidate_age:.1f}s)")
+
+
 def _print_preview(preview: Preview) -> None:
     print("SER8 REAL DEMO PIPELINE -- PREVIEW (NO ORDER SENT)")
     print(f"  hypothesis_id        = {preview.hypothesis_id}")
@@ -667,6 +725,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         )
 
         if result.decision.state != "ALLOW":
+            _print_block_diagnostics(result.decision, candidate=candidate, account_csv=inputs.account_csv)
             print(
                 f"RiskDecision.state={result.decision.state!r}; not ALLOW, refusing to authorize execution.",
                 file=sys.stderr,

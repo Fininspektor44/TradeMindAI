@@ -1,0 +1,24 @@
+{
+  "name": "SER8_SUPERVISED_DEMO_V1",
+  "risk_basis": "MIN_BALANCE_EQUITY",
+  "default_trade_risk_pct": 0.5,
+  "maximum_trade_risk_pct": 1.0,
+  "maximum_portfolio_risk_pct": 3.0,
+  "maximum_symbol_risk_pct": 1.5,
+  "maximum_correlation_risk_pct": 2.0,
+  "maximum_daily_loss_pct": 2.0,
+  "maximum_account_drawdown_pct": 10.0,
+  "maximum_margin_usage_pct": 50.0,
+  "minimum_free_margin_pct": 25.0,
+  "maximum_open_trades": 8,
+  "maximum_account_snapshot_age_seconds": 120,
+  "maximum_signal_age_seconds": 900,
+  "maximum_clock_skew_seconds": 30,
+  "adverse_slippage_ticks": 2.0,
+  "minimum_risk_utilization_pct": 50.0,
+  "require_margin_check": true,
+  "require_complete_portfolio_risk": true,
+  "allowed_signal_states": [
+    "APPROVED_MANUAL"
+  ]
+}
