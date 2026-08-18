@@ -1,15 +1,19 @@
 """Pure identity matcher between a :class:`HypothesisTradeableScopeV1` and a
 live :class:`SignalCandidate`.
 
-This is the ONLY module in the codebase that imports from both the
+This was the first module in the codebase to import from both the
 Discovery Engine research lineage (``trademind.discovery.*``) and the live
 signal/risk lineage (``trademind.signal_intelligence``); every other module
 in either lineage keeps them completely separate (see
 ``trademind.discovery.research_eligibility_boundary``'s own docstring for
 the exhaustive verification that this was true before this module existed).
-Confining the one legitimate cross-lineage identity check to a single,
-narrow, single-purpose module makes that one deliberate seam easy to audit
-and impossible to miss.
+``trademind.ser8_research_risk_gate`` is the one other module that
+deliberately crosses this seam -- it composes this matcher, unchanged, with
+``present_eligible_artifact`` and ``bind_hypothesis_tradeable_scope`` to
+reach a verified ``RiskDecision``. Confining the cross-lineage identity
+checks to these two narrow, single-purpose, easy-to-audit modules -- rather
+than letting the boundary blur across the codebase -- keeps the seam
+impossible to miss.
 
 ``verify_live_candidate_matches_scope`` performs ONLY an exact, deterministic
 identity/scope comparison -- no fuzzy matching, no semantic similarity, no
