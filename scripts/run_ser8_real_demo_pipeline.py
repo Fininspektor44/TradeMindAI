@@ -39,12 +39,23 @@ AUTO-DISCOVERED REAL RUNTIME INPUTS (never fabricated, never a test fixture):
       ``signal_passport_factory.py``, ``fx_signal_adapter.py`` -- already
       reads). This script never constructs a ``SignalCandidate`` itself; it
       only loads one that a real, already-running signal adapter journaled.
-  <data-root>/mt5/mt5_risk_account_<login>.csv
-  <data-root>/mt5/mt5_risk_positions_<login>.csv
-  <data-root>/mt5/mt5_risk_symbols_<login>.csv
-      The exact filename convention documented in
-      ``docs/MT5_READONLY_RISK_ADAPTER_V1_18.md`` and already produced by the
-      existing MT5 risk exporter, keyed by the account/login this run is for.
+  <data-root>/mt5/mt5_risk_account_utc_<login>.csv
+  <data-root>/mt5/mt5_risk_positions_utc_<login>.csv
+  <data-root>/mt5/mt5_risk_symbols_utc_<login>.csv
+      The exact filename convention the real MT5 risk exporter -- both the
+      standalone ``TradeMind_MT5_Risk_Snapshot_Exporter.mq5`` and, since the
+      SER8 unified executor, ``TradeMind_Demo_Order_Executor_v1.mq5``
+      itself -- actually writes, and that every other production consumer
+      (``scripts/run_v118_mt5_risk_adapter.ps1``,
+      ``scripts/run_v119_signal_to_risk_bridge.ps1``,
+      ``scripts/run_v121_live_signal_runtime.ps1``,
+      ``scripts/run_v130_breakeven_runtime.ps1``) already expects. An
+      earlier version of this docstring and this auto-discovery both
+      omitted the ``_utc_`` segment (matching a stale line in
+      ``docs/MT5_READONLY_RISK_ADAPTER_V1_18.md`` instead of the real
+      exporter source) -- fixed here after an audit confirmed the ``_utc_``
+      form is the one genuinely produced and consumed everywhere else in
+      this repository.
   <db>  (default: <data-root>/ser8_registry.db)
       The real ``HypothesisRegistry`` SQLite file. Created if absent (an
       empty registry is not fake state -- it is simply empty; every
@@ -224,9 +235,12 @@ def discover_inputs(
         )
 
     mt5_dir = (mt5_export_dir or (data_root / "mt5")).expanduser()
-    account_csv = mt5_dir / f"mt5_risk_account_{login}.csv"
-    positions_csv = mt5_dir / f"mt5_risk_positions_{login}.csv"
-    symbols_csv = mt5_dir / f"mt5_risk_symbols_{login}.csv"
+    # The real exporter (standalone or, since the unified executor, the
+    # single TradeMind_Demo_Order_Executor_v1.mq5) writes the `_utc_`
+    # form -- see the module docstring's audit note above.
+    account_csv = mt5_dir / f"mt5_risk_account_utc_{login}.csv"
+    positions_csv = mt5_dir / f"mt5_risk_positions_utc_{login}.csv"
+    symbols_csv = mt5_dir / f"mt5_risk_symbols_utc_{login}.csv"
     for path, label in (
         (account_csv, "MT5 account export"),
         (positions_csv, "MT5 positions export"),

@@ -1,4 +1,52 @@
-# TradeMind SER8 MT5 Demo Order Executor v1.0
+# TradeMind SER8 MT5 Demo Order Executor v1.1
+
+## v1.1 — объединение с Risk Snapshot Exporter (ОДИН EA вместо двух)
+
+Начиная с v1.1, `TradeMind_Demo_Order_Executor_v1.mq5` дополнительно
+выполняет ту же самую read-only функциональность, что и отдельный
+`TradeMind_MT5_Risk_Snapshot_Exporter.mq5` (account/positions/Market Watch
+snapshot), на своём собственном независимо настраиваемом таймере
+(`InpRiskRefreshSeconds`, по умолчанию 30с, минимум 10с). Для SER8
+demo-цепочки достаточно прикрепить **ОДИН EA к ОДНОМУ графику** -- второй
+советник для risk-снапшота **больше не требуется**.
+
+- Используется РОВНО ОДИН `EventSetTimer()` на весь файл (таймер работает
+  на более мелком из двух настроенных интервалов `InpPollSeconds`/
+  `InpRiskRefreshSeconds`; каждая из двух задач -- опрос ордеров и
+  risk-снапшот -- запускается по своему собственному, независимо
+  отслеживаемому времени последнего запуска, а не по общему тику).
+- Risk-снапшот функции (`AppendAccountSnapshot`/`ExportPositionSnapshot`/
+  `ExportSymbolSnapshot`) перенесены дословно, с той же самой схемой
+  колонок и теми же именами файлов
+  (`mt5_risk_account_utc_<login>.csv`,
+  `mt5_risk_positions_utc_<login>.csv`,
+  `mt5_risk_symbols_utc_<login>.csv`), что и в
+  `TradeMind_MT5_Risk_Snapshot_Exporter.mq5` -- Python-сторона
+  (`mt5_risk_adapter.py`, `scripts/run_ser8_real_demo_pipeline.py`) не
+  требует никаких изменений схемы.
+- Риск-снапшот строго read-only: не содержит ни одного вызова
+  `CTrade`/`OrderSend`, никогда не участвует в решении об исполнении
+  ордера. Ошибка записи снапшота (например, файл занят) логируется и
+  пропускается -- она НИКОГДА не авторизует и не блокирует ордер. Отказ
+  ордера (reject/malformed) точно так же никогда не пропускает следующий
+  запланированный снапшот -- обе задачи полностью независимы в
+  `OnTimer()`.
+- **Позиционирование объёма (lot size) по-прежнему НИКОГДА не вычисляется
+  в MQL5.** `volume` в исполнителе всегда приходит только из уже
+  авторизованного файла запроса (`ser8_demo_order_request_<login>.csv`),
+  который, в свою очередь, содержит ровно то значение, которое вычислил
+  `risk_manager.evaluate_risk` -> `RiskDecision.SizedOrder` на
+  Python-стороне. Эта цепочка (MT5 snapshot -> Python SER8 Risk Manager ->
+  RiskDecision.SizedOrder -> authorization/claim -> executor получает
+  фиксированный volume -> broker order) в v1.1 не изменилась ни на одно
+  поле.
+- Отдельный `TradeMind_MT5_Risk_Snapshot_Exporter.mq5` остаётся в
+  репозитории без изменений -- он всё ещё нужен для НЕ-SER8 конвейеров
+  (`run_v118_mt5_risk_adapter.ps1`, `run_v119_signal_to_risk_bridge.ps1`,
+  `run_v121_live_signal_runtime.ps1`, `run_v130_breakeven_runtime.ps1`),
+  которые продолжают ожидать те же самые `mt5_risk_*_utc_*.csv` файлы
+  независимо от того, что делает SER8. Для production SER8 demo-пути его
+  больше не нужно прикреплять.
 
 ## Назначение
 
@@ -73,7 +121,9 @@ fill/malformed результат, отказ транспорта без авт
   retcode/order_ticket/deal_ticket/filled_volume/filled_price;
 - не содержит `OnTick`, grid/averaging/martingale логики, и не принимает
   никаких торговых решений сама -- SER8 остаётся единственным источником
-  авторизации.
+  авторизации;
+- дополнительно (v1.1), на независимом таймере, пишет read-only
+  account/positions/symbols risk-снапшот -- см. раздел "v1.1" выше.
 
 **Этот файл не был скомпилирован MetaEditor и не запускался ни на одном
 терминале.** Его синтаксис написан вручную, по образцу уже работающих
@@ -87,12 +137,18 @@ live-счёт к этому исполнителю.**
 
 1. **Скомпилировать исполнитель.** Открыть
    `mt5/TradeMind_Demo_Order_Executor_v1.mq5` в MetaEditor на Windows,
-   `Compile`, убедиться в отсутствии ошибок/предупреждений.
-2. **Установить/прикрепить.** Скопировать `.ex5` в `MQL5\Experts` терминала
-   (тот же механизм, что и для существующих экспортёров -- общая папка
-   `%APPDATA%\MetaQuotes\Terminal\<id>\MQL5\Experts`). Прикрепить советник
-   к ОДНОМУ графику на **DEMO/PAPER-счёте**. Разрешить автоматическую
-   торговлю (`AutoTrading` включён) только для этого графика.
+   `Compile`, убедиться в отсутствии ошибок/предупреждений. Это ЕДИНСТВЕННЫЙ
+   `.mq5`, который нужно скомпилировать для SER8 demo-пути.
+2. **Установить/прикрепить.** Либо запустить
+   `scripts\install_ser8_demo_order_executor.ps1` (копирует исходник в
+   `MQL5\Experts\TradeMindAI` каждого найденного терминала, аналогично
+   `install_v118_mt5_risk_exporter.ps1`), либо скопировать `.ex5` вручную в
+   `MQL5\Experts` терминала (`%APPDATA%\MetaQuotes\Terminal\<id>\MQL5\Experts`).
+   Прикрепить советник к ОДНОМУ графику на **DEMO/PAPER-счёте** -- это
+   ЕДИНСТВЕННЫЙ EA, который нужно прикрепить; отдельный
+   `TradeMind_MT5_Risk_Snapshot_Exporter.mq5` для SER8 demo-пути прикреплять
+   не нужно. Разрешить автоматическую торговлю (`AutoTrading` включён)
+   только для этого графика.
 3. **Проверить DEMO login.** Убедиться, что `AccountInfoInteger(ACCOUNT_LOGIN)`
    этого терминала -- это именно тот `account_id`, который будет в
    `DemoAccountAllowlistV1` на Python-стороне. Никогда не использовать

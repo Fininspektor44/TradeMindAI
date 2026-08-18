@@ -390,14 +390,14 @@ def _write_mt5_exports(data_root: Path, *, account: str = _ACCOUNT) -> None:
         "free_margin": 10_000.0, "margin_level": 0, "leverage": 100, "open_positions": 0,
         "trade_allowed": 1, "terminal_connected": 1,
     }]
-    _write_csv(mt5_dir / f"mt5_risk_account_{account}.csv", account_fields, account_rows)
+    _write_csv(mt5_dir / f"mt5_risk_account_utc_{account}.csv", account_fields, account_rows)
 
     position_fields = [
         "time_msc", "account_login", "server", "currency", "position_ticket", "position_id",
         "position_time_msc", "symbol", "magic", "side", "volume", "open_price",
         "current_price", "sl", "tp", "profit", "swap", "comment",
     ]
-    _write_csv(mt5_dir / f"mt5_risk_positions_{account}.csv", position_fields, [])
+    _write_csv(mt5_dir / f"mt5_risk_positions_utc_{account}.csv", position_fields, [])
 
     symbol_fields = [
         "time_msc", "account_login", "server", "currency", "symbol", "digits", "trade_mode",
@@ -414,7 +414,7 @@ def _write_mt5_exports(data_root: Path, *, account: str = _ACCOUNT) -> None:
         "margin_initial": 0.0, "margin_maintenance": 0.0, "margin_buy_per_volume": 20.0,
         "margin_sell_per_volume": 20.0, "leverage": 100,
     }]
-    _write_csv(mt5_dir / f"mt5_risk_symbols_{account}.csv", symbol_fields, symbol_rows)
+    _write_csv(mt5_dir / f"mt5_risk_symbols_utc_{account}.csv", symbol_fields, symbol_rows)
 
 
 # ---------------------------------------------------------------------------
