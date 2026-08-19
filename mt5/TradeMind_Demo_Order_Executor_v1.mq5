@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.3"
-#property description "TradeMind SER8 Demo Order Executor v1.3"
+#property version   "1.4"
+#property description "TradeMind SER8 Demo Order Executor v1.4"
 #property description "EXECUTOR ONLY. Reads at most one pending SER8 order"
 #property description "request per timer tick, independently verifies the"
 #property description "account/login and request identity, sends exactly"
@@ -40,6 +40,16 @@
 #property description "cancelled, expired, or rejected -- still strictly"
 #property description "read-only, still no OrderSend/CTrade call anywhere"
 #property description "in either export function."
+#property description "v1.4 fixes both history exports' own HistorySelect"
+#property description "call: it now uses TimeCurrent() (broker/server time,"
+#property description "the domain HistorySelect actually requires), not"
+#property description "TimeGMT(). On a server ahead of GMT this previously"
+#property description "excluded genuinely recent, already-filled orders"
+#property description "from the selected range entirely, producing a"
+#property description "header-only export even for real, existing tickets."
+#property description "No other clock in this file (capture timestamps,"
+#property description "timer cadence) changed -- this fixes only the"
+#property description "HistorySelect query interval."
 
 #include <Trade\Trade.mqh>
 
@@ -718,8 +728,21 @@ bool ExportOrderHistorySnapshot()
    // real outcome, and PLACED/STARTED rows are skipped here since the
    // OrdersTotal() loop above already reported them, avoiding a
    // duplicate row for the same order_ticket.
-   datetime from=TimeGMT()-InpHistoryLookbackDays*86400;
-   if(HistorySelect(from,TimeGMT()))
+   //
+   // HistorySelect's own from/to interval is BROKER/SERVER time
+   // (confirmed: real Windows evidence showed both history exports
+   // reproducibly empty -- header only -- even for tickets 733124339/
+   // 733124518, which definitely existed and were filled). TimeGMT()
+   // returns GMT, not server time; TimeCurrent() is the documented
+   // server-time clock every other MQL5 History* call already implicitly
+   // assumes. A broker server ahead of GMT (as most are) means a recent
+   // order's own server-time timestamp can fall AFTER a TimeGMT()-based
+   // upper bound, silently excluding it from the selected range -- this
+   // is the confirmed root cause, not a filtering or magic-number bug.
+   // Both from and to use the SAME TimeCurrent() basis.
+   datetime from=TimeCurrent()-InpHistoryLookbackDays*86400;
+   datetime to=TimeCurrent();
+   if(HistorySelect(from,to))
    {
       int history_total=HistoryOrdersTotal();
       for(int index=0;index<history_total;index++)
@@ -756,6 +779,14 @@ bool ExportOrderHistorySnapshot()
          );
          written++;
       }
+   }
+   else
+   {
+      // A successful zero-row history is still valid (nothing to
+      // report); a FAILED HistorySelect call is not the same thing and
+      // must never be silently indistinguishable from "no history yet".
+      PrintFormat("TradeMind demo executor: ExportOrderHistorySnapshot HistorySelect failed, error=%d",GetLastError());
+      ResetLastError();
    }
 
    FileFlush(handle);
@@ -807,8 +838,12 @@ bool ExportDealHistorySnapshot()
 
    long captured_msc=UtcNowMsc();
    int written=0;
-   datetime from=TimeGMT()-InpHistoryLookbackDays*86400;
-   if(HistorySelect(from,TimeGMT()))
+   // Same server-time fix and rationale as ExportOrderHistorySnapshot
+   // above -- HistorySelect's interval is broker/server time, not GMT.
+   // Both from and to use the SAME TimeCurrent() basis.
+   datetime from=TimeCurrent()-InpHistoryLookbackDays*86400;
+   datetime to=TimeCurrent();
+   if(HistorySelect(from,to))
    {
       int total=HistoryDealsTotal();
       for(int index=0;index<total;index++)
@@ -842,6 +877,15 @@ bool ExportDealHistorySnapshot()
          );
          written++;
       }
+   }
+   else
+   {
+      // Same diagnostics discipline as ExportOrderHistorySnapshot: a
+      // successful zero-row history is still valid; a FAILED
+      // HistorySelect call is not, and must never be silently
+      // indistinguishable from "no deals yet".
+      PrintFormat("TradeMind demo executor: ExportDealHistorySnapshot HistorySelect failed, error=%d",GetLastError());
+      ResetLastError();
    }
 
    FileFlush(handle);
@@ -904,7 +948,7 @@ int OnInit()
    g_last_risk_snapshot_at=0;
    CollectRiskSnapshot();
    g_last_risk_snapshot_at=TimeGMT();
-   Print("TradeMind SER8 Demo Order Executor v1.3 started. One EA, one chart: SER8 one-shot order execution "
+   Print("TradeMind SER8 Demo Order Executor v1.4 started. One EA, one chart: SER8 one-shot order execution "
          "plus read-only risk/position/order/deal snapshot export. No strategy logic, no position sizing of "
          "any kind runs here.");
    return INIT_SUCCEEDED;

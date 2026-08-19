@@ -180,10 +180,15 @@ def test_no_position_sizing_or_grid_language_in_either_new_export() -> None:
 
 
 def test_history_lookback_bounds_the_scan_never_unbounded() -> None:
+    # SER8 MT5 HISTORY SERVER-TIME FIX V1 changed the HistorySelect clock
+    # domain (TimeGMT -> TimeCurrent, see
+    # tests/test_ser8_mt5_history_server_time_fix.py for the dedicated
+    # proof) but the bounded-lookback SHAPE itself -- a from/to pair fed
+    # straight into one HistorySelect call -- is unchanged.
     for function_name in ("ExportOrderHistorySnapshot", "ExportDealHistorySnapshot"):
         body = _function_body(_source(), function_name)
         assert "InpHistoryLookbackDays" in body
-        assert "HistorySelect(from,TimeGMT())" in body
+        assert "HistorySelect(from,to)" in body
 
 
 # ---------------------------------------------------------------------------
