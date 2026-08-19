@@ -5,8 +5,15 @@ param(
     [Parameter(Mandatory=$false)]
     [int]$IntervalMinutes = 1,
 
+    # NOT named $Db -- see run_ser8_mt5_reconciliation.ps1's own comment
+    # on this exact same parameter for the confirmed real Windows root
+    # cause (PowerShell's parameter binder treated "Db" as ambiguous
+    # against the common parameter -Debug: ParameterBindingException,
+    # "Не удается задать параметр 'Db' из-за конфликта с псевдонимом
+    # параметра 'Debug'."). DatabasePath cannot collide with any
+    # PowerShell common parameter.
     [Parameter(Mandatory=$false)]
-    [string]$Db = ".\data\ser8_registry.db",
+    [string]$DatabasePath = ".\data\ser8_registry.db",
 
     [Parameter(Mandatory=$false)]
     [string]$Account = "67206924",
@@ -55,7 +62,7 @@ $powershell = Join-Path $PSHOME "powershell.exe"
 # "XML-код задачи содержит значение в неправильном формате" duration-
 # serialization error) -- this installer reuses that SAME proven pattern
 # from the start rather than risking either bug again.
-$taskArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`" -Db `"$Db`" -Account `"$Account`" -Mt5ExportDir `"$Mt5ExportDir`""
+$taskArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`" -DatabasePath `"$DatabasePath`" -Account `"$Account`" -Mt5ExportDir `"$Mt5ExportDir`""
 if ($DryRun) {
     $taskArguments += " -DryRun"
 }
@@ -63,7 +70,7 @@ if ($DryRun) {
 Write-Host "Installing scheduled task: $TaskName" -ForegroundColor Cyan
 Write-Host "Interval: every $IntervalMinutes minute(s)"
 Write-Host "Account: $Account"
-Write-Host "Registry db: $Db"
+Write-Host "Registry db: $DatabasePath"
 Write-Host "MT5 export dir: $Mt5ExportDir"
 Write-Host "Dry run: $($DryRun.IsPresent)"
 

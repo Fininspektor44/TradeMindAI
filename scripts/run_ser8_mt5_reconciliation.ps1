@@ -1,6 +1,14 @@
 param(
+    # NOT named $Db -- PowerShell's common parameter -Debug binds to any
+    # advanced parameter whose name is an unambiguous PREFIX of "Debug"
+    # (a single letter "Db" is not literally a prefix, but PowerShell's
+    # own parameter-binder still treated it as ambiguous against -Debug
+    # on the real Windows install, raising ParameterBindingException:
+    # "Не удается задать параметр 'Db' из-за конфликта с псевдонимом
+    # параметра 'Debug'." -- confirmed root cause). DatabasePath cannot
+    # collide with any PowerShell common parameter.
     [Parameter(Mandatory=$false)]
-    [string]$Db = ".\data\ser8_registry.db",
+    [string]$DatabasePath = ".\data\ser8_registry.db",
 
     [Parameter(Mandatory=$false)]
     [string]$Account = "67206924",
@@ -44,12 +52,12 @@ $script = Join-Path $PSScriptRoot "reconcile_ser8_mt5_execution.py"
 
 try {
     $started = Get-Date
-    "[$($started.ToString('o'))] START account=$Account db=$Db mt5_export_dir=$Mt5ExportDir dry_run=$($DryRun.IsPresent)" |
+    "[$($started.ToString('o'))] START account=$Account db=$DatabasePath mt5_export_dir=$Mt5ExportDir dry_run=$($DryRun.IsPresent)" |
         Add-Content -Path $logPath -Encoding UTF8
 
     $arguments = @(
         $script,
-        "--db", $Db,
+        "--db", $DatabasePath,
         "--account", $Account,
         "--mt5-export-dir", $Mt5ExportDir,
         "--once"
