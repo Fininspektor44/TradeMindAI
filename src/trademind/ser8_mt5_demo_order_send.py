@@ -1411,6 +1411,160 @@ class SER8DemoOrderSendControl:
             filled_price=(transport_result.filled_price if transport_result is not None else None),
         )
 
+    def recover_misclassified_pending_leg(
+        self,
+        leg_id: str,
+        *,
+        evidence: DemoOrderTransportResult,
+        now: datetime | None = None,
+    ) -> DemoOrderExecutionReceiptV1:
+        """One-time, explicit recovery path for a leg an OLDER version of
+        this module (before this fix -- ``SER8 MT5 PENDING LIMIT RECEIPT +
+        RECONCILIATION V1`` and its own predecessor) persisted as
+        MALFORMED, when fresh, authoritative broker evidence NOW proves it
+        was actually a genuinely accepted pending LIMIT/STOP order all
+        along. This is exactly the real incident this path exists for:
+        FILLED MARKET + two legs the pre-fix classifier persisted
+        MALFORMED for retcode=10009 (DONE), a real nonzero order_ticket,
+        deal_ticket=position_ticket="0", filled_price=0.0 -- the SAME
+        shape :meth:`reconcile_pending_leg` now classifies PENDING for a
+        FRESH send, but that method refuses to touch a leg whose
+        PERSISTED state is not already PENDING (it was never meant to
+        reclassify old data). This method is the narrow, explicit bridge
+        for that one-time migration.
+
+        NEVER calls the transport and NEVER resends (requirements 1/9) --
+        confirmed by direct source inspection just like
+        :meth:`reconcile_pending_leg`. Recovers ONLY a leg whose CURRENTLY
+        PERSISTED state is exactly MALFORMED (never touches FILLED/
+        REJECTED/REQUOTE/PARTIAL_FILL/UNKNOWN/CANCELLED/PENDING legs --
+        requirement 8's "existing FILLED leg untouched" and every other
+        terminal state stays terminal), and only when EVERY one of the
+        following is independently proven, never assumed (requirement 3/4
+        -- any ambiguity fails closed):
+
+          * the persisted request's own ``order_type`` is LIMIT or STOP,
+            never MARKET (a MARKET leg can never be "recovered" as
+            PENDING -- there is no such thing as a pending MARKET order);
+          * the persisted request payload's own integrity check passes
+            (its recomputed ``request_hash`` matches what was stored);
+          * the supplied evidence's ``claim_id`` exactly equals ``leg_id``;
+          * if the already-persisted MALFORMED receipt itself captured a
+            nonzero ``order_ticket`` (it always has, since this module has
+            always persisted the raw transport fields regardless of
+            result_state), the supplied evidence's ``order_ticket`` must
+            match it exactly -- catching evidence that describes a
+            DIFFERENT order by mistake;
+          * reclassifying the evidence against the persisted request via
+            the SAME authoritative :func:`_classify_result` this module
+            uses everywhere else yields exactly ``"PENDING"`` -- i.e. a
+            successful retcode, a real nonzero order_ticket, absent deal/
+            position tickets, and a zero fill price, all at once. Any
+            other reclassification (still MALFORMED, or anything else)
+            means the evidence does not unambiguously prove a pending
+            placement, and this method refuses to recover the leg.
+
+        ``order_ticket`` is preserved from the leg's own already-persisted
+        value whenever one exists (requirement 5) -- never invented, never
+        silently replaced by the evidence's own copy of the same value.
+
+        Idempotent (requirement 6): calling this again for a leg already
+        recovered (now PENDING) with evidence consistent with what is
+        already persisted is a harmless no-op that returns the current
+        receipt unchanged, never a duplicate write and never an error.
+        Once recovered to PENDING, the normal :meth:`reconcile_pending_leg`
+        is the correct entrypoint for any further PENDING -> FILLED/
+        CANCELLED/etc. transition (requirement 7).
+        """
+        if evidence.claim_id != leg_id:
+            raise SER8DemoOrderSendError(
+                f"recovery evidence claim_id {evidence.claim_id!r} does not match leg {leg_id!r}"
+            )
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg_id,)
+            ).fetchone()
+        if row is None:
+            raise SER8DemoOrderSendError(f"no existing send attempt found for leg {leg_id}; cannot recover")
+        if row["payload_json"] is None:
+            raise SER8DemoOrderSendError(
+                f"leg {leg_id} has a reserved but never-finalized attempt; cannot recover an in-flight send"
+            )
+        current = _receipt_from_payload(json.loads(row["payload_json"]))
+
+        if current.result_state == "PENDING":
+            # Idempotent re-run (requirement 6): this leg was already
+            # recovered (or was already genuinely PENDING for some other
+            # reason). A no-op ONLY if the evidence is consistent with
+            # what is already persisted -- anything inconsistent still
+            # fails closed rather than silently succeeding.
+            if _has_ticket(current.order_ticket) and current.order_ticket != evidence.order_ticket:
+                raise SER8DemoOrderSendError(
+                    f"recovery evidence order_ticket {evidence.order_ticket!r} does not match the "
+                    f"already-recovered order_ticket {current.order_ticket!r} for leg {leg_id}; "
+                    "refusing to treat this as the same recovery"
+                )
+            return current
+        if current.result_state != "MALFORMED":
+            raise SER8DemoOrderSendError(
+                f"leg {leg_id} is not MALFORMED and not already-recovered PENDING "
+                f"(result_state={current.result_state!r}); this recovery path only applies to legacy "
+                "misclassified MALFORMED legs -- once any other terminal state is reached it stays "
+                "terminal, and a leg already PENDING for a fresh send uses reconcile_pending_leg instead"
+            )
+
+        request_payload = json.loads(row["request_json"])
+        original_request = _request_from_payload(request_payload)
+        if original_request.request_hash != request_payload.get("request_hash"):
+            raise SER8DemoOrderSendError(
+                f"persisted request payload for leg {leg_id} failed its own integrity check"
+            )
+        if original_request.order_type == "MARKET":
+            raise SER8DemoOrderSendError(
+                f"leg {leg_id} is a MARKET order; a MARKET leg can never be recovered as PENDING"
+            )
+
+        if _has_ticket(current.order_ticket) and current.order_ticket != evidence.order_ticket:
+            raise SER8DemoOrderSendError(
+                f"recovery evidence order_ticket {evidence.order_ticket!r} does not match the "
+                f"already-persisted order_ticket {current.order_ticket!r} for leg {leg_id}; "
+                "refusing to recover -- this evidence may describe a different order"
+            )
+
+        new_state = _classify_result(original_request, evidence)
+        if new_state != "PENDING":
+            raise SER8DemoOrderSendError(
+                f"recovery evidence for leg {leg_id} does not unambiguously prove a pending "
+                f"placement (reclassified as {new_state!r}, not PENDING); refusing to recover -- "
+                "every condition (successful retcode, nonzero order_ticket, absent deal/position "
+                "tickets, zero fill price) must hold at once"
+            )
+
+        preserved_order_ticket = current.order_ticket if _has_ticket(current.order_ticket) else evidence.order_ticket
+        captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        return self._finalize(
+            claim_id=leg_id,
+            plan_id=current.plan_id,
+            parent_claim_id=current.parent_claim_id,
+            entry_index=current.entry_index,
+            authorization_id=current.authorization_id,
+            demo_gate_hash=current.demo_gate_hash,
+            request_hash=current.request_hash,
+            attempt_id=current.attempt_id,
+            result_state="PENDING",
+            recorded_at=captured_at.isoformat(),
+            retcode=evidence.retcode,
+            retcode_description=evidence.retcode_description,
+            order_ticket=preserved_order_ticket,
+            deal_ticket=evidence.deal_ticket,
+            position_ticket=evidence.position_ticket,
+            requested_volume=current.requested_volume,
+            requested_price=current.requested_price,
+            filled_volume=evidence.filled_volume,
+            filled_price=evidence.filled_price,
+        )
+
     def send(
         self,
         claim: ExecutionAuthorizationClaimV1,

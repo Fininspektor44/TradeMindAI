@@ -2308,3 +2308,422 @@ def test_reconcile_pending_leg_never_calls_the_transport() -> None:
     source = inspect.getsource(module.SER8DemoOrderSendControl.reconcile_pending_leg)
     assert "self.transport" not in source
     assert ".send(" not in source
+
+
+# ---------------------------------------------------------------------------
+# RECOVER EXISTING MISCLASSIFIED PENDING LIMIT LEGS.
+#
+# The real CURRENT incident this section reproduces exactly: an
+# already-submitted real demo plan persisted (by the OLD, pre-PENDING-
+# classifier code) as leg #1 = FILLED, leg #2/#3 = MALFORMED, even though
+# the authoritative MT5 receipt evidence for #2/#3 proves they were
+# genuinely accepted pending LIMIT orders (retcode=10009, nonzero
+# order_ticket, deal_ticket=position_ticket="0", filled_price=0).
+# reconcile_pending_leg refuses to touch these (it only ever advances a
+# leg whose PERSISTED state is already PENDING); this section proves the
+# new, explicit, one-time recover_misclassified_pending_leg path can
+# recover them safely, without ever resending, to FILLED + PENDING +
+# PENDING -- matching the real incident's own leg identities and tickets.
+# ---------------------------------------------------------------------------
+
+
+def _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport):
+    """Drives a real send() through the control exactly as production
+    code would, but with _classify_result monkeypatched back to its
+    PRE-FIX behavior (no PENDING branch at all) -- so genuine pending-
+    order evidence is persisted MALFORMED, reproducing exactly what an
+    OLDER deployment of this module actually wrote to disk for the real
+    incident. Never hand-edits SQLite -- every row is written by the
+    control's own real send()/_reserve_leg_attempt()/_finalize() code
+    paths, unmodified."""
+    import trademind.ser8_mt5_demo_order_send as module
+
+    original_classify = module._classify_result
+
+    def _legacy_classify_result(request, result):
+        state = original_classify(request, result)
+        return "MALFORMED" if state == "PENDING" else state
+
+    monkeypatch.setattr(module, "_classify_result", _legacy_classify_result)
+    with pytest.raises(SER8DemoOrderPartialExecutionError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    monkeypatch.undo()
+
+
+def test_recover_misclassified_legs_reproduces_the_real_incident_exactly(
+    tmp_path: Path, monkeypatch
+) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+    assert len(transport.calls) == 3  # the ORIGINAL send -- the only broker sends that ever happen.
+
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+    leg3_id = leg_identity(claim.claim_id, 3, total_legs=3)
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        legacy = {
+            row["entry_index"]: json.loads(row["payload_json"])
+            for row in db.execute(
+                "SELECT entry_index, payload_json FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE parent_claim_id=?", (claim.claim_id,),
+            ).fetchall()
+        }
+    # Exactly the real incident's own persisted shape.
+    assert legacy[1]["result_state"] == "FILLED"
+    assert legacy[2]["result_state"] == "MALFORMED"
+    assert legacy[3]["result_state"] == "MALFORMED"
+    assert legacy[2]["order_ticket"] == "73312452"
+    assert legacy[3]["order_ticket"] == "73312453"
+    assert legacy[2]["deal_ticket"] == "0" and legacy[2]["position_ticket"] == "0"
+    assert legacy[2]["filled_price"] == 0.0
+
+    # reconcile_pending_leg refuses these -- they are not PENDING.
+    with pytest.raises(SER8DemoOrderSendError, match="not PENDING"):
+        control.reconcile_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="done", order_ticket="73312452",
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[1].volume, filled_price=0.0,
+            ),
+        )
+
+    # NOW recover, using the same authoritative evidence the real MT5
+    # receipt actually carried.
+    evidence2 = DemoOrderTransportResult(
+        claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+        retcode=10009, retcode_description="done", order_ticket="73312452",
+        deal_ticket="0", position_ticket="0",
+        filled_volume=decision.orders[1].volume, filled_price=0.0,
+    )
+    evidence3 = DemoOrderTransportResult(
+        claim_id=leg3_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+        retcode=10009, retcode_description="done", order_ticket="73312453",
+        deal_ticket="0", position_ticket="0",
+        filled_volume=decision.orders[2].volume, filled_price=0.0,
+    )
+    receipt2 = control.recover_misclassified_pending_leg(leg2_id, evidence=evidence2, now=NOW + timedelta(hours=1))
+    receipt3 = control.recover_misclassified_pending_leg(leg3_id, evidence=evidence3, now=NOW + timedelta(hours=1))
+
+    assert receipt2.result_state == "PENDING"
+    assert receipt3.result_state == "PENDING"
+    assert receipt2.order_ticket == "73312452"  # preserved (requirement 5).
+    assert receipt3.order_ticket == "73312453"
+
+    # ZERO broker sends happened during recovery -- transport.calls is
+    # unchanged from the original send.
+    assert len(transport.calls) == 3
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        final_states = {
+            row["entry_index"]: json.loads(row["payload_json"])["result_state"]
+            for row in db.execute(
+                "SELECT entry_index, payload_json FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE parent_claim_id=?", (claim.claim_id,),
+            ).fetchall()
+        }
+    # Exactly the target end state: FILLED + PENDING + PENDING.
+    assert final_states == {1: "FILLED", 2: "PENDING", 3: "PENDING"}
+
+    # From here on, normal reconcile_pending_leg handles further
+    # transitions (requirement 7) -- proven end-to-end.
+    later_fill = DemoOrderTransportResult(
+        claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+        retcode=10009, retcode_description="Request completed",
+        order_ticket="73312452", deal_ticket="991", position_ticket="992",
+        filled_volume=decision.orders[1].volume, filled_price=1998.0,
+    )
+    reconciled = control.reconcile_pending_leg(leg2_id, evidence=later_fill, now=NOW + timedelta(hours=2))
+    assert reconciled.result_state == "FILLED"
+    assert reconciled.order_ticket == "73312452"
+    assert len(transport.calls) == 3  # still zero new sends.
+
+
+def test_recovery_leaves_the_filled_market_leg_completely_untouched(tmp_path: Path, monkeypatch) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+
+    leg1_id = leg_identity(claim.claim_id, 1, total_legs=3)
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        before = json.loads(
+            db.execute(
+                "SELECT payload_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg1_id,)
+            ).fetchone()["payload_json"]
+        )
+    assert before["result_state"] == "FILLED"
+
+    # recover_misclassified_pending_leg refuses to even look at a FILLED
+    # leg -- it is not MALFORMED.
+    with pytest.raises(SER8DemoOrderSendError, match="not MALFORMED"):
+        control.recover_misclassified_pending_leg(
+            leg1_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg1_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="done", order_ticket="101",
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[0].volume, filled_price=0.0,
+            ),
+        )
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        after = json.loads(
+            db.execute(
+                "SELECT payload_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg1_id,)
+            ).fetchone()["payload_json"]
+        )
+    assert after == before  # byte-for-byte unchanged.
+
+
+def test_market_leg_can_never_be_reclassified_as_pending_via_recovery(tmp_path: Path) -> None:
+    """Even if a MARKET leg's PERSISTED state were somehow MALFORMED, the
+    order_type guard refuses to recover it as PENDING -- there is no such
+    thing as a pending MARKET order (requirement 3)."""
+    context, claim, decision, candidate = _claim_case(tmp_path)
+
+    class _MalformedMarketTransport:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def send(self, request):
+            self.calls.append(request)
+            return DemoOrderTransportResult(
+                claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol="EURUSD",  # mismatch -> MALFORMED.
+                retcode=10009, retcode_description="done", order_ticket="1",
+                deal_ticket="2", position_ticket="3", filled_volume=request.volume, filled_price=2000.0,
+            )
+
+    market_transport = _MalformedMarketTransport()
+    market_control = SER8DemoOrderSendControl(registry=context.registry, transport=market_transport)
+    with pytest.raises(SER8DemoOrderRejectedError, match="MALFORMED"):
+        market_control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    with pytest.raises(SER8DemoOrderSendError, match="MARKET order"):
+        market_control.recover_misclassified_pending_leg(
+            claim.claim_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=claim.claim_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="done", order_ticket="1",
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[0].volume, filled_price=0.0,
+            ),
+        )
+
+
+def test_recovery_is_idempotent_on_repeated_calls(tmp_path: Path, monkeypatch) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+    evidence = DemoOrderTransportResult(
+        claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+        retcode=10009, retcode_description="done", order_ticket="73312452",
+        deal_ticket="0", position_ticket="0",
+        filled_volume=decision.orders[1].volume, filled_price=0.0,
+    )
+    first = control.recover_misclassified_pending_leg(leg2_id, evidence=evidence, now=NOW + timedelta(hours=1))
+    for attempt in range(3):
+        again = control.recover_misclassified_pending_leg(
+            leg2_id, evidence=evidence, now=NOW + timedelta(hours=2 + attempt)
+        )
+        assert again.result_state == "PENDING"
+        assert again.order_ticket == first.order_ticket
+    assert len(transport.calls) == 3  # never grows -- recovery never sends.
+
+
+def test_recovery_idempotent_call_with_inconsistent_evidence_still_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+    control.recover_misclassified_pending_leg(
+        leg2_id,
+        evidence=DemoOrderTransportResult(
+            claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+            retcode=10009, retcode_description="done", order_ticket="73312452",
+            deal_ticket="0", position_ticket="0",
+            filled_volume=decision.orders[1].volume, filled_price=0.0,
+        ),
+    )
+    with pytest.raises(SER8DemoOrderSendError, match="does not match"):
+        control.recover_misclassified_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="done", order_ticket="99999999",  # wrong ticket.
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[1].volume, filled_price=0.0,
+            ),
+        )
+
+
+def test_recovery_rejects_evidence_claim_id_mismatch(tmp_path: Path, monkeypatch) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    with pytest.raises(SER8DemoOrderSendError, match="does not match leg"):
+        control.recover_misclassified_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id="a-completely-different-leg#9", demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="done", order_ticket="73312452",
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[1].volume, filled_price=0.0,
+            ),
+        )
+
+
+def test_recovery_rejects_wrong_order_ticket(tmp_path: Path, monkeypatch) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    with pytest.raises(SER8DemoOrderSendError, match="does not match the"):
+        control.recover_misclassified_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="done", order_ticket="00000000",  # not the real ticket.
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[1].volume, filled_price=0.0,
+            ),
+        )
+
+
+def test_recovery_rejects_ambiguous_evidence_with_deal_ticket_present(tmp_path: Path, monkeypatch) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    with pytest.raises(SER8DemoOrderSendError, match="not PENDING"):
+        control.recover_misclassified_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="done", order_ticket="73312452",
+                deal_ticket="55501", position_ticket="0",  # a deal ticket -- ambiguous, no fill price.
+                filled_volume=decision.orders[1].volume, filled_price=0.0,
+            ),
+        )
+
+
+def test_recovery_rejects_evidence_with_a_real_fill_price(tmp_path: Path, monkeypatch) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    with pytest.raises(SER8DemoOrderSendError, match="not PENDING"):
+        control.recover_misclassified_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="Request completed", order_ticket="73312452",
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[1].volume, filled_price=1998.0,  # a real price -- this is FILLED, not PENDING.
+            ),
+        )
+
+
+def test_recovery_rejects_non_successful_retcode(tmp_path: Path, monkeypatch) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    with pytest.raises(SER8DemoOrderSendError, match="not PENDING"):
+        control.recover_misclassified_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10019, retcode_description="No money", order_ticket="73312452",  # non-DONE retcode.
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[1].volume, filled_price=0.0,
+            ),
+        )
+
+
+def test_recovery_rejects_a_leg_with_no_prior_send_attempt(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderSendError, match="no existing send attempt"):
+        control.recover_misclassified_pending_leg(
+            "never-sent#1",
+            evidence=DemoOrderTransportResult(
+                claim_id="never-sent#1", demo_account_id=LOGIN, symbol="XAUUSD",
+                retcode=10009, retcode_description="done", order_ticket="1",
+                deal_ticket="0", position_ticket="0", filled_volume=0.01, filled_price=0.0,
+            ),
+        )
+
+
+def test_recovery_rejects_a_persisted_request_that_fails_integrity_check(tmp_path: Path, monkeypatch) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    _persist_legacy_malformed_plan(monkeypatch, control, claim, decision, candidate, transport)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    # Simulate a corrupted/tampered persisted record -- test-only, direct
+    # SQL, never something the production recovery code itself does (it
+    # only ever reads via its own SELECT and writes via its own
+    # _finalize()). This proves the integrity re-check is a real,
+    # effective defense, not decorative.
+    with sqlite3.connect(context.db_path) as db:
+        row = db.execute(
+            "SELECT request_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg2_id,)
+        ).fetchone()
+        tampered = json.loads(row[0])
+        tampered["volume"] = tampered["volume"] * 100  # corrupt the payload without touching its stored hash.
+        db.execute(
+            "UPDATE ser8_mt5_demo_order_leg_receipts SET request_json=? WHERE claim_id=?",
+            (json.dumps(tampered), leg2_id),
+        )
+        db.commit()
+
+    with pytest.raises(SER8DemoOrderSendError, match="integrity check"):
+        control.recover_misclassified_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="done", order_ticket="73312452",
+                deal_ticket="0", position_ticket="0",
+                filled_volume=decision.orders[1].volume, filled_price=0.0,
+            ),
+        )
+
+
+def test_recovery_never_calls_the_transport() -> None:
+    import inspect
+
+    import trademind.ser8_mt5_demo_order_send as module
+
+    source = inspect.getsource(module.SER8DemoOrderSendControl.recover_misclassified_pending_leg)
+    assert "self.transport" not in source
+    assert ".send(" not in source
