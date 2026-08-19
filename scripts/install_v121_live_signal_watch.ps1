@@ -29,9 +29,11 @@ $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
 if ($Remove) {
-    & schtasks.exe /Delete /TN $TaskName /F | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to remove scheduled task: $TaskName"
+    try {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    }
+    catch {
+        throw "Failed to remove scheduled task: $TaskName ($($_.Exception.Message))"
     }
     Write-Host "Removed scheduled task: $TaskName" -ForegroundColor Green
     exit 0
@@ -50,7 +52,20 @@ if (-not (Test-Path $watchScript)) {
 }
 
 $powershell = Join-Path $PSHOME "powershell.exe"
-$taskCommand = "`"$powershell`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`" -Login `"$Login`" -ServerUTCOffsetHours $ServerUTCOffsetHours -RuntimeRoot `"$RuntimeRoot`""
+
+# Registered via the native ScheduledTasks module (New-ScheduledTaskAction /
+# New-ScheduledTaskTrigger / New-ScheduledTaskPrincipal / Register-
+# ScheduledTask) instead of schtasks.exe /Create /TR. schtasks.exe's /TR
+# parameter is the ENTIRE command line collapsed into ONE string, and
+# Windows caps it at 261 characters ("Значение параметра "/TR" не может
+# содержать более 261 знаков"). A real repo checkout path plus the full
+# watch-script path plus -Login/-ServerUTCOffsetHours/-RuntimeRoot routinely
+# exceeds that limit, and task creation failed outright. Register-
+# ScheduledTask stores Execute and Argument as SEPARATE Task Scheduler XML
+# fields with no such combined-string cap, so this failure class cannot
+# recur -- with no path shortened, no account/data hardcoded, and no second
+# launcher/wrapper introduced.
+$taskArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`" -Login `"$Login`" -ServerUTCOffsetHours $ServerUTCOffsetHours -RuntimeRoot `"$RuntimeRoot`""
 
 Write-Host "Installing scheduled task: $TaskName" -ForegroundColor Cyan
 Write-Host "Interval: every $IntervalMinutes minute(s)"
@@ -58,21 +73,42 @@ Write-Host "Account: $Login"
 Write-Host "Broker server UTC offset: $ServerUTCOffsetHours"
 Write-Host "Runtime root: $RuntimeRoot"
 
-& schtasks.exe /Create `
-    /TN $TaskName `
-    /TR $taskCommand `
-    /SC MINUTE `
-    /MO $IntervalMinutes `
-    /RL HIGHEST `
-    /F | Out-Host
+# Same working directory the wrapper itself already establishes via its own
+# Split-Path/Set-Location -- set explicitly here too so the task's own
+# starting directory (before the wrapper's own Set-Location runs) is never
+# left to whatever default Task Scheduler would otherwise pick.
+$action = New-ScheduledTaskAction -Execute $powershell -Argument $taskArguments -WorkingDirectory $repo
 
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to create scheduled task: $TaskName"
+# schtasks.exe /SC MINUTE /MO $IntervalMinutes has no single native trigger
+# type in the ScheduledTasks module; the standard equivalent is one "run
+# once" start time combined with an indefinite repetition interval, which
+# reproduces the same "every N minutes, forever" cadence.
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
+    -RepetitionDuration ([TimeSpan]::MaxValue)
+
+# Runs as the installing user at the highest available privileges (the same
+# /RL HIGHEST semantics as before) using S4U logon: runs whether or not the
+# user is interactively logged on, and -- exactly like the original
+# schtasks.exe /Create call, which never passed /RU or /RP -- never
+# collects or stores a password.
+$currentUser = "$env:USERDOMAIN\$env:USERNAME"
+$principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType S4U -RunLevel Highest
+
+try {
+    # -Force safely replaces any existing task of the same name in one
+    # step -- the native equivalent of schtasks.exe /Create ... /F.
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop | Out-Null
+}
+catch {
+    throw "Failed to create scheduled task: $TaskName ($($_.Exception.Message))"
 }
 
-& schtasks.exe /Run /TN $TaskName | Out-Host
-if ($LASTEXITCODE -ne 0) {
-    throw "Scheduled task was installed but could not be started: $TaskName"
+try {
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+}
+catch {
+    throw "Scheduled task was installed but could not be started: $TaskName ($($_.Exception.Message))"
 }
 
 Write-Host "`nInstalled: $TaskName" -ForegroundColor Green

@@ -79,8 +79,12 @@ def _declared_param_names(text: str) -> set[str]:
 
 
 def _params_passed_to_watch_script(install_text: str) -> set[str]:
-    match = re.search(r'\$taskCommand = "(.*)"\s*\n', install_text)
-    assert match, "expected a single-line $taskCommand assignment"
+    # Since SER8 SCHEDULED TASK LONG COMMAND FIX V1, the installer builds
+    # $taskArguments (a New-ScheduledTaskAction -Argument value, registered
+    # via Register-ScheduledTask -- never a single schtasks.exe /TR string,
+    # which is exactly what this task's fix removes).
+    match = re.search(r'\$taskArguments = "(.*)"\s*\n', install_text)
+    assert match, "expected a single-line $taskArguments assignment"
     cmd_literal = match.group(1)
     tail = cmd_literal.split("$watchScript", 1)[1]
     return set(re.findall(r"-([A-Za-z]+)\b", tail))
@@ -92,10 +96,20 @@ def _params_passed_to_watch_script(install_text: str) -> set[str]:
 
 
 def test_exactly_one_scheduled_task_installer_script_exists() -> None:
+    # The repository has many unrelated Scheduled Task installers for other
+    # subsystems (v142 fx_research, v160 unified_center, watchdogs, etc. --
+    # see the TRADEMIND LEGACY RUNTIME PURGE audit); "one installer" means
+    # one installer FOR THE SER8 LIVE-CANDIDATE watch script specifically.
+    # Since SER8 SCHEDULED TASK LONG COMMAND FIX V1, task creation goes
+    # through the native ScheduledTasks module (Register-ScheduledTask), not
+    # schtasks.exe /Create -- see
+    # tests/test_ser8_scheduled_task_long_command_fix.py for the dedicated
+    # proof of that migration.
     creators = [
         path
         for path in (REPO_ROOT / "scripts").glob("*.ps1")
-        if "schtasks.exe /Create" in path.read_text(encoding="utf-8")
+        if "run_v121_live_signal_watch.ps1" in path.read_text(encoding="utf-8")
+        and ("Register-ScheduledTask" in path.read_text(encoding="utf-8") or "schtasks.exe" in path.read_text(encoding="utf-8"))
     ]
     assert creators == [INSTALL_SCRIPT]
 
