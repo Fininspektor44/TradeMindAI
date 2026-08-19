@@ -1417,6 +1417,7 @@ class SER8DemoOrderSendControl:
         *,
         evidence: DemoOrderTransportResult,
         now: datetime | None = None,
+        dry_run: bool = False,
     ) -> DemoOrderExecutionReceiptV1:
         """One-time, explicit recovery path for a leg an OLDER version of
         this module (before this fix -- ``SER8 MT5 PENDING LIMIT RECEIPT +
@@ -1475,6 +1476,12 @@ class SER8DemoOrderSendControl:
         Once recovered to PENDING, the normal :meth:`reconcile_pending_leg`
         is the correct entrypoint for any further PENDING -> FILLED/
         CANCELLED/etc. transition (requirement 7).
+
+        ``dry_run=True`` performs EVERY validation above exactly as a real
+        call would -- and returns the SAME receipt that would be persisted
+        -- but never calls :meth:`_finalize` (the ONLY mutating step in
+        this method), so nothing is written. Used by
+        ``scripts/recover_ser8_pending_limit_legs.py``'s own ``--dry-run``.
         """
         if evidence.claim_id != leg_id:
             raise SER8DemoOrderSendError(
@@ -1543,7 +1550,7 @@ class SER8DemoOrderSendControl:
 
         preserved_order_ticket = current.order_ticket if _has_ticket(current.order_ticket) else evidence.order_ticket
         captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        return self._finalize(
+        finalize_kwargs = dict(
             claim_id=leg_id,
             plan_id=current.plan_id,
             parent_claim_id=current.parent_claim_id,
@@ -1564,6 +1571,56 @@ class SER8DemoOrderSendControl:
             filled_volume=evidence.filled_volume,
             filled_price=evidence.filled_price,
         )
+        if dry_run:
+            # Every validation above already ran unchanged -- only the
+            # actual write is skipped. Constructing this object touches no
+            # I/O at all; only self._finalize (never called here) writes
+            # to SQLite.
+            return DemoOrderExecutionReceiptV1(schema_version=SCHEMA_VERSION, **finalize_kwargs)
+        return self._finalize(**finalize_kwargs)
+
+    def list_leg_ids_for_claim(self, parent_claim_id: str) -> tuple[str, ...]:
+        """Every leg identity persisted under this EXACT claim root
+        (``parent_claim_id`` -- never a prefix/LIKE match), in
+        ``entry_index`` order. Read-only; never touches the transport.
+        Gives inspection/recovery tooling (e.g.
+        ``scripts/recover_ser8_pending_limit_legs.py``) a stable, public
+        way to discover which legs exist for a claim without needing to
+        know this module's own internal table schema."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT claim_id FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE parent_claim_id=? ORDER BY entry_index",
+                (parent_claim_id,),
+            ).fetchall()
+        return tuple(row["claim_id"] for row in rows)
+
+    def get_leg_receipt(self, leg_id: str) -> DemoOrderExecutionReceiptV1 | None:
+        """Public, read-only accessor for a leg's current persisted
+        receipt (``None`` if this leg identity has never been attempted).
+        Reuses the exact same lookup/self-heal logic :meth:`send` itself
+        uses internally; never touches the transport."""
+        return self._existing_leg_receipt(leg_id)
+
+    def get_leg_request(self, leg_id: str) -> DemoOrderRequestV1 | None:
+        """Public, read-only accessor for a leg's original persisted
+        request (``None`` if this leg identity has never been attempted),
+        with its own integrity re-verified (recomputed ``request_hash``
+        compared against what was stored) before being returned -- never
+        trusted at face value."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT request_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        request_payload = json.loads(row["request_json"])
+        request = _request_from_payload(request_payload)
+        if request.request_hash != request_payload.get("request_hash"):
+            raise SER8DemoOrderSendError(
+                f"persisted request payload for leg {leg_id} failed its own integrity check"
+            )
+        return request
 
     def send(
         self,
