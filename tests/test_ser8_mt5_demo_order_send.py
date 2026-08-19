@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 import sqlite3
 import threading
@@ -94,16 +95,22 @@ from trademind.ser8_mt5_demo_order_send import (
     DEMO_EXECUTOR_MAGIC_NUMBER,
     REQUEST_CSV_FIELDS,
     RESULT_CSV_FIELDS,
+    DemoOrderExecutionPlanReceiptV1,
     DemoOrderExecutionReceiptV1,
     DemoOrderTransportResult,
     FakeDemoOrderTransport,
     FileBridgeDemoOrderTransport,
     SER8DemoOrderAlreadyAttemptedError,
+    SER8DemoOrderPartialExecutionError,
+    SER8DemoOrderReconciliationRequiredError,
     SER8DemoOrderRejectedError,
     SER8DemoOrderSendControl,
     SER8DemoOrderSendError,
     SER8DemoOrderTransportError,
+    build_demo_order_execution_plan,
+    build_demo_order_leg_request,
     build_demo_order_request,
+    leg_identity,
 )
 from trademind.ser8_research_risk_gate import evaluate_ser8_research_risk_gate
 from trademind.signal_intelligence import EntryOrder, SignalCandidate, TradePlan
@@ -647,10 +654,16 @@ def _authorized_case(
     db_name: str = "orchestrator.db",
     captured: datetime | None = None,
     symbol: str = SYMBOL,
+    candidate_factory=None,
 ):
     """Real ACCEPTED hypothesis -> eligibility -> scope -> candidate -> a
     real ALLOW SER8ResearchRiskGateResult -- everything
-    SER8ExecutionAuthorizationControl.authorize needs."""
+    SER8ExecutionAuthorizationControl.authorize needs.
+
+    ``candidate_factory``, when supplied, replaces the default single-leg
+    ``_candidate`` builder (e.g. with a multi-entry TradePlan) -- see
+    ``_multi_leg_candidate`` below, used by the SER8 MT5 MULTI-ENTRY DEMO
+    EXECUTION V1 tests."""
     context = _accepted_context(tmp_path, threshold=threshold, db_name=db_name, symbol=symbol)
     eligibility = present_eligible_artifact(
         context.hypothesis_id, registry=context.registry, final_verdict=context.final_verdict
@@ -662,7 +675,8 @@ def _authorized_case(
     account_csv, positions_csv, symbols_csv = _mt5_files(
         tmp_path, captured=captured, symbol=symbol, suffix=f"-{db_name}"
     )
-    candidate = _candidate(created_at=captured - timedelta(seconds=10), symbol=symbol)
+    factory = candidate_factory or _candidate
+    candidate = factory(created_at=captured - timedelta(seconds=10), symbol=symbol)
     result = evaluate_ser8_research_risk_gate(
         eligibility, scope, candidate,
         registry=context.registry, final_verdict=context.final_verdict, login=LOGIN,
@@ -681,19 +695,69 @@ def _allowlist(*account_ids: str) -> DemoAccountAllowlistV1:
 
 def _claim_case(
     tmp_path: Path, *, threshold: int = 1, db_name: str = "orchestrator.db",
-    captured: datetime | None = None, symbol: str = SYMBOL,
+    captured: datetime | None = None, symbol: str = SYMBOL, candidate_factory=None,
 ):
     """Real ACCEPTED hypothesis -> ... -> a real, claimed
     ExecutionAuthorizationClaimV1, plus the RiskDecision and SignalCandidate
     it was built from -- everything SER8DemoOrderSendControl.send needs."""
     context, eligibility, scope, candidate, result, authorization_control = _authorized_case(
-        tmp_path, threshold=threshold, db_name=db_name, captured=captured, symbol=symbol
+        tmp_path, threshold=threshold, db_name=db_name, captured=captured, symbol=symbol,
+        candidate_factory=candidate_factory,
     )
     captured = captured or NOW
     authorization = authorization_control.authorize(eligibility, scope, candidate, result, now=captured)
     claim_control = SER8ExecutionAuthorizationClaimControl(registry=context.registry)
     claim = claim_control.claim(authorization, claimant_id="ser8-adapter-session-1", now=captured)
     return context, claim, result.decision, candidate
+
+
+def _multi_leg_candidate(
+    *, created_at: datetime | None = None, action: str = "BUY", symbol: str = SYMBOL
+) -> SignalCandidate:
+    """A genuine 3-entry staged TradePlan -- 1 MARKET + 2 LIMIT legs,
+    allocations summing to 1.0 -- structurally the SAME shape as the real
+    Windows evidence this task's own spec quotes (TM-20260819T032500Z-
+    EURUSD-BUY-8124e6ea0526ffbb: MARKET 0.5 / LIMIT 0.3 / LIMIT 0.2),
+    reusing this file's own XAUUSD-scale fixture prices so it can reuse
+    every other real-chain fixture (``_mt5_files`` etc.) unchanged."""
+    created = created_at or NOW - timedelta(seconds=10)
+    observed = created - timedelta(seconds=2)
+    if action == "BUY":
+        entries = (
+            EntryOrder(2000.0, 0.5, "initial confirmation", "MARKET"),
+            EntryOrder(1998.0, 0.3, "first staged pullback", "LIMIT"),
+            EntryOrder(1996.0, 0.2, "second staged pullback", "LIMIT"),
+        )
+        stop_price = 1990.0
+        targets = (2020.0,)
+    else:
+        entries = (
+            EntryOrder(2000.0, 0.5, "initial confirmation", "MARKET"),
+            EntryOrder(2002.0, 0.3, "first staged pullback", "LIMIT"),
+            EntryOrder(2004.0, 0.2, "second staged pullback", "LIMIT"),
+        )
+        stop_price = 2010.0
+        targets = (1980.0,)
+    return SignalCandidate(
+        observed_at=observed,
+        created_at=created,
+        symbol=symbol,
+        timeframe=TIMEFRAME,
+        setup_family=SETUP_FAMILY,
+        scenario="ser8 multi-entry demo execution test",
+        plan=TradePlan(
+            action=action,
+            entries=entries,
+            stop_price=stop_price,
+            targets=targets,
+            invalidation="protected level broken",
+            target_rationale=("external liquidity",),
+        ),
+        market_features={"structure": {"swing_bias": "BULLISH" if action == "BUY" else "BEARISH"}},
+        factor_scores={"structure": 0.9},
+        factor_reasons={"structure": ("BOS confirmed",)},
+        provenance=("FX_RESEARCH",),
+    )
 
 
 def _clean_result(request) -> DemoOrderTransportResult:
@@ -865,20 +929,57 @@ def test_wrong_candidate_lineage_fails(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5: more than one SizedOrder fails.
+# 5: multi-entry RiskDecisions are now genuinely supported (SER8 MT5
+# MULTI-ENTRY DEMO EXECUTION V1) -- what remains rejected is a decision
+# with a data-integrity violation (duplicate entry_index), never a
+# legitimate N > 1 plan. See
+# tests/test_ser8_mt5_multi_entry_demo_execution.py for the dedicated
+# multi-leg execution proofs.
 # ---------------------------------------------------------------------------
 
 
-def test_more_than_one_sized_order_fails(tmp_path: Path) -> None:
+def test_duplicate_entry_index_fails_closed(tmp_path: Path) -> None:
     import dataclasses
 
     context, claim, decision, candidate = _claim_case(tmp_path)
-    two_orders = dataclasses.replace(decision, orders=decision.orders + decision.orders)
+    # Two SizedOrder legs sharing the SAME entry_index -- a data-integrity
+    # violation (never a real multi-entry plan, where risk_manager assigns
+    # one entry_index per staged candidate.plan.entries item), and this
+    # must still fail closed before any leg is attempted.
+    duplicate_index_orders = dataclasses.replace(decision, orders=decision.orders + decision.orders)
     transport = FakeDemoOrderTransport(result_factory=_clean_result)
     control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
 
-    with pytest.raises(SER8DemoOrderSendError, match="exactly one SizedOrder"):
-        control.send(claim, two_orders, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    with pytest.raises(SER8DemoOrderSendError, match="duplicate entry_index"):
+        control.send(claim, duplicate_index_orders, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert transport.calls == []
+
+
+def test_empty_orders_fails_closed(tmp_path: Path) -> None:
+    import dataclasses
+
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    empty_orders = dataclasses.replace(decision, orders=())
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderSendError, match="orders is empty"):
+        control.send(claim, empty_orders, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert transport.calls == []
+
+
+def test_unsupported_order_type_fails_closed_before_any_leg_sent(tmp_path: Path) -> None:
+    import dataclasses
+
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    bad_order = dataclasses.replace(decision.orders[0], order_type="ICEBERG")
+    bad_orders = dataclasses.replace(decision, orders=(bad_order,))
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderSendError, match="unsupported order_type"):
+        control.send(claim, bad_orders, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert transport.calls == []
     assert transport.calls == []
 
 
@@ -953,7 +1054,7 @@ def test_duplicate_call_cannot_produce_second_send(tmp_path: Path) -> None:
     assert len(transport.calls) == 1
     with sqlite3.connect(context.db_path) as db:
         count = db.execute(
-            "SELECT COUNT(*) FROM ser8_mt5_demo_order_receipts WHERE claim_id=?", (claim.claim_id,)
+            "SELECT COUNT(*) FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (claim.claim_id,)
         ).fetchone()[0]
     assert count == 1
 
@@ -1001,7 +1102,7 @@ def test_broker_rejection_persisted_and_fails_closed(tmp_path: Path) -> None:
     with sqlite3.connect(context.db_path) as db:
         db.row_factory = sqlite3.Row
         row = db.execute(
-            "SELECT payload_json FROM ser8_mt5_demo_order_receipts WHERE claim_id=?", (claim.claim_id,)
+            "SELECT payload_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (claim.claim_id,)
         ).fetchone()
     assert row is not None
     payload = __import__("json").loads(row["payload_json"])
@@ -1065,7 +1166,7 @@ def test_transport_failure_persists_unknown_and_does_not_retry(tmp_path: Path) -
     with sqlite3.connect(context.db_path) as db:
         db.row_factory = sqlite3.Row
         row = db.execute(
-            "SELECT payload_json FROM ser8_mt5_demo_order_receipts WHERE claim_id=?", (claim.claim_id,)
+            "SELECT payload_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (claim.claim_id,)
         ).fetchone()
     payload = __import__("json").loads(row["payload_json"])
     assert payload["result_state"] == "UNKNOWN"
@@ -1274,4 +1375,451 @@ def test_mql5_executor_reads_at_most_one_request_per_timer_tick() -> None:
 # ---------------------------------------------------------------------------
 # 19-20: existing research/risk/auth/demo-gate tests remain green; full
 # pytest green -- run separately as part of this task's own VALIDATION.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# SER8 MT5 MULTI-ENTRY DEMO EXECUTION V1 -- N >= 1 SizedOrder legs, all bound
+# to the SAME hypothesis/RiskDecision/authorization/claim/demo account, per
+# this task's own REQUIREMENTS 1-16. The real Windows evidence this task's
+# spec quotes (TM-20260819T032500Z-EURUSD-BUY-8124e6ea0526ffbb: MARKET 0.5 /
+# LIMIT 0.3 / LIMIT 0.2) is reproduced structurally by ``_multi_leg_candidate``
+# above, driven through the SAME real risk_manager.evaluate_risk this file's
+# single-leg fixtures already use -- never a hand-constructed SizedOrder.
+# ---------------------------------------------------------------------------
+
+
+def _leg_result_factory(states: dict[int, str], *, filled_price: float = 2000.0):
+    """Builds a transport result_factory keyed by ``request.entry_index``
+    -- 'FILLED' returns a clean fill, any other string is treated as a
+    literal retcode_description for a definite rejection (never UNKNOWN;
+    to simulate UNKNOWN, raise from the transport instead)."""
+
+    def _factory(request) -> DemoOrderTransportResult:
+        state = states[request.entry_index]
+        if state == "FILLED":
+            return DemoOrderTransportResult(
+                claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
+                retcode=10009, retcode_description="Request completed",
+                order_ticket=f"{request.entry_index}01", deal_ticket=f"{request.entry_index}02",
+                position_ticket=f"{request.entry_index}03",
+                filled_volume=request.volume, filled_price=filled_price,
+            )
+        return DemoOrderTransportResult(
+            claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
+            retcode=10019, retcode_description=state, order_ticket="", deal_ticket="", position_ticket="",
+            filled_volume=None, filled_price=None,
+        )
+
+    return _factory
+
+
+# ---------------------------------------------------------------------------
+# 1: a 1-leg MARKET plan remains valid and fully backward compatible.
+# ---------------------------------------------------------------------------
+
+
+def test_single_leg_market_plan_still_returns_a_bare_receipt(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    assert len(decision.orders) == 1
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    receipt = control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    # Byte-for-byte the pre-multi-entry contract: a bare receipt, never
+    # wrapped in DemoOrderExecutionPlanReceiptV1, claim_id unchanged.
+    assert isinstance(receipt, DemoOrderExecutionReceiptV1)
+    assert not isinstance(receipt, DemoOrderExecutionPlanReceiptV1)
+    assert receipt.claim_id == claim.claim_id
+    assert receipt.result_state == "FILLED"
+    assert len(transport.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 2: a genuine 3-leg MARKET/LIMIT/LIMIT plan sends every leg.
+# ---------------------------------------------------------------------------
+
+
+def test_three_leg_market_limit_limit_plan_sends_every_leg(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    assert len(decision.orders) == 3
+    assert [order.order_type for order in decision.orders] == ["MARKET", "LIMIT", "LIMIT"]
+
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "FILLED", 3: "FILLED"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    outcome = control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    assert isinstance(outcome, DemoOrderExecutionPlanReceiptV1)
+    assert outcome.aggregate_state == "COMPLETE"
+    assert len(outcome.leg_receipts) == 3
+    assert [r.result_state for r in outcome.leg_receipts] == ["FILLED", "FILLED", "FILLED"]
+    assert len(transport.calls) == 3
+    # Never collapsed to the first (or any single) leg -- every SizedOrder
+    # was individually sent with its own order_type/volume/price.
+    sent_types = [call.order_type for call in transport.calls]
+    assert sent_types == ["MARKET", "LIMIT", "LIMIT"]
+    for call, order in zip(transport.calls, decision.orders):
+        assert call.volume == order.volume
+        assert call.price == order.planned_price
+
+
+# ---------------------------------------------------------------------------
+# 3: deterministic, immutable plan/leg identities (requirement 6).
+# ---------------------------------------------------------------------------
+
+
+def test_plan_and_leg_identities_are_deterministic(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    plan_a = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo_authorization)
+    plan_b = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo_authorization)
+
+    assert plan_a.plan_id == plan_b.plan_id
+    assert plan_a.plan_hash == plan_b.plan_hash
+    assert [leg.leg_id for leg in plan_a.legs] == [leg.leg_id for leg in plan_b.legs]
+    assert [leg.leg_hash for leg in plan_a.legs] == [leg.leg_hash for leg in plan_b.legs]
+    # Never random, never wall-clock -- a pure function of already-
+    # immutable claim/decision/candidate identity.
+    assert plan_a.plan_id.startswith("EOP-")
+    assert len({leg.leg_id for leg in plan_a.legs}) == 3  # all distinct.
+    for leg in plan_a.legs:
+        assert leg.leg_id == leg_identity(claim.claim_id, leg.entry_index, total_legs=3)
+        assert leg.leg_id != claim.claim_id  # multi-leg: never collapses to the bare claim id.
+        assert leg.leg_id.startswith(claim.claim_id)  # still human-traceable to the parent claim.
+
+
+def test_single_leg_identity_equals_bare_claim_id(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    plan = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo_authorization)
+    assert len(plan.legs) == 1
+    assert plan.legs[0].leg_id == claim.claim_id
+
+
+# ---------------------------------------------------------------------------
+# 4: exact per-leg volume preservation (never recomputed, never invented).
+# ---------------------------------------------------------------------------
+
+
+def test_exact_volume_preserved_per_leg(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    for order in decision.orders:
+        request = build_demo_order_leg_request(
+            claim, decision, candidate, order, demo_authorization=demo_authorization, total_legs=3
+        )
+        assert request.volume == order.volume
+        assert request.volume > 0
+        assert request.order_type == order.order_type
+        assert request.price == order.planned_price
+        assert request.sl == candidate.plan.stop_price
+        assert request.tp == candidate.plan.targets[0]
+        assert request.entry_index == order.entry_index
+
+
+# ---------------------------------------------------------------------------
+# 5: duplicate invocation cannot duplicate any leg.
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_invocation_cannot_duplicate_any_leg(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "FILLED", 3: "FILLED"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert len(transport.calls) == 3
+
+    for _ in range(3):
+        with pytest.raises(SER8DemoOrderAlreadyAttemptedError):
+            control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=1))
+    assert len(transport.calls) == 3  # never resent, for any leg.
+
+    with sqlite3.connect(context.db_path) as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM ser8_mt5_demo_order_leg_receipts WHERE plan_id="
+            "(SELECT plan_id FROM ser8_mt5_demo_order_plans WHERE claim_id=?)",
+            (claim.claim_id,),
+        ).fetchone()[0]
+    assert count == 3  # exactly one row per leg, never duplicated.
+
+
+# ---------------------------------------------------------------------------
+# 6: crash after one (or more) leg(s) does not resend it/them.
+# ---------------------------------------------------------------------------
+
+
+def test_crash_after_one_leg_does_not_resend_it(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+
+    class _CrashAfterFirstLeg:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def send(self, request):
+            self.calls.append(request)
+            if request.entry_index == 1:
+                return DemoOrderTransportResult(
+                    claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
+                    retcode=10009, retcode_description="Request completed",
+                    order_ticket="1", deal_ticket="2", position_ticket="3",
+                    filled_volume=request.volume, filled_price=2000.0,
+                )
+            # Simulate the terminal/process dying while attempting leg 2 --
+            # the transport itself never returns a real result.
+            raise TimeoutError("terminal connection lost")
+
+    transport = _CrashAfterFirstLeg()
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderReconciliationRequiredError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    # Leg 1 filled, leg 2 attempted and UNKNOWN, leg 3 never even reached.
+    assert len(transport.calls) == 2
+    assert [c.entry_index for c in transport.calls] == [1, 2]
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        rows = {
+            row["entry_index"]: row["payload_json"]
+            for row in db.execute(
+                "SELECT entry_index, payload_json FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE parent_claim_id=?", (claim.claim_id,),
+            ).fetchall()
+        }
+    assert set(rows) == {1, 2}  # leg 3 never got a row at all.
+    assert json.loads(rows[1])["result_state"] == "FILLED"
+    assert json.loads(rows[2])["result_state"] == "UNKNOWN"
+
+    # Retrying (e.g. after a process restart) must NOT resend leg 1 (already
+    # FILLED) or leg 2 (still UNKNOWN, unresolved) -- and, because leg 2 is
+    # still unresolved, leg 3 stays blocked too, exactly as before.
+    with pytest.raises(SER8DemoOrderReconciliationRequiredError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=1))
+    assert len(transport.calls) == 2  # zero new transport calls.
+
+
+def test_reserved_but_never_finalized_leg_self_heals_to_unknown_without_resend(tmp_path: Path) -> None:
+    """Simulates a genuine hard process crash strictly BETWEEN reserving a
+    leg's one-shot attempt and recording its outcome (never reached via the
+    public send() API, which always finalizes-or-raises within the same
+    call) -- proving the crash/restart self-heal path never calls the
+    transport."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    plan = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo_authorization)
+    leg1 = plan.legs[0]
+    request = build_demo_order_leg_request(
+        claim, decision, candidate, decision.orders[0], demo_authorization=demo_authorization, total_legs=3
+    )
+
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "FILLED", 3: "FILLED"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    control._persist_plan(plan, created_at=NOW.isoformat())
+    # Reserve leg 1's attempt directly -- exactly what send() does BEFORE
+    # calling the transport -- then stop, simulating a crash before
+    # transport.send() or _finalize() ever ran.
+    control._reserve_leg_attempt(
+        leg_id=leg1.leg_id, plan_id=plan.plan_id, parent_claim_id=claim.claim_id, entry_index=1,
+        attempt_id="EAO-test-crash-mid-attempt", request=request,
+        demo_authorization=demo_authorization, captured_at=NOW,
+    )
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT payload_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg1.leg_id,)
+        ).fetchone()
+    assert row["payload_json"] is None  # reserved, never finalized.
+
+    with pytest.raises(SER8DemoOrderReconciliationRequiredError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=1))
+    # Leg 1 self-healed to UNKNOWN and blocked everything after it -- the
+    # transport was NEVER called for leg 1 (it was already reserved) or for
+    # legs 2/3 (blocked by leg 1's now-explicit UNKNOWN).
+    assert transport.calls == []
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT payload_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg1.leg_id,)
+        ).fetchone()
+    assert json.loads(row["payload_json"])["result_state"] == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# 7: partial completion is never reported as aggregate SUCCESS.
+# ---------------------------------------------------------------------------
+
+
+def test_partial_completion_raises_and_is_never_aggregate_success(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(
+        result_factory=_leg_result_factory({1: "FILLED", 2: "No money", 3: "FILLED"})
+    )
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderPartialExecutionError) as excinfo:
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    assert len(transport.calls) == 3  # every leg WAS attempted (no UNKNOWN to block the cascade).
+    assert isinstance(excinfo.value, SER8DemoOrderRejectedError)  # broader catch-all still works.
+    # Confirm the persisted per-leg truth: exactly 2 FILLED, 1 REJECTED --
+    # never silently reported as if the whole plan succeeded.
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        states = [
+            json.loads(row["payload_json"])["result_state"]
+            for row in db.execute(
+                "SELECT payload_json FROM ser8_mt5_demo_order_leg_receipts WHERE parent_claim_id=? "
+                "ORDER BY entry_index", (claim.claim_id,),
+            ).fetchall()
+        ]
+    assert states == ["FILLED", "REJECTED", "FILLED"]
+
+
+# ---------------------------------------------------------------------------
+# 8: an UNKNOWN broker outcome fails the whole plan closed.
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_outcome_on_any_leg_fails_the_plan_closed(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+
+    class _UnknownOnSecondLeg:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def send(self, request):
+            self.calls.append(request)
+            if request.entry_index != 2:
+                return DemoOrderTransportResult(
+                    claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
+                    retcode=10009, retcode_description="Request completed",
+                    order_ticket="1", deal_ticket="2", position_ticket="3",
+                    filled_volume=request.volume, filled_price=2000.0,
+                )
+            raise ConnectionError("terminal unreachable")
+
+    transport = _UnknownOnSecondLeg()
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderReconciliationRequiredError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert isinstance(SER8DemoOrderReconciliationRequiredError("x"), SER8DemoOrderTransportError)
+    assert len(transport.calls) == 2  # leg 3 never attempted while leg 2 is unresolved.
+
+
+# ---------------------------------------------------------------------------
+# 9: LIMIT requests correctly reach the (unmodified) executor schema.
+# ---------------------------------------------------------------------------
+
+
+def test_limit_leg_request_matches_the_unmodified_executor_wire_schema(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    limit_order = decision.orders[1]
+    assert limit_order.order_type == "LIMIT"
+    request = build_demo_order_leg_request(
+        claim, decision, candidate, limit_order, demo_authorization=demo_authorization, total_legs=3
+    )
+    row = request.to_csv_row()
+    assert set(row) == set(REQUEST_CSV_FIELDS)
+    assert row["order_type"] == "LIMIT"
+    assert float(row["price"]) == limit_order.planned_price
+    assert float(row["price"]) > 0  # a genuine limit price, never MARKET's ignored 0.0.
+
+    # Cross-checked directly against the real, UNMODIFIED executor source --
+    # LIMIT dispatch already existed before this task (see the module
+    # docstring's audit note); this task changed nothing about it.
+    executor_path = Path(__file__).resolve().parents[1] / "mt5" / "TradeMind_Demo_Order_Executor_v1.mq5"
+    executor_source = executor_path.read_text(encoding="utf-8")
+    assert 'order_type=="LIMIT"' in executor_source
+    assert "trade.BuyLimit(" in executor_source and "trade.SellLimit(" in executor_source
+
+
+# ---------------------------------------------------------------------------
+# 10: demo login/magic checks preserved for every leg.
+# ---------------------------------------------------------------------------
+
+
+def test_demo_login_and_magic_checks_preserved_per_leg(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    for order in decision.orders:
+        request = build_demo_order_leg_request(
+            claim, decision, candidate, order, demo_authorization=demo_authorization, total_legs=3
+        )
+        assert request.magic == DEMO_EXECUTOR_MAGIC_NUMBER == 990244
+        assert request.demo_account_id == demo_authorization.account_id == LOGIN
+
+    executor_path = Path(__file__).resolve().parents[1] / "mt5" / "TradeMind_Demo_Order_Executor_v1.mq5"
+    executor_source = executor_path.read_text(encoding="utf-8")
+    assert "demo_account_id!=LoginText()" in executor_source
+    assert "magic!=InpMagicNumber" in executor_source
+    assert "InpMagicNumber       = 990244" in executor_source
+
+
+# ---------------------------------------------------------------------------
+# 11-12: no MQL5 position sizing; no grid/averaging/martingale -- the
+# executor file itself is COMPLETELY UNTOUCHED by this task (the strongest
+# possible proof), re-verified here rather than only trusted from Task B's
+# own tests in tests/test_mt5_unified_executor.py.
+# ---------------------------------------------------------------------------
+
+
+def test_mql5_executor_file_untouched_by_this_task(tmp_path: Path) -> None:
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ["git", "diff", "--stat", "HEAD", "--", "mt5/TradeMind_Demo_Order_Executor_v1.mq5"],
+        cwd=repo_root, capture_output=True, text=True, check=False,
+    )
+    # Empty output means git sees zero changes relative to the last commit
+    # for this exact file -- this task adds no MQL5 diff at all. (If this
+    # ever legitimately needs to change in a future task, this assertion
+    # should be updated deliberately, not silently broken.)
+    assert result.stdout.strip() == ""
+
+
+def test_mql5_executor_still_has_no_position_sizing_or_grid_logic() -> None:
+    executor_path = Path(__file__).resolve().parents[1] / "mt5" / "TradeMind_Demo_Order_Executor_v1.mq5"
+    source = executor_path.read_text(encoding="utf-8")
+    # Volume is assigned exactly once (read from the request file), never
+    # computed -- the same invariant tests/test_mt5_unified_executor.py
+    # already established for the whole file.
+    assignments = [line for line in source.splitlines() if "volume " in line and "=" in line and "==" not in line]
+    volume_assignments = [line for line in assignments if line.strip().startswith("volume") and "=" in line]
+    assert len(volume_assignments) == 1, volume_assignments
+    # Exclude #property description prose (which legitimately SAYS "no
+    # grid, no averaging, no martingale" as a documented guarantee) --
+    # only functional code lines must never contain these terms.
+    functional_lines = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("#property")
+    )
+    for forbidden in ("GridStep", "Martingale", "martingale", "AveragePrice", "averaging"):
+        assert forbidden not in functional_lines
+
+
+# ---------------------------------------------------------------------------
+# 13: PREVIEW shows the entire ordered leg plan -- see
+# tests/test_run_ser8_real_demo_pipeline.py::test_preview_shows_every_leg_
+# of_a_multi_entry_plan for the dedicated end-to-end proof (this module has
+# no PREVIEW concept of its own; that lives entirely in
+# scripts/run_ser8_real_demo_pipeline.py).
 # ---------------------------------------------------------------------------

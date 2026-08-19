@@ -181,10 +181,12 @@ from trademind.ser8_execution_authorization_claim import (  # noqa: E402
     SER8ExecutionAuthorizationClaimError,
 )
 from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
+    DemoOrderExecutionPlanReceiptV1,
     DemoOrderTransport,
     FileBridgeDemoOrderTransport,
     SER8DemoOrderSendControl,
     SER8DemoOrderSendError,
+    build_demo_order_execution_plan,
 )
 from trademind.ser8_research_risk_gate import (  # noqa: E402
     SER8ResearchRiskGateError,
@@ -575,20 +577,30 @@ def advance_research_state(
 
 
 @dataclass(frozen=True, slots=True)
+class LegPreview:
+    """One ordered leg of the full execution plan -- requirement 13:
+    PREVIEW must display the entire ordered leg plan, never a single,
+    possibly-misleading volume/price collapsed from the first leg only."""
+
+    entry_index: int
+    order_type: str
+    volume: float
+    price: float
+    stop_price: float
+    target_price: float
+
+
+@dataclass(frozen=True, slots=True)
 class Preview:
     hypothesis_id: str
     candidate_signal_id: str
     symbol: str
     action: str
-    volume: float
-    stop_price: float
-    target_price: float
     risk_decision_state: str
     authorization_id: str
     claim_id: str
     demo_account_id: str
-    order_type: str
-    price: float
+    legs: tuple[LegPreview, ...]
 
 
 def _account_snapshot_age_seconds(account_csv: Path, *, now: datetime | None = None) -> float | None:
@@ -653,14 +665,21 @@ def _print_preview(preview: Preview) -> None:
     print(f"  hypothesis_id        = {preview.hypothesis_id}")
     print(f"  candidate signal_id  = {preview.candidate_signal_id}")
     print(f"  symbol / action      = {preview.symbol} / {preview.action}")
-    print(f"  volume               = {preview.volume}")
-    print(f"  SL / TP              = {preview.stop_price} / {preview.target_price}")
     print(f"  RiskDecision.state   = {preview.risk_decision_state}")
     print(f"  authorization_id     = {preview.authorization_id}")
     print(f"  claim_id             = {preview.claim_id}")
     print(f"  demo account         = {preview.demo_account_id}")
-    print(f"  MT5 request preview  = {preview.order_type} {preview.action} {preview.volume} {preview.symbol}"
-          f" @ {preview.price if preview.order_type != 'MARKET' else 'MARKET'}")
+    # The COMPLETE ordered leg plan -- never collapsed to a single volume
+    # or the first leg only (requirement 13). One line per SizedOrder leg,
+    # in entry_index order, exactly matching what SER8DemoOrderSendControl
+    # will actually send.
+    print(f"  legs ({len(preview.legs)}):")
+    for leg in preview.legs:
+        price_text = "MARKET" if leg.order_type == "MARKET" else f"{leg.price}"
+        print(
+            f"    [{leg.entry_index}] {leg.order_type:<6} {preview.action} {leg.volume} {preview.symbol}"
+            f" @ {price_text}  SL={leg.stop_price} TP={leg.target_price}"
+        )
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
@@ -775,21 +794,33 @@ def run_pipeline(args: argparse.Namespace) -> int:
         allowlist = DemoAccountAllowlistV1(account_ids=tuple(args.demo_account_allowlist))
         demo_authorization = verify_demo_account_authorization(claim, allowlist=allowlist)
 
-        order = result.decision.orders[0]
+        # The COMPLETE ordered execution plan (one or more legs) -- the
+        # SAME pure, deterministic builder SER8DemoOrderSendControl.send
+        # itself uses, so the preview can never drift from what would
+        # actually be sent (requirement 13).
+        plan = build_demo_order_execution_plan(
+            claim, result.decision, candidate, demo_authorization=demo_authorization
+        )
         preview = Preview(
             hypothesis_id=args.hypothesis_id,
             candidate_signal_id=candidate.signal_id,
             symbol=candidate.symbol,
             action=candidate.plan.action,
-            volume=order.volume,
-            stop_price=candidate.plan.stop_price,
-            target_price=candidate.plan.targets[0],
             risk_decision_state=result.decision.state,
             authorization_id=authorization.authorization_id,
             claim_id=claim.claim_id,
             demo_account_id=demo_authorization.account_id,
-            order_type=order.order_type,
-            price=order.planned_price,
+            legs=tuple(
+                LegPreview(
+                    entry_index=leg.entry_index,
+                    order_type=leg.order_type,
+                    volume=leg.volume,
+                    price=leg.planned_price,
+                    stop_price=leg.sl,
+                    target_price=leg.tp,
+                )
+                for leg in plan.legs
+            ),
         )
         _print_preview(preview)
 
@@ -816,12 +847,24 @@ def run_pipeline(args: argparse.Namespace) -> int:
             timeout_seconds=args.transport_timeout_seconds,
         )
         send_control = SER8DemoOrderSendControl(registry=pipeline.registry, transport=transport)
-        receipt = send_control.send(claim, result.decision, candidate, allowlist=allowlist)
+        outcome = send_control.send(claim, result.decision, candidate, allowlist=allowlist)
         print("SER8 REAL DEMO PIPELINE -- ORDER SENT")
-        print(f"  result_state = {receipt.result_state}")
-        print(f"  order_ticket = {receipt.order_ticket}")
-        print(f"  deal_ticket  = {receipt.deal_ticket}")
-        print(f"  filled       = {receipt.filled_volume} @ {receipt.filled_price}")
+        if isinstance(outcome, DemoOrderExecutionPlanReceiptV1):
+            # Multi-leg plan -- report the aggregate state plus every
+            # leg's own individually-persisted outcome (requirement 10:
+            # never report aggregate SUCCESS unless every leg filled).
+            print(f"  aggregate_state = {outcome.aggregate_state}")
+            for leg in outcome.leg_receipts:
+                print(
+                    f"  [{leg.entry_index}] result_state={leg.result_state} "
+                    f"order_ticket={leg.order_ticket} deal_ticket={leg.deal_ticket} "
+                    f"filled={leg.filled_volume} @ {leg.filled_price}"
+                )
+        else:
+            print(f"  result_state = {outcome.result_state}")
+            print(f"  order_ticket = {outcome.order_ticket}")
+            print(f"  deal_ticket  = {outcome.deal_ticket}")
+            print(f"  filled       = {outcome.filled_volume} @ {outcome.filled_price}")
         return 0
     except PipelineGapError as exc:
         print(str(exc), file=sys.stderr)

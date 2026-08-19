@@ -371,6 +371,48 @@ def _write_candidate_journal(
     return journal_path
 
 
+def _write_multi_leg_candidate_journal(
+    data_root: Path, *, signal_id: str = "sig-multi-1", runtime_root: Path | None = None
+) -> Path:
+    """A genuine 3-entry staged candidate journal (1 MARKET + 2 LIMIT legs,
+    allocations 0.5/0.3/0.2) -- structurally the same shape as the real
+    Windows evidence SER8 MT5 MULTI-ENTRY DEMO EXECUTION V1's own spec
+    quotes, for the PREVIEW-shows-every-leg proof below."""
+    candidates_dir = (runtime_root or (data_root / "live_signal_runtime_v1"))
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "signal_id": signal_id,
+        "observed_at": now,
+        "created_at": now,
+        "symbol": _SYMBOL,
+        "timeframe": "M5",
+        "setup_family": "spread_pressure",
+        "scenario": "continuation",
+        "plan": {
+            "action": "BUY",
+            "entries": [
+                {"price": 2000.0, "allocation": 0.5, "rationale": "initial confirmation", "order_type": "MARKET"},
+                {"price": 1998.0, "allocation": 0.3, "rationale": "first staged pullback", "order_type": "LIMIT"},
+                {"price": 1996.0, "allocation": 0.2, "rationale": "second staged pullback", "order_type": "LIMIT"},
+            ],
+            "stop_price": 1990.0,
+            "targets": [2020.0],
+            "invalidation": "close below stop",
+            "target_rationale": ["r1"],
+        },
+        "market_features": {},
+        "factor_scores": {},
+        "factor_reasons": {},
+        "provenance": ["test"],
+        "generated_from_market_data": True,
+        "robot_context_only": {},
+    }
+    journal_path = candidates_dir / "candidates.jsonl"
+    journal_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    return journal_path
+
+
 def _msc(value: datetime) -> int:
     return int(value.timestamp() * 1000)
 
@@ -574,7 +616,7 @@ def test_preview_default_sends_zero_orders(tmp_path: Path) -> None:
     db = sqlite3.connect(chain.db_path)
     db.row_factory = sqlite3.Row
     table = db.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='ser8_mt5_demo_order_receipts'"
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ser8_mt5_demo_order_leg_receipts'"
     ).fetchall()
     db.close()
     assert table == []
@@ -726,7 +768,7 @@ def test_real_default_standard_profile_blocks_with_full_diagnostics_no_authoriza
 
     db = sqlite3.connect(chain.db_path)
     db.row_factory = sqlite3.Row
-    for table in ("ser8_execution_authorizations", "ser8_execution_authorization_claims", "ser8_mt5_demo_order_receipts"):
+    for table in ("ser8_execution_authorizations", "ser8_execution_authorization_claims", "ser8_mt5_demo_order_leg_receipts"):
         rows = db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchall()
@@ -749,3 +791,26 @@ def test_real_supervised_demo_profile_reaches_allow_and_preview(tmp_path: Path, 
     captured = capsys.readouterr()
     assert "PREVIEW (NO ORDER SENT)" in captured.out
     assert "RiskDecision.state   = ALLOW" in captured.out
+
+
+def test_preview_shows_every_leg_of_a_multi_entry_plan(tmp_path: Path, capsys) -> None:
+    """SER8 MT5 MULTI-ENTRY DEMO EXECUTION V1, requirement 13: PREVIEW must
+    display the ENTIRE ordered leg plan, never a single, possibly-
+    misleading volume/price collapsed from the first leg only."""
+    chain = _full_real_chain(tmp_path)
+    _write_multi_leg_candidate_journal(chain.data_root)
+    _write_mt5_exports(chain.data_root)
+
+    args = _base_args(chain, risk_profile=_REAL_SUPERVISED_DEMO_PROFILE)
+    exit_code = pipeline_module.run_pipeline(args)
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "PREVIEW (NO ORDER SENT)" in captured.out
+    assert "RiskDecision.state   = ALLOW" in captured.out
+    assert "legs (3):" in captured.out
+    assert "[1] MARKET" in captured.out
+    assert "[2] LIMIT " in captured.out
+    assert "[3] LIMIT " in captured.out
+    # Never collapsed to a single top-level volume/price line -- the old
+    # single-leg-only preview fields no longer exist at all.
+    assert "MT5 request preview" not in captured.out
