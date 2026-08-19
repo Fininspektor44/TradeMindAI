@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.2"
-#property description "TradeMind SER8 Demo Order Executor v1.2"
+#property version   "1.3"
+#property description "TradeMind SER8 Demo Order Executor v1.3"
 #property description "EXECUTOR ONLY. Reads at most one pending SER8 order"
 #property description "request per timer tick, independently verifies the"
 #property description "account/login and request identity, sends exactly"
@@ -28,6 +28,18 @@
 #property description "never observe a truncated or zero-filled positions"
 #property description "CSV. No other writer, no order-execution behavior,"
 #property description "and no sizing/grid/martingale logic changed."
+#property description "v1.3 adds two more read-only exports on the SAME"
+#property description "risk-refresh timer: mt5_risk_orders_utc_<login>.csv"
+#property description "(every order this account's magic owns, active or"
+#property description "historical, with its ENUM_ORDER_STATE) and"
+#property description "mt5_risk_deals_utc_<login>.csv (matching deal"
+#property description "history, DEAL_ORDER-linked back to its order). This"
+#property description "is the authoritative evidence SER8's own automatic"
+#property description "MT5 reconciliation layer needs to know whether a"
+#property description "pending LIMIT/STOP order has since filled, been"
+#property description "cancelled, expired, or rejected -- still strictly"
+#property description "read-only, still no OrderSend/CTrade call anywhere"
+#property description "in either export function."
 
 #include <Trade\Trade.mqh>
 
@@ -42,6 +54,12 @@ input int    InpDeviationPoints   = 20;
 //--- standalone TradeMind_MT5_Risk_Snapshot_Exporter.mq5).
 input int    InpRiskRefreshSeconds = 30;    // Independent of InpPollSeconds; must be >= 10.
 input string InpSymbols            = "";    // Optional Market Watch filter. Blank = every selected symbol.
+
+//--- Read-only order/deal history inputs (v1.3). Bounds how far back
+//--- ExportOrderHistorySnapshot/ExportDealHistorySnapshot scan on every
+//--- refresh -- a small, fast, bounded read every cycle, never an
+//--- unbounded full-account history scan.
+input int    InpHistoryLookbackDays = 30;   // Independent of InpRiskRefreshSeconds; must be >= 1.
 
 CTrade trade;
 
@@ -355,6 +373,26 @@ string RiskSymbolsFilename()
    return InpOutputFolder+"\\mt5_risk_symbols_utc_"+LoginText()+".csv";
 }
 
+string RiskOrdersFilename()
+{
+   return InpOutputFolder+"\\mt5_risk_orders_utc_"+LoginText()+".csv";
+}
+
+string RiskOrdersTempFilename()
+{
+   return InpOutputFolder+"\\mt5_risk_orders_utc_"+LoginText()+".csv.tmp";
+}
+
+string RiskDealsFilename()
+{
+   return InpOutputFolder+"\\mt5_risk_deals_utc_"+LoginText()+".csv";
+}
+
+string RiskDealsTempFilename()
+{
+   return InpOutputFolder+"\\mt5_risk_deals_utc_"+LoginText()+".csv.tmp";
+}
+
 bool AppendAccountSnapshot()
 {
    string filename=RiskAccountFilename();
@@ -596,7 +634,232 @@ bool ExportSymbolSnapshot()
    return true;
 }
 
-//--- Collects all three read-only snapshots. Each export function is
+//--- v1.3: the ONLY authoritative source this repository has for whether
+//--- a specific order_ticket is still a genuinely working pending order
+//--- or has reached a terminal broker outcome (FILLED/CANCELED/EXPIRED/
+//--- REJECTED). Neither the account, positions, nor symbols snapshot can
+//--- answer that -- a position row carries its OWN position_ticket, never
+//--- the order_ticket of the pending order that created it, and two
+//--- same-symbol/same-side pending LIMIT legs (a real, intentional SER8
+//--- multi-entry shape) are indistinguishable by symbol/side/volume
+//--- alone. Filtered to this EA's own InpMagicNumber only -- never
+//--- exports another EA's/account's orders. Strictly read-only: no
+//--- OrderSend/CTrade call anywhere in this function. Written atomically
+//--- (temp file + FileMove), exactly like ExportPositionSnapshot.
+bool ExportOrderHistorySnapshot()
+{
+   string filename=RiskOrdersFilename();
+   string temp_filename=RiskOrdersTempFilename();
+   if(FileIsExist(temp_filename,FILE_COMMON))
+      FileDelete(temp_filename,FILE_COMMON);
+
+   int handle=FileOpen(
+      temp_filename,
+      FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE,
+      ','
+   );
+   if(handle==INVALID_HANDLE)
+   {
+      PrintFormat("TradeMind demo executor: risk order temp file open failed for %s, error=%d",temp_filename,GetLastError());
+      ResetLastError();
+      return false;
+   }
+
+   FileWrite(
+      handle,
+      "time_msc","account_login","order_ticket","symbol","magic","side","order_type","volume",
+      "price","state","time_setup_msc","time_done_msc","position_id"
+   );
+
+   long captured_msc=UtcNowMsc();
+   int written=0;
+
+   // Currently ACTIVE (still working, not yet terminal) orders --
+   // OrdersTotal()/OrderGetTicket() is the real-time list of orders that
+   // have not yet reached a terminal state. OrderGetTicket already
+   // selects the order for the OrderGet*() calls that follow, exactly
+   // like PositionGetTicket already does above for positions.
+   int active_total=OrdersTotal();
+   for(int index=0;index<active_total;index++)
+   {
+      ulong ticket=OrderGetTicket(index);
+      if(ticket==0)
+         continue;
+      if(OrderGetInteger(ORDER_MAGIC)!=InpMagicNumber)
+         continue;
+      string symbol=OrderGetString(ORDER_SYMBOL);
+      if(symbol=="")
+         continue;
+      int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+      ENUM_ORDER_TYPE order_type=(ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      string side=(order_type==ORDER_TYPE_SELL||order_type==ORDER_TYPE_SELL_LIMIT||order_type==ORDER_TYPE_SELL_STOP||order_type==ORDER_TYPE_SELL_STOP_LIMIT) ? "SELL" : "BUY";
+      FileWrite(
+         handle,
+         captured_msc,
+         AccountInfoInteger(ACCOUNT_LOGIN),
+         ticket,
+         symbol,
+         OrderGetInteger(ORDER_MAGIC),
+         side,
+         EnumTail(EnumToString(order_type),"ORDER_TYPE_"),
+         DoubleToString(OrderGetDouble(ORDER_VOLUME_INITIAL),8),
+         DoubleToString(OrderGetDouble(ORDER_PRICE_OPEN),digits),
+         "PLACED",
+         (long)OrderGetInteger(ORDER_TIME_SETUP_MSC),
+         0,
+         0
+      );
+      written++;
+   }
+
+   // Historical (completed/terminal) orders within the bounded lookback
+   // window -- HistorySelect populates a combined list that also
+   // includes currently-active orders in range; ORDER_STATE tells the
+   // real outcome, and PLACED/STARTED rows are skipped here since the
+   // OrdersTotal() loop above already reported them, avoiding a
+   // duplicate row for the same order_ticket.
+   datetime from=TimeGMT()-InpHistoryLookbackDays*86400;
+   if(HistorySelect(from,TimeGMT()))
+   {
+      int history_total=HistoryOrdersTotal();
+      for(int index=0;index<history_total;index++)
+      {
+         ulong ticket=HistoryOrderGetTicket(index);
+         if(ticket==0)
+            continue;
+         if(HistoryOrderGetInteger(ticket,ORDER_MAGIC)!=InpMagicNumber)
+            continue;
+         ENUM_ORDER_STATE state=(ENUM_ORDER_STATE)HistoryOrderGetInteger(ticket,ORDER_STATE);
+         if(state==ORDER_STATE_STARTED || state==ORDER_STATE_PLACED)
+            continue;
+         string symbol=HistoryOrderGetString(ticket,ORDER_SYMBOL);
+         if(symbol=="")
+            continue;
+         int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+         ENUM_ORDER_TYPE order_type=(ENUM_ORDER_TYPE)HistoryOrderGetInteger(ticket,ORDER_TYPE);
+         string side=(order_type==ORDER_TYPE_SELL||order_type==ORDER_TYPE_SELL_LIMIT||order_type==ORDER_TYPE_SELL_STOP||order_type==ORDER_TYPE_SELL_STOP_LIMIT) ? "SELL" : "BUY";
+         FileWrite(
+            handle,
+            captured_msc,
+            AccountInfoInteger(ACCOUNT_LOGIN),
+            ticket,
+            symbol,
+            HistoryOrderGetInteger(ticket,ORDER_MAGIC),
+            side,
+            EnumTail(EnumToString(order_type),"ORDER_TYPE_"),
+            DoubleToString(HistoryOrderGetDouble(ticket,ORDER_VOLUME_INITIAL),8),
+            DoubleToString(HistoryOrderGetDouble(ticket,ORDER_PRICE_OPEN),digits),
+            EnumTail(EnumToString(state),"ORDER_STATE_"),
+            (long)HistoryOrderGetInteger(ticket,ORDER_TIME_SETUP_MSC),
+            (long)HistoryOrderGetInteger(ticket,ORDER_TIME_DONE_MSC),
+            (long)HistoryOrderGetInteger(ticket,ORDER_POSITION_ID)
+         );
+         written++;
+      }
+   }
+
+   FileFlush(handle);
+   FileClose(handle);
+
+   if(!FileMove(temp_filename,FILE_COMMON,filename,FILE_COMMON|FILE_REWRITE))
+   {
+      PrintFormat("TradeMind demo executor: risk order atomic replace failed for %s, error=%d",filename,GetLastError());
+      ResetLastError();
+      FileDelete(temp_filename,FILE_COMMON);
+      return false;
+   }
+
+   PrintFormat("TradeMind demo executor: risk order snapshot account=%s orders=%d",LoginText(),written);
+   return true;
+}
+
+//--- v1.3: matching deal history for the same bounded lookback window --
+//--- DEAL_ORDER directly gives the ORIGINATING order ticket for an
+//--- executed deal (the authoritative link
+//--- ExportOrderHistorySnapshot's own FILLED rows alone cannot provide),
+//--- plus the real fill price/volume/deal_ticket/position_id. Filtered
+//--- to InpMagicNumber only. Strictly read-only. Written atomically,
+//--- exactly like ExportOrderHistorySnapshot.
+bool ExportDealHistorySnapshot()
+{
+   string filename=RiskDealsFilename();
+   string temp_filename=RiskDealsTempFilename();
+   if(FileIsExist(temp_filename,FILE_COMMON))
+      FileDelete(temp_filename,FILE_COMMON);
+
+   int handle=FileOpen(
+      temp_filename,
+      FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE,
+      ','
+   );
+   if(handle==INVALID_HANDLE)
+   {
+      PrintFormat("TradeMind demo executor: risk deal temp file open failed for %s, error=%d",temp_filename,GetLastError());
+      ResetLastError();
+      return false;
+   }
+
+   FileWrite(
+      handle,
+      "time_msc","account_login","deal_ticket","order_ticket","position_id","symbol","magic",
+      "side","volume","price","entry","time_deal_msc"
+   );
+
+   long captured_msc=UtcNowMsc();
+   int written=0;
+   datetime from=TimeGMT()-InpHistoryLookbackDays*86400;
+   if(HistorySelect(from,TimeGMT()))
+   {
+      int total=HistoryDealsTotal();
+      for(int index=0;index<total;index++)
+      {
+         ulong ticket=HistoryDealGetTicket(index);
+         if(ticket==0)
+            continue;
+         if(HistoryDealGetInteger(ticket,DEAL_MAGIC)!=InpMagicNumber)
+            continue;
+         string symbol=HistoryDealGetString(ticket,DEAL_SYMBOL);
+         if(symbol=="")
+            continue;
+         int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+         ENUM_DEAL_TYPE deal_type=(ENUM_DEAL_TYPE)HistoryDealGetInteger(ticket,DEAL_TYPE);
+         string side=(deal_type==DEAL_TYPE_SELL) ? "SELL" : (deal_type==DEAL_TYPE_BUY) ? "BUY" : "OTHER";
+         ENUM_DEAL_ENTRY entry=(ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket,DEAL_ENTRY);
+         FileWrite(
+            handle,
+            captured_msc,
+            AccountInfoInteger(ACCOUNT_LOGIN),
+            ticket,
+            (ulong)HistoryDealGetInteger(ticket,DEAL_ORDER),
+            (ulong)HistoryDealGetInteger(ticket,DEAL_POSITION_ID),
+            symbol,
+            HistoryDealGetInteger(ticket,DEAL_MAGIC),
+            side,
+            DoubleToString(HistoryDealGetDouble(ticket,DEAL_VOLUME),8),
+            DoubleToString(HistoryDealGetDouble(ticket,DEAL_PRICE),digits),
+            EnumTail(EnumToString(entry),"DEAL_ENTRY_"),
+            (long)HistoryDealGetInteger(ticket,DEAL_TIME_MSC)
+         );
+         written++;
+      }
+   }
+
+   FileFlush(handle);
+   FileClose(handle);
+
+   if(!FileMove(temp_filename,FILE_COMMON,filename,FILE_COMMON|FILE_REWRITE))
+   {
+      PrintFormat("TradeMind demo executor: risk deal atomic replace failed for %s, error=%d",filename,GetLastError());
+      ResetLastError();
+      FileDelete(temp_filename,FILE_COMMON);
+      return false;
+   }
+
+   PrintFormat("TradeMind demo executor: risk deal snapshot account=%s deals=%d",LoginText(),written);
+   return true;
+}
+
+//--- Collects all five read-only snapshots. Each export function is
 //--- independent and unconditional -- one failing (logged only) never
 //--- skips the others, and this function's own success/failure never
 //--- feeds back into ProcessPendingRequest() in any way.
@@ -605,7 +868,9 @@ void CollectRiskSnapshot()
    bool account_ok=AppendAccountSnapshot();
    bool positions_ok=ExportPositionSnapshot();
    bool symbols_ok=ExportSymbolSnapshot();
-   if(!account_ok || !positions_ok || !symbols_ok)
+   bool orders_ok=ExportOrderHistorySnapshot();
+   bool deals_ok=ExportDealHistorySnapshot();
+   if(!account_ok || !positions_ok || !symbols_ok || !orders_ok || !deals_ok)
       Print("TradeMind demo executor: one or more risk snapshot writes failed");
 }
 
@@ -621,6 +886,11 @@ int OnInit()
       Print("TradeMind demo executor: InpRiskRefreshSeconds must be at least 10");
       return INIT_PARAMETERS_INCORRECT;
    }
+   if(InpHistoryLookbackDays<1)
+   {
+      Print("TradeMind demo executor: InpHistoryLookbackDays must be at least 1");
+      return INIT_PARAMETERS_INCORRECT;
+   }
    // Exactly ONE timer for this entire EA. Both independent cadences
    // (order-request polling at InpPollSeconds, risk snapshot refresh at
    // InpRiskRefreshSeconds) are driven off this single timer's ticks via
@@ -634,8 +904,9 @@ int OnInit()
    g_last_risk_snapshot_at=0;
    CollectRiskSnapshot();
    g_last_risk_snapshot_at=TimeGMT();
-   Print("TradeMind SER8 Demo Order Executor v1.1 started. One EA, one chart: SER8 one-shot order execution "
-         "plus read-only risk snapshot export. No strategy logic, no position sizing of any kind runs here.");
+   Print("TradeMind SER8 Demo Order Executor v1.3 started. One EA, one chart: SER8 one-shot order execution "
+         "plus read-only risk/position/order/deal snapshot export. No strategy logic, no position sizing of "
+         "any kind runs here.");
    return INIT_SUCCEEDED;
 }
 

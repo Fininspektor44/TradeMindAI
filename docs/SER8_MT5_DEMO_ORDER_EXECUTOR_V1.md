@@ -1,4 +1,41 @@
-# TradeMind SER8 MT5 Demo Order Executor v1.2
+# TradeMind SER8 MT5 Demo Order Executor v1.3
+
+## v1.3 — экспорт истории ордеров/сделок для автоматической сверки
+
+SER8 теперь корректно сохраняет принятые брокером pending LIMIT-ноги как
+`PENDING`, но раньше их перевод в `FILLED`/`CANCELLED`/`EXPIRED`/
+`REJECTED` требовал ручной команды. Ни account-, ни positions-, ни
+symbols-снапшот не могут ответить на вопрос "что случилось с конкретным
+`order_ticket`": строка позиции несёт СОБСТВЕННЫЙ `position_ticket`,
+а не тикет исходного pending-ордера, а два pending LIMIT-ноги с
+одинаковым символом/стороной (реальная, намеренная форма SER8
+multi-entry) неразличимы по символу/стороне/объёму.
+
+Добавлены ровно два новых read-only экспорта на ТОМ ЖЕ таймере
+risk-refresh (`InpRiskRefreshSeconds`), без нового EA и без нового
+таймера:
+
+- `mt5_risk_orders_utc_<login>.csv` — каждый ордер с магиком
+  `InpMagicNumber`, активный (`OrdersTotal()`) или из истории
+  (`HistorySelect`/`HistoryOrdersTotal()`, окно `InpHistoryLookbackDays`
+  дней, по умолчанию 30) со своим `ENUM_ORDER_STATE`
+  (`PLACED`/`FILLED`/`CANCELED`/`EXPIRED`/`REJECTED`/`PARTIAL`/...);
+- `mt5_risk_deals_utc_<login>.csv` — соответствующая история сделок за то
+  же окно, где `order_ticket` -- это `DEAL_ORDER` (прямая, авторитетная
+  ссылка на исходный ордер), плюс реальные `price`/`volume`/
+  `deal_ticket`/`position_id`.
+
+Оба файла пишутся атомарно (temp-файл + `FileMove(...,FILE_REWRITE)`),
+тем же способом, что и `ExportPositionSnapshot` (v1.2). Ни один из них не
+делает ни одного вызова `OrderSend`/`CTrade` -- строго read-only.
+
+Python-сторона: `trademind.ser8_mt5_execution_reconciliation` читает эти
+два файла и через `SER8DemoOrderSendControl.reconcile_pending_leg`
+(без изменений в её собственной строгой валидации) автоматически
+переводит PENDING-ноги в терминальное состояние -- никогда не отправляя
+ордер повторно и никогда не угадывая исход по одному лишь исчезновению
+ордера из экспорта. См. `scripts/reconcile_ser8_mt5_execution.py` и
+`scripts/install_ser8_mt5_reconciliation.ps1`.
 
 ## v1.2 — атомарная запись positions-снапшота (исправление NUL-файла)
 

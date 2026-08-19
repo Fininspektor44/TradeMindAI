@@ -256,7 +256,7 @@ RESULT_CSV_FIELDS = (
 # manual reconciliation before this module will touch that leg again at
 # all). Both are still valid, recognized values for a persisted receipt's
 # own result_state.
-_TERMINAL_LEG_STATES = {"FILLED", "REJECTED", "REQUOTE", "PARTIAL_FILL", "MALFORMED", "CANCELLED"}
+_TERMINAL_LEG_STATES = {"FILLED", "REJECTED", "REQUOTE", "PARTIAL_FILL", "MALFORMED", "CANCELLED", "EXPIRED"}
 _NONTERMINAL_LEG_STATES = {"PENDING", "UNKNOWN"}
 _RECOGNIZED_LEG_STATES = _TERMINAL_LEG_STATES | _NONTERMINAL_LEG_STATES
 
@@ -1310,41 +1310,63 @@ class SER8DemoOrderSendControl:
         *,
         evidence: DemoOrderTransportResult | None = None,
         cancelled: bool = False,
+        terminal_order_state: str | None = None,
         now: datetime | None = None,
     ) -> DemoOrderExecutionReceiptV1:
         """Advances ONE currently-PENDING leg to FILLED/REJECTED/REQUOTE/
-        MALFORMED/CANCELLED using ONLY fresh, authoritative broker evidence
-        supplied by the caller (requirement 8) -- NEVER auto-guessed, and
-        NEVER calls the transport (this is reconciliation, not a resend --
-        requirement 5/11). Exactly one of ``evidence`` (a freshly observed
-        :class:`DemoOrderTransportResult` for this SAME leg identity -- for
-        example a fresh read of the executor's own result CSV row, or a
-        result reconstructed from a genuine positions/deals lookup showing
-        the pending order has since filled) or ``cancelled=True`` (an
-        explicit, out-of-band confirmation -- e.g. the operator checked the
-        real MT5 terminal by hand and confirmed the pending order was
-        cancelled or expired) must be supplied.
+        MALFORMED/CANCELLED/EXPIRED using ONLY fresh, authoritative broker
+        evidence supplied by the caller (requirement 8) -- NEVER auto-
+        guessed, and NEVER calls the transport (this is reconciliation,
+        not a resend -- requirement 5/11). Exactly ONE of the following
+        must be supplied:
+
+          * ``evidence`` -- a freshly observed :class:`DemoOrderTransportResult`
+            for this SAME leg identity (e.g. a fresh read of the
+            executor's own result CSV row, or a result reconstructed from
+            a genuine deal-history lookup showing the pending order has
+            since filled), reclassified via the same authoritative
+            :func:`_classify_result` this module uses everywhere else;
+          * ``cancelled=True`` -- an explicit, out-of-band confirmation
+            the order was cancelled (kept for backward compatibility;
+            exactly equivalent to ``terminal_order_state="CANCELLED"``);
+          * ``terminal_order_state`` -- one of ``"CANCELLED"``,
+            ``"EXPIRED"``, or ``"REJECTED"``, for a caller (typically the
+            automatic MT5 reconciliation layer, driven by authoritative
+            order-history evidence showing ``ENUM_ORDER_STATE`` values
+            like ``ORDER_STATE_CANCELED``/``ORDER_STATE_EXPIRED``/
+            ``ORDER_STATE_REJECTED``) that already knows the SPECIFIC
+            terminal outcome, not just "not pending anymore". EXPIRED is
+            the narrowest new state this module adds for exactly this --
+            the existing model had no way to distinguish "the broker
+            cancelled/rejected this" from "this LIMIT/STOP order simply
+            timed out without ever triggering", and those are genuinely
+            different, useful-to-know outcomes.
 
         Fails closed (requirement 9) if: no send attempt exists for this
         leg identity at all; the attempt was never finalized (still
         genuinely in-flight, not this method's concern); the leg's current
         state is anything other than PENDING (this method never moves a
-        FILLED/REJECTED/REQUOTE/MALFORMED/UNKNOWN/CANCELLED leg -- once
-        terminal, always terminal, and PENDING is the only state this
+        FILLED/REJECTED/REQUOTE/MALFORMED/UNKNOWN/CANCELLED/EXPIRED leg --
+        once terminal, always terminal, and PENDING is the only state this
         method is willing to advance FROM); the persisted request payload
         fails its own integrity check (receipt_hash/request_hash
-        recomputed and compared, never trusted at face value); or the
+        recomputed and compared, never trusted at face value); the
         supplied evidence's own claim_id does not match this leg's wire
-        identity. If the supplied evidence still shows the order as
-        genuinely pending (nothing changed), this call is a harmless,
-        idempotent no-op that returns the unchanged current receipt --
-        never an error, since "still pending" is itself a legitimate,
-        expected outcome of checking.
+        identity; or more than one (or none) of evidence/cancelled/
+        terminal_order_state was supplied. If the supplied evidence still
+        shows the order as genuinely pending (nothing changed), this call
+        is a harmless, idempotent no-op that returns the unchanged
+        current receipt -- never an error, since "still pending" is
+        itself a legitimate, expected outcome of checking.
         """
-        if (evidence is None) == (not cancelled):
+        supplied_count = sum([evidence is not None, cancelled, terminal_order_state is not None])
+        if supplied_count != 1:
             raise SER8DemoOrderSendError(
-                "reconcile_pending_leg requires exactly one of evidence= or cancelled=True"
+                "reconcile_pending_leg requires exactly one of evidence=, cancelled=True, "
+                "or terminal_order_state="
             )
+        if terminal_order_state is not None and terminal_order_state not in {"CANCELLED", "EXPIRED", "REJECTED"}:
+            raise SER8DemoOrderSendError(f"unsupported terminal_order_state: {terminal_order_state!r}")
         captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
         with self._connect() as db:
@@ -1370,8 +1392,8 @@ class SER8DemoOrderSendControl:
                 f"persisted request payload for leg {leg_id} failed its own integrity check"
             )
 
-        if cancelled:
-            new_state = "CANCELLED"
+        if cancelled or terminal_order_state is not None:
+            new_state = terminal_order_state or "CANCELLED"
             transport_result: DemoOrderTransportResult | None = None
         else:
             if evidence.claim_id != leg_id:
@@ -1398,7 +1420,7 @@ class SER8DemoOrderSendControl:
             recorded_at=captured_at.isoformat(),
             retcode=(transport_result.retcode if transport_result is not None else current.retcode),
             retcode_description=(
-                transport_result.retcode_description if transport_result is not None else "CANCELLED_BY_RECONCILIATION"
+                transport_result.retcode_description if transport_result is not None else f"{new_state}_BY_RECONCILIATION"
             ),
             order_ticket=current.order_ticket,  # never invented/changed by reconciliation.
             deal_ticket=(transport_result.deal_ticket if transport_result is not None else current.deal_ticket),
@@ -1594,6 +1616,31 @@ class SER8DemoOrderSendControl:
                 (parent_claim_id,),
             ).fetchall()
         return tuple(row["claim_id"] for row in rows)
+
+    def list_pending_leg_ids_for_account(self, demo_account_id: str) -> tuple[str, ...]:
+        """Every leg identity, across ALL claims, currently persisted
+        PENDING for this demo account -- the GENERIC discovery entrypoint
+        automatic reconciliation needs (never hard-codes a specific claim
+        or ticket). Read-only; never touches the transport. Only rows
+        with a non-NULL, already-finalized ``payload_json`` are ever
+        considered (a reserved-but-never-finalized attempt is not this
+        method's concern -- ``send()``'s own crash-self-heal handles
+        that)."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT claim_id, payload_json, request_json FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE payload_json IS NOT NULL ORDER BY entry_index"
+            ).fetchall()
+        pending: list[str] = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if payload.get("result_state") != "PENDING":
+                continue
+            request_payload = json.loads(row["request_json"])
+            if request_payload.get("demo_account_id") != demo_account_id:
+                continue
+            pending.append(row["claim_id"])
+        return tuple(pending)
 
     def get_leg_receipt(self, leg_id: str) -> DemoOrderExecutionReceiptV1 | None:
         """Public, read-only accessor for a leg's current persisted

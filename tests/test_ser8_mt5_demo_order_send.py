@@ -95,8 +95,12 @@ from trademind.ser8_mt5_demo_order_send import (
     DEMO_EXECUTOR_MAGIC_NUMBER,
     REQUEST_CSV_FIELDS,
     RESULT_CSV_FIELDS,
+    SCHEMA_VERSION,
     DemoOrderExecutionPlanReceiptV1,
+    DemoOrderExecutionPlanV1,
     DemoOrderExecutionReceiptV1,
+    DemoOrderPlanLegV1,
+    DemoOrderRequestV1,
     DemoOrderTransportResult,
     FakeDemoOrderTransport,
     FileBridgeDemoOrderTransport,
@@ -2727,3 +2731,160 @@ def test_recovery_never_calls_the_transport() -> None:
     source = inspect.getsource(module.SER8DemoOrderSendControl.recover_misclassified_pending_leg)
     assert "self.transport" not in source
     assert ".send(" not in source
+
+
+# ---------------------------------------------------------------------------
+# SER8 AUTOMATIC MT5 RECONCILIATION V1 -- reconcile_pending_leg's new
+# terminal_order_state= parameter (CANCELLED/EXPIRED/REJECTED from
+# authoritative order-history evidence, distinct from the retcode-based
+# evidence= path) and list_pending_leg_ids_for_account (the generic,
+# multi-claim discovery entrypoint automatic reconciliation needs).
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_pending_leg_terminal_order_state_expired(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    receipt = control.reconcile_pending_leg(leg2_id, terminal_order_state="EXPIRED", now=NOW + timedelta(hours=1))
+    assert receipt.result_state == "EXPIRED"
+    assert receipt.order_ticket == "73312452"  # preserved.
+    assert len(transport.calls) == 3  # unchanged -- no new send.
+
+
+def test_reconcile_pending_leg_terminal_order_state_rejected(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    leg3_id = leg_identity(claim.claim_id, 3, total_legs=3)
+
+    receipt = control.reconcile_pending_leg(leg3_id, terminal_order_state="REJECTED", now=NOW + timedelta(hours=1))
+    assert receipt.result_state == "REJECTED"
+    assert receipt.order_ticket == "73312453"
+
+
+def test_reconcile_pending_leg_terminal_order_state_cancelled_matches_bool_flag(tmp_path: Path) -> None:
+    """terminal_order_state="CANCELLED" and the pre-existing cancelled=True
+    flag must produce byte-identical results -- backward compatibility."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+    leg3_id = leg_identity(claim.claim_id, 3, total_legs=3)
+
+    via_bool = control.reconcile_pending_leg(leg2_id, cancelled=True, now=NOW + timedelta(hours=1))
+    via_state = control.reconcile_pending_leg(
+        leg3_id, terminal_order_state="CANCELLED", now=NOW + timedelta(hours=1)
+    )
+    assert via_bool.result_state == via_state.result_state == "CANCELLED"
+
+
+def test_reconcile_pending_leg_rejects_unsupported_terminal_order_state(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    with pytest.raises(SER8DemoOrderSendError, match="unsupported terminal_order_state"):
+        control.reconcile_pending_leg(leg2_id, terminal_order_state="SOMETHING_ELSE")
+
+
+def test_reconcile_pending_leg_terminal_order_state_and_evidence_both_supplied_fails_closed(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    leg2_id = leg_identity(claim.claim_id, 2, total_legs=3)
+
+    with pytest.raises(SER8DemoOrderSendError, match="exactly one"):
+        control.reconcile_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="Request completed",
+                order_ticket="73312452", deal_ticket="1", position_ticket="1",
+                filled_volume=decision.orders[1].volume, filled_price=1998.0,
+            ),
+            terminal_order_state="EXPIRED",
+        )
+
+
+def test_list_pending_leg_ids_for_account_is_generic_across_claims(tmp_path: Path) -> None:
+    context, claim_a, decision_a, candidate_a = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim_a, decision_a, candidate_a, allowlist=_allowlist(LOGIN), now=NOW)
+
+    # A SECOND, independent claim -- persisted directly via the control's
+    # own production persistence methods (the same technique
+    # _persist_legacy_malformed_plan already established) on the SAME
+    # registry/control, proving discovery is not hard-coded to one claim.
+    # (A second full research-lifecycle chain cannot reuse the same
+    # db_name -- its own authorization would already be consumed -- so
+    # this directly persists a second, independent claim's legs instead,
+    # which is all list_pending_leg_ids_for_account itself ever reads.)
+    other_claim_id = "EAC-67206924-otherclaim00000"
+    other_leg_id = leg_identity(other_claim_id, 1, total_legs=1)
+    other_plan = DemoOrderExecutionPlanV1(
+        schema_version=SCHEMA_VERSION, plan_id="EOP-otherclaim", claim_id=other_claim_id,
+        authorization_id="EA-other", decision_id="RD-other", candidate_signal_id="sig-other",
+        demo_account_id=LOGIN, symbol="EURUSD", action="BUY",
+        legs=(
+            DemoOrderPlanLegV1(
+                entry_index=1, leg_id=other_leg_id, order_type="LIMIT", planned_price=1.1,
+                effective_entry_price=1.1, allocation=1.0, volume=0.01, sl=1.0, tp=1.2,
+            ),
+        ),
+    )
+    control._persist_plan(other_plan, created_at=NOW.isoformat())
+    other_request = DemoOrderRequestV1(
+        schema_version=SCHEMA_VERSION, parent_claim_id=other_claim_id, entry_index=1, claim_id=other_leg_id,
+        authorization_id="EA-other", demo_account_id=LOGIN, symbol="EURUSD", action="BUY", order_type="LIMIT",
+        volume=0.01, price=1.1, sl=1.0, tp=1.2, magic=DEMO_EXECUTOR_MAGIC_NUMBER, comment="SER8:other",
+    )
+    control._reserve_leg_attempt(
+        leg_id=other_leg_id, plan_id=other_plan.plan_id, parent_claim_id=other_claim_id, entry_index=1,
+        attempt_id="EAO-other", request=other_request, demo_authorization=_OtherFakeAuth(), captured_at=NOW,
+    )
+    control._finalize(
+        claim_id=other_leg_id, plan_id=other_plan.plan_id, parent_claim_id=other_claim_id, entry_index=1,
+        authorization_id="EA-other", demo_gate_hash=_OtherFakeAuth.gate_hash, request_hash=other_request.request_hash,
+        attempt_id="EAO-other", result_state="PENDING", recorded_at=NOW.isoformat(),
+        retcode=10009, retcode_description="done", order_ticket="55555555", deal_ticket="0", position_ticket="0",
+        requested_volume=0.01, requested_price=1.1, filled_volume=0.01, filled_price=0.0,
+    )
+
+    pending = control.list_pending_leg_ids_for_account(LOGIN)
+    assert leg_identity(claim_a.claim_id, 2, total_legs=3) in pending
+    assert leg_identity(claim_a.claim_id, 3, total_legs=3) in pending
+    assert other_leg_id in pending
+    # The FILLED leg of claim_a is never listed as pending.
+    assert leg_identity(claim_a.claim_id, 1, total_legs=3) not in pending
+    assert len(pending) == 3
+
+
+class _OtherFakeAuth:
+    gate_hash = "sha256:" + "b" * 64
+
+
+def test_list_pending_leg_ids_for_account_filters_by_account(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    assert control.list_pending_leg_ids_for_account(LOGIN) != ()
+    assert control.list_pending_leg_ids_for_account("99999999") == ()
