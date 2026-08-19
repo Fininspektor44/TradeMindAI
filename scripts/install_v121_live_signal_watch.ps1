@@ -81,11 +81,21 @@ $action = New-ScheduledTaskAction -Execute $powershell -Argument $taskArguments 
 
 # schtasks.exe /SC MINUTE /MO $IntervalMinutes has no single native trigger
 # type in the ScheduledTasks module; the standard equivalent is one "run
-# once" start time combined with an indefinite repetition interval, which
-# reproduces the same "every N minutes, forever" cadence.
+# once" start time combined with a repetition interval, which reproduces
+# the same "every N minutes" cadence. -RepetitionDuration is deliberately
+# OMITTED, not set to [TimeSpan]::MaxValue: Task Scheduler's own repetition
+# Duration is an OPTIONAL XML field, and per its authoritative semantics,
+# omitting it makes repetition continue indefinitely. Passing
+# [TimeSpan]::MaxValue instead serializes to a literal
+# "P99999999DT23H59M59S" ISO-8601 duration string, which Task Scheduler's
+# own XML schema rejects outright ("XML-код задачи содержит значение в
+# неправильном формате или за пределами допустимого диапазона") -- this is
+# the real Windows registration failure this fix closes. No arbitrary
+# 10-year/100-year duration is substituted either: indefinite-by-omission is
+# the correct, authoritative way to express "forever" here, not a
+# workaround with its own eventual expiry.
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) `
-    -RepetitionDuration ([TimeSpan]::MaxValue)
+    -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)
 
 # Runs as the installing user at the highest available privileges (the same
 # /RL HIGHEST semantics as before) using S4U logon: runs whether or not the

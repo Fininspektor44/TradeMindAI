@@ -77,9 +77,12 @@ def test_one_minute_cadence_preserved_via_repetition_interval() -> None:
     text = INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert "[int]$IntervalMinutes = 1" in text
     assert "-RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes)" in text
-    # Indefinite repetition -- the same "runs forever, every N minutes"
-    # cadence schtasks.exe /SC MINUTE /MO $IntervalMinutes provided.
-    assert "-RepetitionDuration ([TimeSpan]::MaxValue)" in text
+    # Repetition is indefinite BY OMISSION of -RepetitionDuration (Task
+    # Scheduler's own authoritative semantics: an omitted Duration means
+    # "repeat forever") -- see
+    # tests/test_ser8_scheduled_task_indefinite_repetition_fix.py for the
+    # dedicated proof that no -RepetitionDuration value (MaxValue or
+    # otherwise) is ever passed.
 
 
 def test_highest_privileges_preserved() -> None:
