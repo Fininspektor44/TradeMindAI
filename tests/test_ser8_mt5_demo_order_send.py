@@ -1776,25 +1776,71 @@ def test_demo_login_and_magic_checks_preserved_per_leg(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # 11-12: no MQL5 position sizing; no grid/averaging/martingale -- the
-# executor file itself is COMPLETELY UNTOUCHED by this task (the strongest
-# possible proof), re-verified here rather than only trusted from Task B's
-# own tests in tests/test_mt5_unified_executor.py.
+# executor file itself was COMPLETELY UNTOUCHED by SER8 MT5 MULTI-ENTRY
+# DEMO EXECUTION V1 (this exact assertion, before it), and this comment's
+# own note said any future task that DOES need to touch it should update
+# this assertion deliberately, not silently break it. SER8 UNIFIED MT5
+# POSITIONS SNAPSHOT WRITER FIX V1 is exactly that deliberate update: it
+# fixes a real, reproduced-on-Windows bug in ExportPositionSnapshot (see
+# that function's own root-cause comment in the .mq5 file). The test below
+# proves the change stayed scoped to the positions-snapshot writer alone --
+# order execution (ProcessPendingRequest/WriteResult), the account writer's
+# own body, and the symbols writer are all still byte-for-byte unchanged
+# relative to the fixed, immutable base commit this task started from.
 # ---------------------------------------------------------------------------
 
+_POSITIONS_SNAPSHOT_FIX_BASE_SHA = "7e134376813844500793f267c0f1a58b8e18c35a"
 
-def test_mql5_executor_file_untouched_by_this_task(tmp_path: Path) -> None:
+
+def test_mql5_executor_change_stays_scoped_to_positions_snapshot_writer() -> None:
     import subprocess
 
     repo_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
-        ["git", "diff", "--stat", "HEAD", "--", "mt5/TradeMind_Demo_Order_Executor_v1.mq5"],
+        [
+            "git", "diff", "--unified=0", _POSITIONS_SNAPSHOT_FIX_BASE_SHA,
+            "--", "mt5/TradeMind_Demo_Order_Executor_v1.mq5",
+        ],
         cwd=repo_root, capture_output=True, text=True, check=False,
     )
-    # Empty output means git sees zero changes relative to the last commit
-    # for this exact file -- this task adds no MQL5 diff at all. (If this
-    # ever legitimately needs to change in a future task, this assertion
-    # should be updated deliberately, not silently broken.)
-    assert result.stdout.strip() == ""
+    if result.returncode != 0:
+        pytest.skip(f"base commit {_POSITIONS_SNAPSHOT_FIX_BASE_SHA} not reachable in this checkout")
+    diff_text = result.stdout
+    hunk_headers = [line for line in diff_text.splitlines() if line.startswith("@@")]
+    assert hunk_headers, "expected this task to have changed the executor file"
+    # Only actual changed (+/-) CODE lines count -- explanatory comments
+    # (added or pre-existing) legitimately NAME sibling functions like
+    # ReadAndConsumeRequest/FileMove for cross-reference without touching
+    # them; a comment mentioning a name is not a change to that function.
+    changed_lines = [
+        line for line in diff_text.splitlines() if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    ]
+    changed_code_lines = [line for line in changed_lines if not line.lstrip("+- ").startswith("//")]
+    for forbidden_function in (
+        "ProcessPendingRequest", "WriteResult(", "WriteMalformedResult",
+        "ReadAndConsumeRequest", "ExportSymbolSnapshot", "OnInit()", "OnTimer()", "OnDeinit",
+    ):
+        for line in changed_code_lines:
+            assert forbidden_function not in line, (
+                f"unexpected code change touching {forbidden_function} in line {line!r} -- "
+                "this fix must stay scoped to the positions-snapshot writer only"
+            )
+    # AppendAccountSnapshot's own BODY (its FileWrite calls / account
+    # fields) must not appear as a changed (+/-) CODE line -- only context.
+    for line in changed_code_lines:
+        assert "AccountInfoDouble" not in line
+        assert "ACCOUNT_BALANCE" not in line
+
+
+def test_mql5_executor_file_still_has_the_untouched_prior_task_guarantees() -> None:
+    """The prior task's own guarantees (single EventSetTimer, one-shot
+    request consumption, no OnTick) remain true even though this task did
+    touch the file -- this fix is additive/scoped, not a rewrite."""
+    executor_path = Path(__file__).resolve().parents[1] / "mt5" / "TradeMind_Demo_Order_Executor_v1.mq5"
+    source = executor_path.read_text(encoding="utf-8")
+    assert source.count("EventSetTimer(") == 1
+    assert "RequestConsumedFilename" in source
+    assert "OnTick" not in source
 
 
 def test_mql5_executor_still_has_no_position_sizing_or_grid_logic() -> None:

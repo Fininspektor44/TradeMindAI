@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.1"
-#property description "TradeMind SER8 Demo Order Executor v1.1"
+#property version   "1.2"
+#property description "TradeMind SER8 Demo Order Executor v1.2"
 #property description "EXECUTOR ONLY. Reads at most one pending SER8 order"
 #property description "request per timer tick, independently verifies the"
 #property description "account/login and request identity, sends exactly"
@@ -22,6 +22,12 @@
 #property description "execution -- a failed snapshot write never"
 #property description "authorizes an order, and a rejected/failed order"
 #property description "never skips a future snapshot."
+#property description "v1.2 fixes the positions-snapshot writer: it now"
+#property description "writes to a temp file and atomically renames it"
+#property description "over the real file, so a concurrent reader can"
+#property description "never observe a truncated or zero-filled positions"
+#property description "CSV. No other writer, no order-execution behavior,"
+#property description "and no sizing/grid/martingale logic changed."
 
 #include <Trade\Trade.mqh>
 
@@ -334,6 +340,16 @@ string RiskPositionsFilename()
    return InpOutputFolder+"\\mt5_risk_positions_utc_"+LoginText()+".csv";
 }
 
+//--- Temp filename for the atomic write-then-rename pattern
+//--- ExportPositionSnapshot uses below -- see that function's own comment
+//--- for why. Reuses exactly the same FileMove(...,FILE_REWRITE) mechanism
+//--- ReadAndConsumeRequest already uses (above) to rename a request file
+//--- after reading it; this is not a new/parallel snapshot path.
+string RiskPositionsTempFilename()
+{
+   return InpOutputFolder+"\\mt5_risk_positions_utc_"+LoginText()+".csv.tmp";
+}
+
 string RiskSymbolsFilename()
 {
    return InpOutputFolder+"\\mt5_risk_symbols_utc_"+LoginText()+".csv";
@@ -386,21 +402,57 @@ bool AppendAccountSnapshot()
    return true;
 }
 
+//--- ROOT CAUSE (confirmed by direct source comparison with
+//--- AppendAccountSnapshot, not assumed): unlike the account file (which
+//--- APPENDS one new row to an already-complete, mostly-unchanged file),
+//--- this function REWRITES THE ENTIRE positions file from scratch on
+//--- every call -- by design, since a positions snapshot is a point-in-
+//--- time view, not a growing log. Opening the REAL, well-known filename
+//--- directly with FILE_WRITE (no FILE_READ) and rewriting it in place is
+//--- NOT atomic: for a real, unbounded window between FileOpen (which
+//--- truncates the existing file) and FileClose (once the new content is
+//--- fully written and flushed), the SAME filename the Python side
+//--- (trademind.mt5_risk_adapter) polls and reads concurrently can be
+//--- observed truncated, empty, or -- as directly reproduced on Windows --
+//--- zero-filled (162 bytes of 0x00, exactly the length of the header row
+//--- alone), because Windows/NTFS can make the file's new, extended length
+//--- visible to another process before the corresponding bytes have
+//--- actually been written. The Python reader correctly, deliberately
+//--- fails closed on that content ("missing fields: ...") -- it is not
+//--- being weakened by this fix; the write path is made atomic instead.
+//---
+//--- FIX: write the complete new snapshot to a TEMP filename first, flush
+//--- and close it there, then atomically replace the real filename in one
+//--- step via FileMove(...,FILE_REWRITE) -- the SAME rename-based
+//--- mechanism ReadAndConsumeRequest already uses above for the one-shot
+//--- request file, not a new/parallel snapshot path. A concurrent reader
+//--- of the REAL filename can now only ever see the complete PREVIOUS
+//--- snapshot or the complete NEW one -- never a partial, empty, or
+//--- zero-filled state.
 bool ExportPositionSnapshot()
 {
    string filename=RiskPositionsFilename();
+   string temp_filename=RiskPositionsTempFilename();
+
+   // Clear any stale temp file left over from a prior aborted write, so
+   // the temp file always starts clean.
+   if(FileIsExist(temp_filename,FILE_COMMON))
+      FileDelete(temp_filename,FILE_COMMON);
+
    int handle=FileOpen(
-      filename,
+      temp_filename,
       FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE,
       ','
    );
    if(handle==INVALID_HANDLE)
    {
-      PrintFormat("TradeMind demo executor: risk position file open failed for %s, error=%d",filename,GetLastError());
+      PrintFormat("TradeMind demo executor: risk position temp file open failed for %s, error=%d",temp_filename,GetLastError());
       ResetLastError();
       return false;
    }
 
+   // Header row is ALWAYS written, even with zero open positions -- a
+   // valid header-only CSV, never a zero-length or NUL-filled file.
    FileWrite(
       handle,
       "time_msc","account_login","server","currency","position_ticket","position_id","position_time_msc",
@@ -449,6 +501,17 @@ bool ExportPositionSnapshot()
 
    FileFlush(handle);
    FileClose(handle);
+
+   // Atomic replace -- the real filename only ever transitions directly
+   // from "previous complete snapshot" to "this complete snapshot".
+   if(!FileMove(temp_filename,FILE_COMMON,filename,FILE_COMMON|FILE_REWRITE))
+   {
+      PrintFormat("TradeMind demo executor: risk position atomic replace failed for %s, error=%d",filename,GetLastError());
+      ResetLastError();
+      FileDelete(temp_filename,FILE_COMMON);
+      return false;
+   }
+
    PrintFormat("TradeMind demo executor: risk snapshot account=%s open positions=%d",LoginText(),written);
    return true;
 }
