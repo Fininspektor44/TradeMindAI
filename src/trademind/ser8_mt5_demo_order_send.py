@@ -116,22 +116,42 @@ does not attempt it.
 PARTIAL EXECUTION (requirement 10): this module NEVER reports aggregate
 success unless every leg's own result_state is FILLED. The exact per-leg
 outcome is always persisted individually. ``SER8DemoOrderSendControl.send``
-distinguishes four aggregate outcomes:
+distinguishes five aggregate outcomes:
 
   * COMPLETE               -- every leg FILLED. Returned as a value (never
                                an exception).
+  * ACCEPTED_PENDING       -- every leg is either FILLED or a genuine,
+                               broker-ACCEPTED PENDING working LIMIT/STOP
+                               order (e.g. FILLED MARKET + PENDING LIMIT +
+                               PENDING LIMIT) -- never a failure, never
+                               ambiguous, just not yet complete. Raises
+                               :class:`SER8DemoOrderPendingError`. PENDING
+                               is never treated as FILLED (requirement 3);
+                               advancing a PENDING leg to a terminal state
+                               later requires
+                               :meth:`SER8DemoOrderSendControl.
+                               reconcile_pending_leg` with fresh,
+                               authoritative evidence (requirement 8) --
+                               never automatic, never a resend.
   * PARTIAL                -- at least one leg FILLED and at least one leg
-                               has a DEFINITE non-fill outcome, with no
+                               has a DEFINITE non-fill outcome (REJECTED/
+                               REQUOTE/PARTIAL_FILL/MALFORMED), with no
                                UNKNOWN among them. Raises
                                :class:`SER8DemoOrderPartialExecutionError`.
   * FAILED                 -- every attempted leg has a DEFINITE non-fill
-                               outcome (zero FILLED, zero UNKNOWN). Raises
+                               outcome (zero FILLED, zero PENDING, zero
+                               UNKNOWN). Raises
                                :class:`SER8DemoOrderRejectedError` (the
                                SAME exception type this module has always
                                raised for a single-leg non-fill -- for a
                                one-leg plan, FAILED and "the leg was
                                rejected" are the same thing).
-  * PENDING_RECONCILIATION -- at least one leg's outcome is UNKNOWN. Raises
+  * PENDING_RECONCILIATION -- at least one leg's outcome is UNKNOWN (the
+                               broker outcome was never even learned, e.g.
+                               a transport failure -- distinct from
+                               ACCEPTED_PENDING, where the outcome IS
+                               known: the broker accepted a working
+                               order). Raises
                                :class:`SER8DemoOrderReconciliationRequiredError`
                                (a subclass of the existing
                                :class:`SER8DemoOrderTransportError`, so
@@ -227,7 +247,18 @@ RESULT_CSV_FIELDS = (
     "order_ticket", "deal_ticket", "position_ticket", "filled_volume", "filled_price",
 )
 
-_TERMINAL_LEG_STATES = {"FILLED", "REJECTED", "REQUOTE", "PARTIAL_FILL", "MALFORMED", "UNKNOWN"}
+# FILLED/REJECTED/REQUOTE/PARTIAL_FILL/MALFORMED/CANCELLED are terminal --
+# a leg in one of these states is never touched again by this module.
+# PENDING and UNKNOWN are NOT terminal: PENDING means the broker genuinely
+# accepted a working LIMIT/STOP order that has not yet triggered (requires
+# reconcile_pending_leg + authoritative evidence to advance -- requirement
+# 8); UNKNOWN means the broker outcome itself was never learned (requires
+# manual reconciliation before this module will touch that leg again at
+# all). Both are still valid, recognized values for a persisted receipt's
+# own result_state.
+_TERMINAL_LEG_STATES = {"FILLED", "REJECTED", "REQUOTE", "PARTIAL_FILL", "MALFORMED", "CANCELLED"}
+_NONTERMINAL_LEG_STATES = {"PENDING", "UNKNOWN"}
+_RECOGNIZED_LEG_STATES = _TERMINAL_LEG_STATES | _NONTERMINAL_LEG_STATES
 
 
 class SER8DemoOrderSendError(RuntimeError):
@@ -277,6 +308,24 @@ class SER8DemoOrderPartialExecutionError(SER8DemoOrderRejectedError):
     subclass of :class:`SER8DemoOrderRejectedError` so this is never
     mistaken for a clean success by any caller catching that broader
     type."""
+
+
+class SER8DemoOrderPendingError(SER8DemoOrderSendError):
+    """Raised when the broker genuinely ACCEPTED an order (a real,
+    nonzero order_ticket) but it has not yet triggered a deal/fill --
+    result_state ``PENDING``, or aggregate_state ``ACCEPTED_PENDING`` for
+    a multi-leg plan. This is deliberately NOT a subclass of
+    :class:`SER8DemoOrderRejectedError` (nothing was rejected) and NOT a
+    subclass of :class:`SER8DemoOrderTransportError`/
+    :class:`SER8DemoOrderReconciliationRequiredError` (the broker outcome
+    is fully KNOWN, not unresolved) -- it is its own, third category, so a
+    caller can never mistake "the broker accepted this and it is working"
+    for either a failure or an unknown/ambiguous outcome (requirement 3:
+    do not pretend pending == filled, and equally do not pretend pending
+    == failed or pending == unknown). Advancing a PENDING leg to a
+    terminal state later requires
+    :meth:`SER8DemoOrderSendControl.reconcile_pending_leg` with fresh,
+    authoritative evidence -- never automatic, never a resend."""
 
 
 def _nonempty_str(value: object, *, field_name: str) -> str:
@@ -489,6 +538,31 @@ def build_demo_order_request(
     """
     return build_demo_order_leg_request(
         claim, decision, candidate, decision.orders[0], demo_authorization=demo_authorization, total_legs=1
+    )
+
+
+def _request_from_payload(payload: dict[str, object]) -> DemoOrderRequestV1:
+    """Reconstructs the immutable original request from its own persisted
+    JSON payload (never re-derived from caller-supplied objects) -- used
+    by :meth:`SER8DemoOrderSendControl.reconcile_pending_leg` so a
+    reconciliation call can never silently substitute a different volume/
+    price/symbol/order_type than what was actually sent."""
+    return DemoOrderRequestV1(
+        schema_version=payload["schema_version"],
+        parent_claim_id=payload["parent_claim_id"],
+        entry_index=payload["entry_index"],
+        claim_id=payload["claim_id"],
+        authorization_id=payload["authorization_id"],
+        demo_account_id=payload["demo_account_id"],
+        symbol=payload["symbol"],
+        action=payload["action"],
+        order_type=payload["order_type"],
+        volume=payload["volume"],
+        price=payload["price"],
+        sl=payload["sl"],
+        tp=payload["tp"],
+        magic=payload["magic"],
+        comment=payload["comment"],
     )
 
 
@@ -799,6 +873,29 @@ class FileBridgeDemoOrderTransport:
             return None
 
 
+def _has_ticket(value: str | None) -> bool:
+    """True iff ``value`` is a genuine, nonzero broker ticket string --
+    MT5 echoes an absent ticket as either an empty string or the literal
+    "0"; neither counts as a real ticket."""
+    text = (value or "").strip()
+    return text not in ("", "0")
+
+
+def _is_pending_placement(result: DemoOrderTransportResult) -> bool:
+    """True iff ``result`` describes a genuinely broker-ACCEPTED but not
+    yet triggered LIMIT/STOP order: the broker created a real order
+    (order_ticket present) but no deal or position exists yet (both
+    absent) and no fill price exists yet. Never true for a result that
+    also carries deal/position evidence -- that combination is ambiguous
+    and must fail closed as MALFORMED instead of being guessed at
+    (requirement 9)."""
+    has_order = _has_ticket(result.order_ticket)
+    has_deal = _has_ticket(result.deal_ticket)
+    has_position = _has_ticket(result.position_ticket)
+    no_fill_price = result.filled_price is None or result.filled_price <= 0
+    return has_order and not has_deal and not has_position and no_fill_price
+
+
 def _classify_result(request: DemoOrderRequestV1, result: DemoOrderTransportResult) -> str:
     if (
         result.claim_id != request.claim_id
@@ -810,6 +907,17 @@ def _classify_result(request: DemoOrderRequestV1, result: DemoOrderTransportResu
         return "REQUOTE"
     if result.retcode != _RETCODE_DONE:
         return "REJECTED"
+
+    # A genuinely PENDING (broker-accepted, not yet triggered) LIMIT/STOP
+    # order -- requirement 2. Real Windows evidence: retcode=10009 (DONE),
+    # order_ticket set, deal_ticket=0, position_ticket=0, filled_price=0.0
+    # (no fill has happened yet), filled_volume sometimes echoed as the
+    # PLACED (not filled) volume. This is impossible for a MARKET request
+    # (which either fills immediately or fails), so MARKET classification
+    # below is completely unaffected -- requirement 1.
+    if request.order_type != "MARKET" and _is_pending_placement(result):
+        return "PENDING"
+
     if result.filled_volume is None or result.filled_price is None:
         return "MALFORMED"
     if result.filled_volume <= 0 or result.filled_price <= 0:
@@ -871,7 +979,7 @@ class DemoOrderExecutionReceiptV1:
             _nonempty_str(value, field_name=field_name)
         if self.entry_index < 1:
             raise SER8DemoOrderSendError("entry_index must be >= 1")
-        if self.result_state not in _TERMINAL_LEG_STATES and self.result_state != "ATTEMPTING":
+        if self.result_state not in _RECOGNIZED_LEG_STATES and self.result_state != "ATTEMPTING":
             raise SER8DemoOrderSendError(f"unrecognized result_state: {self.result_state!r}")
         if type(self.recorded_at) is not str:
             raise SER8DemoOrderSendError("recorded_at must be a string")
@@ -960,7 +1068,9 @@ class DemoOrderExecutionPlanReceiptV1:
     leg_receipts: tuple[DemoOrderExecutionReceiptV1, ...]
 
     def __post_init__(self) -> None:
-        if self.aggregate_state not in {"COMPLETE", "PARTIAL", "FAILED", "PENDING_RECONCILIATION"}:
+        if self.aggregate_state not in {
+            "COMPLETE", "PARTIAL", "FAILED", "PENDING_RECONCILIATION", "ACCEPTED_PENDING",
+        }:
             raise SER8DemoOrderSendError(f"unrecognized aggregate_state: {self.aggregate_state!r}")
         if not self.leg_receipts:
             raise SER8DemoOrderSendError("an execution plan receipt must contain at least one leg receipt")
@@ -986,9 +1096,17 @@ def _aggregate_state(leg_receipts: list[DemoOrderExecutionReceiptV1], *, total_l
         # incomplete data.
         return "PENDING_RECONCILIATION"
     filled = sum(1 for receipt in leg_receipts if receipt.result_state == "FILLED")
+    pending = sum(1 for receipt in leg_receipts if receipt.result_state == "PENDING")
     if filled == total_legs:
         return "COMPLETE"
-    if filled == 0:
+    if filled + pending == total_legs:
+        # Every leg is either FILLED or a genuinely broker-ACCEPTED
+        # pending order -- e.g. FILLED MARKET + PENDING LIMIT + PENDING
+        # LIMIT (requirement 4). Never a failure and never ambiguous:
+        # distinct from PARTIAL, which means some legs definitely did NOT
+        # succeed.
+        return "ACCEPTED_PENDING"
+    if filled == 0 and pending == 0:
         return "FAILED"
     return "PARTIAL"
 
@@ -1186,6 +1304,113 @@ class SER8DemoOrderSendControl:
                 raise
         return receipt
 
+    def reconcile_pending_leg(
+        self,
+        leg_id: str,
+        *,
+        evidence: DemoOrderTransportResult | None = None,
+        cancelled: bool = False,
+        now: datetime | None = None,
+    ) -> DemoOrderExecutionReceiptV1:
+        """Advances ONE currently-PENDING leg to FILLED/REJECTED/REQUOTE/
+        MALFORMED/CANCELLED using ONLY fresh, authoritative broker evidence
+        supplied by the caller (requirement 8) -- NEVER auto-guessed, and
+        NEVER calls the transport (this is reconciliation, not a resend --
+        requirement 5/11). Exactly one of ``evidence`` (a freshly observed
+        :class:`DemoOrderTransportResult` for this SAME leg identity -- for
+        example a fresh read of the executor's own result CSV row, or a
+        result reconstructed from a genuine positions/deals lookup showing
+        the pending order has since filled) or ``cancelled=True`` (an
+        explicit, out-of-band confirmation -- e.g. the operator checked the
+        real MT5 terminal by hand and confirmed the pending order was
+        cancelled or expired) must be supplied.
+
+        Fails closed (requirement 9) if: no send attempt exists for this
+        leg identity at all; the attempt was never finalized (still
+        genuinely in-flight, not this method's concern); the leg's current
+        state is anything other than PENDING (this method never moves a
+        FILLED/REJECTED/REQUOTE/MALFORMED/UNKNOWN/CANCELLED leg -- once
+        terminal, always terminal, and PENDING is the only state this
+        method is willing to advance FROM); the persisted request payload
+        fails its own integrity check (receipt_hash/request_hash
+        recomputed and compared, never trusted at face value); or the
+        supplied evidence's own claim_id does not match this leg's wire
+        identity. If the supplied evidence still shows the order as
+        genuinely pending (nothing changed), this call is a harmless,
+        idempotent no-op that returns the unchanged current receipt --
+        never an error, since "still pending" is itself a legitimate,
+        expected outcome of checking.
+        """
+        if (evidence is None) == (not cancelled):
+            raise SER8DemoOrderSendError(
+                "reconcile_pending_leg requires exactly one of evidence= or cancelled=True"
+            )
+        captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg_id,)
+            ).fetchone()
+        if row is None:
+            raise SER8DemoOrderSendError(f"no existing send attempt found for leg {leg_id}; cannot reconcile")
+        if row["payload_json"] is None:
+            raise SER8DemoOrderSendError(
+                f"leg {leg_id} has a reserved but never-finalized attempt; cannot reconcile an in-flight send"
+            )
+        current = _receipt_from_payload(json.loads(row["payload_json"]))
+        if current.result_state != "PENDING":
+            raise SER8DemoOrderSendError(
+                f"leg {leg_id} is not PENDING (result_state={current.result_state!r}); refusing to reconcile"
+            )
+
+        request_payload = json.loads(row["request_json"])
+        original_request = _request_from_payload(request_payload)
+        if original_request.request_hash != request_payload.get("request_hash"):
+            raise SER8DemoOrderSendError(
+                f"persisted request payload for leg {leg_id} failed its own integrity check"
+            )
+
+        if cancelled:
+            new_state = "CANCELLED"
+            transport_result: DemoOrderTransportResult | None = None
+        else:
+            if evidence.claim_id != leg_id:
+                raise SER8DemoOrderSendError(
+                    f"reconciliation evidence claim_id {evidence.claim_id!r} does not match leg {leg_id!r}"
+                )
+            new_state = _classify_result(original_request, evidence)
+            if new_state == "PENDING":
+                # Still genuinely pending -- nothing authoritative changed;
+                # idempotent no-op, not an error.
+                return current
+            transport_result = evidence
+
+        return self._finalize(
+            claim_id=leg_id,
+            plan_id=current.plan_id,
+            parent_claim_id=current.parent_claim_id,
+            entry_index=current.entry_index,
+            authorization_id=current.authorization_id,
+            demo_gate_hash=current.demo_gate_hash,
+            request_hash=current.request_hash,
+            attempt_id=current.attempt_id,
+            result_state=new_state,
+            recorded_at=captured_at.isoformat(),
+            retcode=(transport_result.retcode if transport_result is not None else current.retcode),
+            retcode_description=(
+                transport_result.retcode_description if transport_result is not None else "CANCELLED_BY_RECONCILIATION"
+            ),
+            order_ticket=current.order_ticket,  # never invented/changed by reconciliation.
+            deal_ticket=(transport_result.deal_ticket if transport_result is not None else current.deal_ticket),
+            position_ticket=(
+                transport_result.position_ticket if transport_result is not None else current.position_ticket
+            ),
+            requested_volume=current.requested_volume,
+            requested_price=current.requested_price,
+            filled_volume=(transport_result.filled_volume if transport_result is not None else None),
+            filled_price=(transport_result.filled_price if transport_result is not None else None),
+        )
+
     def send(
         self,
         claim: ExecutionAuthorizationClaimV1,
@@ -1361,6 +1586,12 @@ class SER8DemoOrderSendControl:
                 raise SER8DemoOrderTransportError(
                     f"transport failed for claim {claim.claim_id}: leg result_state={solo.result_state}"
                 )
+            if aggregate_state == "ACCEPTED_PENDING":
+                raise SER8DemoOrderPendingError(
+                    f"order for claim {claim.claim_id} was accepted by the broker (order_ticket="
+                    f"{solo.order_ticket!r}) but has not yet triggered a fill; result_state=PENDING, "
+                    f"not FILLED and not a failure -- reconcile with fresh evidence once it resolves"
+                )
             raise SER8DemoOrderRejectedError(
                 f"order result for claim {claim.claim_id} was {solo.result_state}, not a clean fill"
             )
@@ -1383,6 +1614,12 @@ class SER8DemoOrderSendControl:
                 f"an UNKNOWN broker outcome; refusing to resend or continue further legs "
                 f"automatically -- manual reconciliation against the real MT5 account is required. "
                 f"leg states: {leg_states}"
+            )
+        if aggregate_state == "ACCEPTED_PENDING":
+            raise SER8DemoOrderPendingError(
+                f"execution plan {plan.plan_id} for claim {claim.claim_id} was fully accepted by the "
+                f"broker (every leg is FILLED or a genuine PENDING working order) but is not yet "
+                f"complete; leg states: {leg_states}"
             )
         if aggregate_state == "PARTIAL":
             raise SER8DemoOrderPartialExecutionError(
@@ -1412,6 +1649,7 @@ __all__ = [
     "FileBridgeDemoOrderTransport",
     "SER8DemoOrderAlreadyAttemptedError",
     "SER8DemoOrderPartialExecutionError",
+    "SER8DemoOrderPendingError",
     "SER8DemoOrderReconciliationRequiredError",
     "SER8DemoOrderRejectedError",
     "SER8DemoOrderSendControl",

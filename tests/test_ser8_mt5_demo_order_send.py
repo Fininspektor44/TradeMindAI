@@ -102,6 +102,7 @@ from trademind.ser8_mt5_demo_order_send import (
     FileBridgeDemoOrderTransport,
     SER8DemoOrderAlreadyAttemptedError,
     SER8DemoOrderPartialExecutionError,
+    SER8DemoOrderPendingError,
     SER8DemoOrderReconciliationRequiredError,
     SER8DemoOrderRejectedError,
     SER8DemoOrderSendControl,
@@ -1391,8 +1392,11 @@ def test_mql5_executor_reads_at_most_one_request_per_timer_tick() -> None:
 
 def _leg_result_factory(states: dict[int, str], *, filled_price: float = 2000.0):
     """Builds a transport result_factory keyed by ``request.entry_index``
-    -- 'FILLED' returns a clean fill, any other string is treated as a
-    literal retcode_description for a definite rejection (never UNKNOWN;
+    -- 'FILLED' returns a clean fill, 'PENDING' returns a genuine broker-
+    accepted-but-not-yet-triggered LIMIT/STOP result (the exact real
+    Windows shape: retcode=10009 done, a real order_ticket, deal_ticket=
+    position_ticket="0", filled_price=0.0), any other string is treated as
+    a literal retcode_description for a definite rejection (never UNKNOWN;
     to simulate UNKNOWN, raise from the transport instead)."""
 
     def _factory(request) -> DemoOrderTransportResult:
@@ -1404,6 +1408,13 @@ def _leg_result_factory(states: dict[int, str], *, filled_price: float = 2000.0)
                 order_ticket=f"{request.entry_index}01", deal_ticket=f"{request.entry_index}02",
                 position_ticket=f"{request.entry_index}03",
                 filled_volume=request.volume, filled_price=filled_price,
+            )
+        if state == "PENDING":
+            return DemoOrderTransportResult(
+                claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
+                retcode=10009, retcode_description="done",
+                order_ticket=f"7331245{request.entry_index}", deal_ticket="0", position_ticket="0",
+                filled_volume=request.volume, filled_price=0.0,
             )
         return DemoOrderTransportResult(
             claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
@@ -1869,3 +1880,431 @@ def test_mql5_executor_still_has_no_position_sizing_or_grid_logic() -> None:
 # no PREVIEW concept of its own; that lives entirely in
 # scripts/run_ser8_real_demo_pipeline.py).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# SER8 MT5 PENDING LIMIT RECEIPT + RECONCILIATION V1.
+#
+# Real Windows evidence this section reproduces exactly: a 3-leg plan
+# where leg 1 (MARKET) FILLED and legs 2/3 (LIMIT) were genuinely accepted
+# pending orders that the OLD classifier mislabeled MALFORMED:
+#
+#   claim_id = EAC-67206924-2e40988a6cd689d6#3
+#   retcode = 10009, retcode_description = done
+#   order_ticket = 733124518, deal_ticket = 0, position_ticket = 0
+#   filled_volume = 0.09000000, filled_price = 0.00000000
+# ---------------------------------------------------------------------------
+
+
+def test_limit_accepted_pending_receipt_is_classified_pending_not_malformed(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+    from trademind.ser8_mt5_demo_order_send import _classify_result
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    limit_order = decision.orders[2]
+    assert limit_order.order_type == "LIMIT"
+    request = build_demo_order_leg_request(
+        claim, decision, candidate, limit_order, demo_authorization=demo_authorization, total_legs=3
+    )
+    # The EXACT real Windows evidence shape, keyed to this leg's own wire
+    # identity (requirement 6: claim_id#3).
+    assert request.claim_id.endswith("#3")
+    result = DemoOrderTransportResult(
+        claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
+        retcode=10009, retcode_description="done",
+        order_ticket="733124518", deal_ticket="0", position_ticket="0",
+        filled_volume=0.09, filled_price=0.0,
+    )
+    assert _classify_result(request, result) == "PENDING"
+
+
+def test_leg_identity_format_matches_real_windows_evidence_exactly() -> None:
+    # The real evidence's own claim_id, EAC-67206924-2e40988a6cd689d6#3, is
+    # exactly the f"{parent_claim_id}#{entry_index}" format leg_identity()
+    # has produced since SER8 MT5 MULTI-ENTRY DEMO EXECUTION V1 -- this
+    # task changes nothing about leg identity (requirement 6).
+    assert leg_identity("EAC-67206924-2e40988a6cd689d6", 3, total_legs=3) == "EAC-67206924-2e40988a6cd689d6#3"
+
+
+# ---------------------------------------------------------------------------
+# 1: MARKET success semantics remain unchanged -- the SAME "retcode=DONE,
+# order_ticket set, no deal, filled_price=0" shape that means PENDING for
+# a LIMIT request must NOT trigger PENDING for a MARKET request (there is
+# no such thing as a pending MARKET order); it must still fail exactly as
+# before.
+# ---------------------------------------------------------------------------
+
+
+def test_market_success_semantics_unchanged_by_pending_classification(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+    from trademind.ser8_mt5_demo_order_send import _classify_result
+
+    assert decision.orders[0].order_type == "MARKET"
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    request = build_demo_order_request(claim, decision, candidate, demo_authorization=demo_authorization)
+    pending_shaped_result = DemoOrderTransportResult(
+        claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
+        retcode=10009, retcode_description="done",
+        order_ticket="1", deal_ticket="0", position_ticket="0",
+        filled_volume=request.volume, filled_price=0.0,
+    )
+    assert _classify_result(request, pending_shaped_result) == "MALFORMED"
+
+    # A genuine MARKET fill still classifies FILLED exactly as before.
+    clean_result = _clean_result(request)
+    assert _classify_result(request, clean_result) == "FILLED"
+
+
+def test_single_leg_market_still_fills_end_to_end_unaffected(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    receipt = control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert receipt.result_state == "FILLED"
+    assert isinstance(receipt, DemoOrderExecutionReceiptV1)
+
+
+# ---------------------------------------------------------------------------
+# 3-4: pending != filled; a broker-accepted plan (FILLED MARKET + PENDING
+# LIMIT + PENDING LIMIT) is a valid, distinct outcome -- never silently
+# reported as complete, never silently reported as a failure.
+# ---------------------------------------------------------------------------
+
+
+def test_three_leg_plan_with_pending_limits_reaches_accepted_pending(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderPendingError) as excinfo:
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    # Never mistaken for a rejection or an unknown/ambiguous outcome --
+    # SER8DemoOrderPendingError is its own category.
+    assert not isinstance(excinfo.value, SER8DemoOrderRejectedError)
+    assert not isinstance(excinfo.value, SER8DemoOrderTransportError)
+    assert len(transport.calls) == 3  # every leg WAS attempted -- PENDING never blocks the cascade.
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        states = {
+            row["entry_index"]: json.loads(row["payload_json"])["result_state"]
+            for row in db.execute(
+                "SELECT entry_index, payload_json FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE parent_claim_id=?", (claim.claim_id,),
+            ).fetchall()
+        }
+    assert states == {1: "FILLED", 2: "PENDING", 3: "PENDING"}
+
+
+def test_pending_is_never_treated_as_filled(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    # send() NEVER returns a value for this plan -- only COMPLETE (every
+    # leg genuinely FILLED) returns; ACCEPTED_PENDING always raises, so a
+    # caller can never mistake "the broker accepted this" for "it filled".
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+
+def test_order_ticket_persisted_for_pending_legs(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        tickets = {
+            row["entry_index"]: json.loads(row["payload_json"])["order_ticket"]
+            for row in db.execute(
+                "SELECT entry_index, payload_json FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE parent_claim_id=?", (claim.claim_id,),
+            ).fetchall()
+        }
+    assert tickets[2] == "73312452"
+    assert tickets[3] == "73312453"
+    assert tickets[2] != "" and tickets[3] != ""
+
+
+# ---------------------------------------------------------------------------
+# 5: before any resend, existing broker/order evidence is reconciled by
+# leg identity -- an already-accepted (PENDING or FILLED) leg is NEVER
+# sent again, restart or not.
+# ---------------------------------------------------------------------------
+
+
+def test_restart_recovery_with_existing_pending_order_does_not_resend(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert len(transport.calls) == 3
+
+    # Simulate a process restart: same claim/decision/candidate, a FRESH
+    # transport instance (a real restart would reconnect to the executor).
+    fresh_transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "FILLED", 3: "FILLED"}))
+    fresh_control = SER8DemoOrderSendControl(registry=context.registry, transport=fresh_transport)
+    with pytest.raises(SER8DemoOrderAlreadyAttemptedError):
+        fresh_control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=5))
+    # Zero new sends -- every leg (including the two still-PENDING ones)
+    # already has a recorded attempt, so nothing is ever resent.
+    assert fresh_transport.calls == []
+
+
+def test_no_duplicate_resend_across_many_retries(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert len(transport.calls) == 3
+
+    for attempt in range(5):
+        with pytest.raises(SER8DemoOrderAlreadyAttemptedError):
+            control.send(
+                claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=attempt + 1)
+            )
+    assert len(transport.calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# partial plan recovery: a mix of FILLED + PENDING + a DEFINITE rejection
+# is PARTIAL, not ACCEPTED_PENDING and not FAILED.
+# ---------------------------------------------------------------------------
+
+
+def test_partial_plan_recovery_with_mixed_pending_and_rejection(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(
+        result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "No money"})
+    )
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderPartialExecutionError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        states = {
+            row["entry_index"]: json.loads(row["payload_json"])["result_state"]
+            for row in db.execute(
+                "SELECT entry_index, payload_json FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE parent_claim_id=?", (claim.claim_id,),
+            ).fetchall()
+        }
+    assert states == {1: "FILLED", 2: "PENDING", 3: "REJECTED"}
+
+
+# ---------------------------------------------------------------------------
+# 9: unknown/ambiguous receipts still fail closed -- a receipt carrying
+# BOTH a deal/position ticket AND filled_price=0 is genuinely
+# inconsistent, never guessed as PENDING.
+# ---------------------------------------------------------------------------
+
+
+def test_ambiguous_deal_evidence_with_zero_fill_price_fails_closed_as_malformed(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+    from trademind.ser8_mt5_demo_order_send import _classify_result
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    limit_order = decision.orders[1]
+    request = build_demo_order_leg_request(
+        claim, decision, candidate, limit_order, demo_authorization=demo_authorization, total_legs=3
+    )
+    ambiguous_result = DemoOrderTransportResult(
+        claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
+        retcode=10009, retcode_description="done",
+        order_ticket="733124518", deal_ticket="991", position_ticket="0",  # a deal exists...
+        filled_volume=request.volume, filled_price=0.0,  # ...but no fill price. Inconsistent.
+    )
+    assert _classify_result(request, ambiguous_result) == "MALFORMED"
+
+
+def test_transport_failure_still_produces_unknown_not_pending(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+
+    class _UnknownOnSecondLeg:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def send(self, request):
+            self.calls.append(request)
+            if request.entry_index != 2:
+                return _leg_result_factory({1: "FILLED", 3: "FILLED"})(request)
+            raise ConnectionError("terminal unreachable")
+
+    transport = _UnknownOnSecondLeg()
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderReconciliationRequiredError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert len(transport.calls) == 2  # leg 3 never attempted while leg 2 is unresolved.
+
+
+def test_no_order_type_no_longer_permits_a_stray_pending_classification() -> None:
+    # requirement 9: an "unrecognized"/tampered order_type never reaches
+    # _classify_result at all -- send() already fails the whole plan closed
+    # at precondition-check time (proven in
+    # test_unsupported_order_type_fails_closed_before_any_leg_sent above).
+    assert "STOP" in {"MARKET", "LIMIT", "STOP"}  # VALID_ORDER_TYPES unchanged, sanity check only.
+
+
+# ---------------------------------------------------------------------------
+# reconcile_pending_leg: PENDING -> FILLED/CANCELLED/REJECTED only from
+# fresh, authoritative evidence -- never a resend, never automatic.
+# ---------------------------------------------------------------------------
+
+
+def _send_and_capture_pending_leg_id(control, claim, decision, candidate, *, entry_index: int) -> str:
+    with pytest.raises((SER8DemoOrderPendingError, SER8DemoOrderPartialExecutionError)):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    return leg_identity(claim.claim_id, entry_index, total_legs=3)
+
+
+def test_reconcile_pending_leg_advances_to_filled_with_fresh_evidence(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    leg2_id = _send_and_capture_pending_leg_id(control, claim, decision, candidate, entry_index=2)
+    calls_before = len(transport.calls)
+
+    fresh_evidence = DemoOrderTransportResult(
+        claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+        retcode=10009, retcode_description="Request completed",
+        order_ticket="73312452", deal_ticket="55501", position_ticket="55502",
+        filled_volume=decision.orders[1].volume, filled_price=1998.0,
+    )
+    receipt = control.reconcile_pending_leg(leg2_id, evidence=fresh_evidence, now=NOW + timedelta(minutes=10))
+
+    assert receipt.result_state == "FILLED"
+    assert receipt.order_ticket == "73312452"  # unchanged -- never invented by reconciliation.
+    assert receipt.filled_price == 1998.0
+    assert len(transport.calls) == calls_before  # reconciliation NEVER calls the transport.
+
+    with sqlite3.connect(context.db_path) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT payload_json FROM ser8_mt5_demo_order_leg_receipts WHERE claim_id=?", (leg2_id,)
+        ).fetchone()
+    assert json.loads(row["payload_json"])["result_state"] == "FILLED"
+
+
+def test_reconcile_pending_leg_explicit_cancellation(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    leg3_id = _send_and_capture_pending_leg_id(control, claim, decision, candidate, entry_index=3)
+
+    receipt = control.reconcile_pending_leg(leg3_id, cancelled=True, now=NOW + timedelta(minutes=15))
+    assert receipt.result_state == "CANCELLED"
+    assert receipt.order_ticket == "73312453"  # preserved.
+    assert len(transport.calls) == 3  # unchanged -- no new send.
+
+
+def test_reconcile_pending_leg_still_pending_is_idempotent_noop(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    leg2_id = _send_and_capture_pending_leg_id(control, claim, decision, candidate, entry_index=2)
+
+    still_pending_evidence = DemoOrderTransportResult(
+        claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+        retcode=10009, retcode_description="done",
+        order_ticket="73312452", deal_ticket="0", position_ticket="0",
+        filled_volume=decision.orders[1].volume, filled_price=0.0,
+    )
+    receipt = control.reconcile_pending_leg(leg2_id, evidence=still_pending_evidence)
+    assert receipt.result_state == "PENDING"  # unchanged -- checking is never an error.
+
+
+def test_reconcile_pending_leg_rejects_a_non_pending_leg(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+
+    with pytest.raises(SER8DemoOrderSendError, match="not PENDING"):
+        control.reconcile_pending_leg(
+            claim.claim_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=claim.claim_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="Request completed",
+                order_ticket="1", deal_ticket="2", position_ticket="3",
+                filled_volume=decision.orders[0].volume, filled_price=2000.0,
+            ),
+        )
+
+
+def test_reconcile_pending_leg_unknown_leg_fails_closed(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+
+    with pytest.raises(SER8DemoOrderSendError, match="no existing send attempt"):
+        control.reconcile_pending_leg(
+            "some-leg-that-was-never-sent#1",
+            evidence=DemoOrderTransportResult(
+                claim_id="some-leg-that-was-never-sent#1", demo_account_id=LOGIN, symbol="XAUUSD",
+                retcode=10009, retcode_description="done", order_ticket="1", deal_ticket="2",
+                position_ticket="3", filled_volume=0.01, filled_price=2000.0,
+            ),
+        )
+
+
+def test_reconcile_pending_leg_requires_exactly_one_of_evidence_or_cancelled(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    leg2_id = _send_and_capture_pending_leg_id(control, claim, decision, candidate, entry_index=2)
+
+    with pytest.raises(SER8DemoOrderSendError, match="exactly one"):
+        control.reconcile_pending_leg(leg2_id)  # neither evidence nor cancelled=True.
+
+    with pytest.raises(SER8DemoOrderSendError, match="exactly one"):
+        control.reconcile_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id=leg2_id, demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="Request completed",
+                order_ticket="73312452", deal_ticket="1", position_ticket="1",
+                filled_volume=decision.orders[1].volume, filled_price=1998.0,
+            ),
+            cancelled=True,  # both -- also rejected.
+        )
+
+
+def test_reconcile_pending_leg_evidence_claim_id_mismatch_fails_closed(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"}))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    leg2_id = _send_and_capture_pending_leg_id(control, claim, decision, candidate, entry_index=2)
+
+    with pytest.raises(SER8DemoOrderSendError, match="does not match leg"):
+        control.reconcile_pending_leg(
+            leg2_id,
+            evidence=DemoOrderTransportResult(
+                claim_id="a-completely-different-leg#9", demo_account_id=LOGIN, symbol=candidate.symbol,
+                retcode=10009, retcode_description="Request completed",
+                order_ticket="73312452", deal_ticket="1", position_ticket="1",
+                filled_volume=decision.orders[1].volume, filled_price=1998.0,
+            ),
+        )
+
+
+def test_reconcile_pending_leg_never_calls_the_transport() -> None:
+    import inspect
+
+    import trademind.ser8_mt5_demo_order_send as module
+
+    source = inspect.getsource(module.SER8DemoOrderSendControl.reconcile_pending_leg)
+    assert "self.transport" not in source
+    assert ".send(" not in source

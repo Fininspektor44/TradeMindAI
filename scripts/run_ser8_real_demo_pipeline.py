@@ -184,6 +184,7 @@ from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
     DemoOrderExecutionPlanReceiptV1,
     DemoOrderTransport,
     FileBridgeDemoOrderTransport,
+    SER8DemoOrderPendingError,
     SER8DemoOrderSendControl,
     SER8DemoOrderSendError,
     build_demo_order_execution_plan,
@@ -869,6 +870,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
     except PipelineGapError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    except SER8DemoOrderPendingError as exc:
+        # Not a denial: the broker genuinely ACCEPTED the order(s) -- a
+        # real, nonzero order_ticket exists -- it just has not triggered a
+        # fill yet (a working LIMIT/STOP order). Never printed as "denied"
+        # and never exit code 0 either, since nothing is complete yet;
+        # reconciling to a terminal state later requires
+        # SER8DemoOrderSendControl.reconcile_pending_leg with fresh,
+        # authoritative broker evidence.
+        print("SER8 REAL DEMO PIPELINE -- ORDER ACCEPTED, PENDING (NOT YET FILLED)", file=sys.stderr)
+        print(str(exc), file=sys.stderr)
+        return 6
     except (
         ResearchEligibilityError,
         HypothesisTradeableScopeError,
