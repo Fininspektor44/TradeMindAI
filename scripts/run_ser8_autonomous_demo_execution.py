@@ -87,17 +87,31 @@ closed authorization/claim/send layers:
     the task's own audit question: NO new authorization-cleanup
     mechanism is needed; the existing TTL is sufficient, and the worker
     only needs to fail closed on conflict rather than invent a bypass.
-  * ``resume_plan`` re-checks the SAME claim-staleness bound
-    (``DEFAULT_MAXIMUM_CLAIM_AGE_SECONDS`` = 60s from the ORIGINAL
-    ``claimed_at``) a fresh ``send`` call would -- resuming a plan whose
-    claim has gone stale fails closed exactly like sending fresh legs
-    under it would, never silently exempted. In practice this means
-    resume is reliable within roughly the same scheduler tick as the
-    crash (the worker's default 1-minute cadence); a restart beyond that
-    window leaves the plan stalled at whatever legs were already
-    attempted -- an explicit, visible (via this script's own
-    observability line), fail-closed outcome, never a bypass of an
-    already-established freshness invariant.
+  * DURABLE RESUME AUTHORITY (SER8 DURABLE PARTIAL PLAN RESUME CONTRACT
+    V1): ``resume_plan`` does NOT re-check the ORIGINAL claim's own
+    60-second freshness bound (``DEFAULT_MAXIMUM_CLAIM_AGE_SECONDS``) --
+    that bound governs ONLY the moment a plan is first created (see
+    requirement A below). Reusing an old claim to resume an existing
+    plan is proof a durably-authorized plan exists, not "the claim
+    presented as freshly valid again". Instead, EVERY plan persists its
+    own bounded ``resume_until`` deadline at creation time -- the
+    minimum of the ORIGINAL authorization's own ``expires_at`` (never
+    extended beyond it) and the standing, never-weakened 900-second
+    signal-freshness ceiling measured from the candidate's own
+    ``created_at``. A restart within that window resumes cleanly,
+    regardless of how many scheduler ticks the machine was unavailable
+    for. A restart AFTER that window reports ``RESUME_WINDOW_EXPIRED``
+    -- fail closed, zero sends, permanently, until a human reviews it;
+    the window is never silently renewed by a retry. A plan built
+    without an authorization supplied to ``send`` (only possible via the
+    legacy single-shot pipeline, never this worker) carries no durable
+    resume authority at all and can never be resumed.
+
+    A. INITIAL CLAIM USE remains completely unchanged: the FIRST time a
+       plan is persisted for a candidate, ``send()`` still requires
+       RiskDecision + authorization + claim, the claim must still be
+       <= 60 seconds old, and the demo account gate still applies --
+       none of that is weakened by durable resume existing.
 
 DRY-RUN: performs candidate selection, eligibility, and risk evaluation
 exactly like a real cycle, and previews the plan Risk Manager WOULD
@@ -189,6 +203,7 @@ from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
     SER8DemoOrderPendingError,
     SER8DemoOrderReconciliationRequiredError,
     SER8DemoOrderRejectedError,
+    SER8DemoOrderResumeWindowExpiredError,
     SER8DemoOrderSendControl,
     SER8DemoOrderSendError,
     build_demo_order_execution_plan,
@@ -265,6 +280,9 @@ class CycleSummary:
         self.pending = 0
         self.filled = 0
         self.terminal_failures = 0
+        self.unknown_legs = 0
+        self.unattempted_legs = 0
+        self.resume_until = "-"
         self.outcomes_ingested = 0
         self.broker_sends_this_cycle = 0
         self.cycle_status = "NO_ACTION"
@@ -276,26 +294,34 @@ class CycleSummary:
             f"candidate_id={self.candidate_id} candidate_status={self.candidate_status} "
             f"risk_state={self.risk_state} risk_block_reason={self.risk_block_reason} "
             f"authorization_id={self.authorization_id} claim_id={self.claim_id} "
-            f"execution_plan_id={self.execution_plan_id} legs_total={self.legs_total} "
-            f"legs_newly_submitted={self.legs_newly_submitted} legs_existing={self.legs_existing} "
-            f"pending={self.pending} filled={self.filled} terminal_failures={self.terminal_failures} "
+            f"execution_plan_id={self.execution_plan_id} resume_until={self.resume_until} "
+            f"legs_total={self.legs_total} legs_newly_submitted={self.legs_newly_submitted} "
+            f"legs_existing={self.legs_existing} pending={self.pending} filled={self.filled} "
+            f"terminal_failures={self.terminal_failures} unattempted_legs={self.unattempted_legs} "
             f"outcomes_ingested={self.outcomes_ingested} broker_sends_this_cycle={self.broker_sends_this_cycle} "
             f"cycle_status={self.cycle_status}"
         )
 
 
-def _observe_claim_legs(send_control: SER8DemoOrderSendControl, claim_id: str, summary: CycleSummary) -> None:
+def _observe_claim_legs(
+    send_control: SER8DemoOrderSendControl, claim_id: str, summary: CycleSummary, *, total_legs: int,
+) -> None:
     """Recomputes every leg-state count on ``summary`` from scratch --
     idempotent regardless of how many times it is called for the same
     cycle (e.g. once before a resume attempt to size the observation, and
     again after -- see ``_execute_and_observe``'s own call), never
-    accumulating across calls."""
+    accumulating across calls. ``total_legs`` is the PLAN's own total leg
+    count -- ``list_leg_ids_for_claim`` only returns legs that already
+    have a send-attempt row, so it alone cannot reveal how many legs were
+    never attempted at all; ``unattempted_legs`` is derived from the
+    difference."""
     leg_ids = send_control.list_leg_ids_for_claim(claim_id)
-    summary.legs_total = len(leg_ids)
+    summary.legs_total = total_legs
     summary.legs_existing = len(leg_ids)
     summary.filled = 0
     summary.pending = 0
     summary.terminal_failures = 0
+    summary.unknown_legs = 0
     for leg_id in leg_ids:
         receipt = send_control.get_leg_receipt(leg_id)
         if receipt is None:
@@ -304,8 +330,11 @@ def _observe_claim_legs(send_control: SER8DemoOrderSendControl, claim_id: str, s
             summary.filled += 1
         elif receipt.result_state == "PENDING":
             summary.pending += 1
-        elif receipt.result_state != "UNKNOWN":
+        elif receipt.result_state == "UNKNOWN":
+            summary.unknown_legs += 1
+        else:
             summary.terminal_failures += 1
+    summary.unattempted_legs = total_legs - len(leg_ids)
 
 
 def _execute_and_observe(
@@ -314,23 +343,31 @@ def _execute_and_observe(
     claim: ExecutionAuthorizationClaimV1,
     summary: CycleSummary,
     action: Callable[[], object],
+    total_legs: int,
+    success_status: str,
 ) -> None:
     """Shared exception-handling/observability tail for BOTH a fresh
     ``send()`` call and a ``resume_plan()`` call -- ``action`` is a
-    zero-argument callable performing exactly one of the two. Both raise
-    the SAME exception types for the SAME aggregate outcomes (see
-    ``SER8DemoOrderSendControl._resolve_plan_outcome``), so this single
-    handler is correct for either, and counts actual NEW broker sends via
-    a before/after leg-id diff -- never assumed from the exception type
-    alone."""
+    zero-argument callable performing exactly one of the two.
+    ``success_status`` distinguishes ``EXECUTION_COMPLETE`` (a brand-new
+    plan, freshly sent) from ``EXECUTION_RESUMED`` (an existing plan's
+    remaining legs, continued) -- the underlying aggregate-outcome
+    exception types raised are otherwise identical for either entrypoint
+    (see ``SER8DemoOrderSendControl._resolve_plan_outcome``), so this
+    single handler is correct for both, and counts actual NEW broker
+    sends via a before/after leg-id diff -- never assumed from the
+    exception type alone."""
     pre_leg_ids = set(real_send_control.list_leg_ids_for_claim(claim.claim_id))
     try:
         action()
-        summary.cycle_status = "EXECUTION_COMPLETE"
+        summary.cycle_status = success_status
     except SER8DemoOrderPendingError:
         summary.cycle_status = "EXECUTION_PENDING"
     except SER8DemoOrderReconciliationRequiredError as exc:
         summary.cycle_status = "EXECUTION_PENDING_RECONCILIATION"
+        summary.risk_block_reason = str(exc)
+    except SER8DemoOrderResumeWindowExpiredError as exc:
+        summary.cycle_status = "RESUME_WINDOW_EXPIRED"
         summary.risk_block_reason = str(exc)
     except SER8DemoOrderPartialExecutionError as exc:
         summary.cycle_status = "EXECUTION_PARTIAL"
@@ -345,7 +382,7 @@ def _execute_and_observe(
         summary.risk_block_reason = str(exc)
     post_leg_ids = set(real_send_control.list_leg_ids_for_claim(claim.claim_id))
     summary.broker_sends_this_cycle = len(post_leg_ids - pre_leg_ids)
-    _observe_claim_legs(real_send_control, claim.claim_id, summary)
+    _observe_claim_legs(real_send_control, claim.claim_id, summary, total_legs=total_legs)
     summary.legs_newly_submitted = summary.broker_sends_this_cycle
 
 
@@ -484,6 +521,7 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
         summary.claim_id = plan.claim_id
         summary.execution_plan_id = plan.plan_id
         summary.authorization_id = plan.authorization_id
+        summary.resume_until = plan.resume_until or "-"
         leg_ids = send_control.list_leg_ids_for_claim(plan.claim_id)
         receipts = {leg_id: send_control.get_leg_receipt(leg_id) for leg_id in leg_ids}
         fully_attempted = len(leg_ids) == len(plan.legs) and all(r is not None for r in receipts.values())
@@ -491,7 +529,7 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
         if fully_attempted:
             summary.candidate_status = "ALREADY_PROCESSED"
             summary.cycle_status = "ALREADY_PROCESSED"
-            _observe_claim_legs(send_control, plan.claim_id, summary)
+            _observe_claim_legs(send_control, plan.claim_id, summary, total_legs=len(plan.legs))
             summary.outcomes_ingested = _capture_outcomes_report_only(
                 outcome_control=outcome_control, send_control=send_control,
                 authorization_control=authorization_control, account=args.account, deals_csv=deals_csv, now=now,
@@ -499,11 +537,13 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
             return summary
 
         # Some legs are genuinely unattempted -- resumable through
-        # resume_plan ONLY. resume_plan is a REAL send-capable operation
-        # (it may call the transport for the remaining legs), so
-        # --dry-run must report this state WITHOUT ever reaching it.
+        # resume_plan ONLY, governed by the plan's own durable
+        # resume_until (see this script's own module docstring).
+        # resume_plan is a REAL send-capable operation (it may call the
+        # transport for the remaining legs), so --dry-run must report
+        # this state WITHOUT ever reaching it.
         summary.candidate_status = "RESUMABLE"
-        _observe_claim_legs(send_control, plan.claim_id, summary)
+        _observe_claim_legs(send_control, plan.claim_id, summary, total_legs=len(plan.legs))
         if args.dry_run:
             summary.cycle_status = "DRY_RUN_WOULD_RESUME"
             return summary
@@ -527,6 +567,7 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
         _execute_and_observe(
             real_send_control=real_send_control, claim=claim, summary=summary,
             action=lambda: real_send_control.resume_plan(claim, allowlist=allowlist, now=now),
+            total_legs=len(plan.legs), success_status="EXECUTION_RESUMED",
         )
         summary.outcomes_ingested = _capture_outcomes_report_only(
             outcome_control=outcome_control, send_control=real_send_control,
@@ -614,12 +655,19 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
         return summary
 
     # Pure, side-effect-free -- the SAME deterministic builder ``send``
-    # itself uses -- computed here only so ``execution_plan_id`` is
-    # reported even if ``send`` below raises before returning a receipt
-    # (the plan itself is still persisted by ``send`` before any leg is
-    # attempted, so this id is authoritative either way).
-    planned = build_demo_order_execution_plan(claim, result.decision, candidate, demo_authorization=demo_authorization)
+    # itself uses -- computed here only so ``execution_plan_id``/
+    # ``resume_until`` are reported even if ``send`` below raises before
+    # returning a receipt (the plan itself is still persisted by ``send``
+    # before any leg is attempted, so these are authoritative either
+    # way). Supplying ``authorization`` here is what gives this plan a
+    # durable resume_until at all (see this script's own module
+    # docstring) -- omitting it would silently make this candidate's
+    # plan unresumable if a later crash left legs unattempted.
+    planned = build_demo_order_execution_plan(
+        claim, result.decision, candidate, demo_authorization=demo_authorization, authorization=authorization,
+    )
     summary.execution_plan_id = planned.plan_id
+    summary.resume_until = planned.resume_until or "-"
 
     common_files_dir = Path(args.common_files_dir).expanduser()
     real_transport = FileBridgeDemoOrderTransport(
@@ -630,7 +678,10 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
 
     _execute_and_observe(
         real_send_control=real_send_control, claim=claim, summary=summary,
-        action=lambda: real_send_control.send(claim, result.decision, candidate, allowlist=allowlist, now=now),
+        action=lambda: real_send_control.send(
+            claim, result.decision, candidate, allowlist=allowlist, authorization=authorization, now=now,
+        ),
+        total_legs=len(result.decision.orders), success_status="EXECUTION_COMPLETE",
     )
 
     summary.outcomes_ingested = _capture_outcomes_report_only(
@@ -643,9 +694,13 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
 def _cycle_exit_code(cycle_status: str) -> int:
     if cycle_status in (
         "NO_ELIGIBLE_CANDIDATE", "RISK_BLOCK", "ALREADY_PROCESSED", "EXECUTION_COMPLETE",
-        "EXECUTION_PENDING", "DRY_RUN_WOULD_EXECUTE", "DRY_RUN_WOULD_RESUME",
+        "EXECUTION_RESUMED", "EXECUTION_PENDING", "DRY_RUN_WOULD_EXECUTE", "DRY_RUN_WOULD_RESUME",
     ):
         return 0
+    # RESUME_WINDOW_EXPIRED and every FAIL_CLOSED_* status are reported
+    # here as non-zero -- expected, self-explaining, non-crash outcomes
+    # that still deserve operator attention, exactly like the existing
+    # FAIL_CLOSED_* family.
     return 1
 
 

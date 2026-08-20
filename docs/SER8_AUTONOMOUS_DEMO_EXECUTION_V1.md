@@ -46,13 +46,31 @@ Each cycle:
    `SER8DemoOrderSendControl.resume_plan` — the ONLY authoritative way to
    continue an existing plan, using EXCLUSIVELY the plan's own frozen leg
    data, never a freshly re-evaluated `RiskDecision` — which re-verifies
-   the demo account gate and claim staleness exactly as a fresh `send`
-   call would, reloads the SAME already-persisted claim (never
-   re-claims), and attempts only the genuinely unattempted legs. An
+   the demo account gate and attempts only the genuinely unattempted
+   legs, reloading the SAME already-persisted claim (never re-claims). An
    UNKNOWN leg still blocks every leg after it, exactly like `send`
    itself. `--dry-run` never reaches `resume_plan` (a real send-capable
    operation) — it reports `DRY_RUN_WOULD_RESUME` instead, with zero
    broker sends.
+
+   **DURABLE PARTIAL PLAN RESUME (SER8 DURABLE PARTIAL PLAN RESUME
+   CONTRACT V1)**: `resume_plan` deliberately does NOT re-check the
+   claim's own initial 60-second freshness bound — that bound governs
+   ONLY the moment a plan is first created. Reusing an old claim to
+   resume an already-persisted plan is not "the claim presented as
+   freshly valid again"; it is proof that a durably-authorized plan
+   already exists. Instead, every plan persists its own bounded
+   `resume_until` deadline at creation time — the minimum of the
+   ORIGINAL authorization's own `expires_at` (never extended beyond it)
+   and the standing, never-weakened 900-second signal-freshness ceiling
+   measured from the candidate's own `created_at`. A restart *within*
+   that window resumes cleanly, however many scheduler ticks the machine
+   was unavailable for. A restart *after* that window reports
+   `RESUME_WINDOW_EXPIRED` — fail closed, zero sends, permanently, until
+   a human reviews it; the window is never silently renewed by a retry.
+   A plan built without an authorization supplied to `send` (only
+   possible via the legacy single-shot pipeline, never this worker)
+   carries no durable resume authority at all and can never be resumed.
 3. Otherwise runs `evaluate_ser8_research_risk_gate` fresh. A BLOCK is
    reported and produces no execution. An ALLOW proceeds to
    `SER8ExecutionAuthorizationControl.authorize` →
@@ -73,10 +91,15 @@ Each cycle:
 6. Prints exactly one structured summary line
    (`SER8 AUTONOMOUS DEMO EXECUTION CYCLE -- account=... candidate_seen=...
    candidate_id=... candidate_status=... risk_state=... risk_block_reason=...
-   authorization_id=... claim_id=... execution_plan_id=... legs_total=...
-   legs_newly_submitted=... legs_existing=... pending=... filled=...
-   terminal_failures=... outcomes_ingested=... broker_sends_this_cycle=...
-   cycle_status=...`).
+   authorization_id=... claim_id=... execution_plan_id=... resume_until=...
+   legs_total=... legs_newly_submitted=... legs_existing=... pending=...
+   filled=... terminal_failures=... unattempted_legs=...
+   outcomes_ingested=... broker_sends_this_cycle=... cycle_status=...`).
+   `cycle_status` distinguishes `EXECUTION_COMPLETE` (a brand-new plan,
+   freshly sent) from `EXECUTION_RESUMED` (an existing plan's remaining
+   legs, continued) from `RESUME_WINDOW_EXPIRED` (a resumable plan whose
+   durable window has passed — fail closed, zero sends) — never folded
+   together.
 
 `--dry-run` runs candidate selection, eligibility, and Risk Manager
 evaluation exactly like a real cycle and prints what WOULD be sent, but
@@ -162,7 +185,9 @@ authoritative record needed.
   are resumable ONLY through `resume_plan`, which never creates a second
   plan and never creates a second claim for the same plan — proven by
   dedicated tests asserting the plans/claims table row counts are
-  unchanged by a resume.
+  unchanged by a resume, bounded by the plan's own persisted
+  `resume_until` — proven never to exceed the ORIGINAL authorization's
+  own `expires_at` (never extended).
 - `--account`/`--demo-account-allowlist` are both required, explicit, and
   cross-checked at startup — the worker never silently defaults to a
   live account, and fails closed immediately if `--account` is not a

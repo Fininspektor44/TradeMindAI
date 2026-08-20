@@ -189,7 +189,7 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -201,6 +201,7 @@ from trademind.ser8_demo_account_safety_gate import (
     DemoAccountSafetyGateError,
     verify_demo_account_authorization,
 )
+from trademind.ser8_execution_authorization import ExecutionAuthorizationV1
 from trademind.ser8_execution_authorization_claim import ExecutionAuthorizationClaimV1
 from trademind.signal_intelligence import SignalCandidate
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
@@ -218,6 +219,17 @@ _LEG_HASH_DOMAIN = b"trademind:ser8:mt5-demo-order-execution-leg:v1"
 DEMO_EXECUTOR_MAGIC_NUMBER = 990244
 
 DEFAULT_MAXIMUM_CLAIM_AGE_SECONDS = 60.0
+
+# The standing, never-weakened signal-freshness ceiling this whole
+# codebase enforces (see trademind.risk_manager.RiskProfile.
+# maximum_signal_age_seconds's own default and every SER8 task's
+# standing "signal freshness = 900 sec, never weakened" rule). Reused
+# here as a FIXED bound for durable plan-resume eligibility (SER8
+# DURABLE PARTIAL PLAN RESUME CONTRACT V1) -- deliberately NOT read from
+# a live, possibly-different risk profile file at resume time, so a
+# later configuration change can never silently widen how long an
+# already-persisted plan remains resumable.
+DURABLE_RESUME_SIGNAL_FRESHNESS_CEILING_SECONDS = 900.0
 
 VALID_ACTIONS = {"BUY", "SELL"}
 # Confirmed by direct inspection of mt5/TradeMind_Demo_Order_Executor_v1.mq5
@@ -326,6 +338,20 @@ class SER8DemoOrderPendingError(SER8DemoOrderSendError):
     terminal state later requires
     :meth:`SER8DemoOrderSendControl.reconcile_pending_leg` with fresh,
     authoritative evidence -- never automatic, never a resend."""
+
+
+class SER8DemoOrderResumeWindowExpiredError(SER8DemoOrderSendError):
+    """Raised by :meth:`SER8DemoOrderSendControl.resume_plan` when the
+    persisted plan's own durable resume authority (``resume_until``) has
+    passed -- the plan was validly created, may still have genuinely
+    unattempted legs, but the bounded window during which continuing it
+    is authoritatively safe has closed. Distinct from every other
+    :class:`SER8DemoOrderSendError` so a caller (the autonomous worker)
+    can report this exact, narrow condition (``RESUME_WINDOW_EXPIRED`` /
+    an explicitly incomplete-and-expired plan) rather than folding it
+    into a generic denial. Never sends anything before raising; never
+    itself a bypass -- the plan simply stops there, permanently, until a
+    human reviews it."""
 
 
 def _nonempty_str(value: object, *, field_name: str) -> str:
@@ -630,7 +656,23 @@ class DemoOrderExecutionPlanV1:
     one claim (requirement 6). ``plan_id`` is a pure function of
     ``(claim_id, decision_id, candidate_signal_id)``; ``plan_hash`` is a
     content hash over every leg. Construct only via
-    :func:`build_demo_order_execution_plan` -- never by hand."""
+    :func:`build_demo_order_execution_plan` -- never by hand.
+
+    ``resume_until`` (SER8 DURABLE PARTIAL PLAN RESUME CONTRACT V1) is
+    the plan's own persisted, bounded DURABLE RESUME AUTHORITY -- an ISO
+    timestamp computed ONCE, at plan-creation time, from the ORIGINAL
+    authorization's own expiry and the standing signal-freshness ceiling
+    (never re-derived, never extended, never read from a live/possibly-
+    different risk profile later). ``None`` means this plan carries no
+    durable resume authority at all (e.g. a plan built without supplying
+    ``authorization`` to :func:`build_demo_order_execution_plan` -- the
+    legacy/single-shot-pipeline shape) and :meth:`SER8DemoOrderSendControl.
+    resume_plan` refuses to resume such a plan, unconditionally.
+    Deliberately excluded from ``semantic_projection``/``plan_hash``:
+    this is operational metadata about WHEN continuation remains
+    authorized, not part of WHAT was authorized -- mirroring every other
+    wall-clock-only field excluded from an identity hash elsewhere in
+    this lineage (e.g. ``SER8ResearchRiskGateEvidenceV1.evaluated_at``)."""
 
     schema_version: str
     plan_id: str
@@ -642,6 +684,7 @@ class DemoOrderExecutionPlanV1:
     symbol: str
     action: str
     legs: tuple[DemoOrderPlanLegV1, ...]
+    resume_until: str | None = None
     plan_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -669,6 +712,15 @@ class DemoOrderExecutionPlanV1:
             seen_indices.add(leg.entry_index)
         if tuple(leg.entry_index for leg in self.legs) != tuple(sorted(seen_indices)):
             raise SER8DemoOrderSendError("execution plan legs must be strictly ordered by entry_index")
+        if self.resume_until is not None:
+            if type(self.resume_until) is not str:
+                raise SER8DemoOrderSendError("resume_until must be a string or None")
+            try:
+                parsed_resume_until = datetime.fromisoformat(self.resume_until)
+            except ValueError as exc:
+                raise SER8DemoOrderSendError("resume_until must be an ISO timestamp") from exc
+            if parsed_resume_until.tzinfo is None or parsed_resume_until.utcoffset() is None:
+                raise SER8DemoOrderSendError("resume_until must be timezone-aware")
 
         object.__setattr__(
             self,
@@ -694,7 +746,27 @@ class DemoOrderExecutionPlanV1:
     def to_payload(self) -> dict[str, object]:
         payload = self.semantic_projection()
         payload["plan_hash"] = self.plan_hash
+        payload["resume_until"] = self.resume_until
         return payload
+
+
+def _durable_resume_until(
+    *, authorization: ExecutionAuthorizationV1, candidate: SignalCandidate
+) -> str:
+    """Computes the plan's bounded DURABLE RESUME AUTHORITY deadline --
+    the minimum of every applicable persisted ORIGINAL limit: the
+    authorization's own ``expires_at`` (never extended beyond it -- this
+    is the SAME TTL ``authorize()`` already committed to, read back
+    verbatim, not re-derived or assumed as a default) and the standing,
+    never-weakened signal-freshness ceiling measured from the candidate's
+    own ``created_at``. Deliberately does NOT read a live risk-profile
+    file (which could differ from -- or be weakened relative to -- what
+    was true when this plan was actually authorized)."""
+    authorization_deadline = datetime.fromisoformat(authorization.expires_at)
+    signal_deadline = candidate.created_at.astimezone(timezone.utc) + timedelta(
+        seconds=DURABLE_RESUME_SIGNAL_FRESHNESS_CEILING_SECONDS
+    )
+    return min(authorization_deadline, signal_deadline).isoformat()
 
 
 def build_demo_order_execution_plan(
@@ -703,6 +775,7 @@ def build_demo_order_execution_plan(
     candidate: SignalCandidate,
     *,
     demo_authorization: DemoAccountAuthorizationV1,
+    authorization: ExecutionAuthorizationV1 | None = None,
 ) -> DemoOrderExecutionPlanV1:
     """Pure and deterministic -- no I/O, no persistence, no transport call.
     Builds the COMPLETE ordered leg plan straight from ``decision.orders``
@@ -710,7 +783,19 @@ def build_demo_order_execution_plan(
     ``candidate.plan`` (the already-bound SL/TP), in ``entry_index`` order.
     Calling this twice for the identical, untouched inputs yields a
     byte-identical ``plan_id``/``plan_hash`` and byte-identical legs --
-    required for safe crash/restart resumption (requirement 9)."""
+    required for safe crash/restart resumption (requirement 9).
+
+    ``authorization``, when supplied, MUST be the exact
+    ``ExecutionAuthorizationV1`` this ``claim`` was claimed from (checked
+    by the caller, :meth:`SER8DemoOrderSendControl.send`, before this
+    function is ever called) -- its own ``expires_at`` is read to compute
+    and persist this plan's bounded durable-resume deadline (see
+    :func:`_durable_resume_until`). Omitting it (the default) produces a
+    plan with ``resume_until=None`` -- no durable resume authority at
+    all; :meth:`SER8DemoOrderSendControl.resume_plan` refuses to resume
+    such a plan unconditionally. This keeps every existing caller that
+    never supplies ``authorization`` (e.g. ``run_ser8_real_demo_pipeline.py``)
+    byte-for-byte unaffected."""
     total_legs = len(decision.orders)
     ordered = sorted(decision.orders, key=lambda order: order.entry_index)
     legs = tuple(
@@ -730,6 +815,14 @@ def build_demo_order_execution_plan(
     plan_id = _plan_id(
         claim_id=claim.claim_id, decision_id=decision.decision_id, candidate_signal_id=candidate.signal_id
     )
+    resume_until = None
+    if authorization is not None:
+        if authorization.authorization_id != claim.authorization_id:
+            raise SER8DemoOrderSendError(
+                "supplied authorization does not match the claim's own recorded authorization_id -- "
+                "refusing to compute a durable resume window from mismatched lineage"
+            )
+        resume_until = _durable_resume_until(authorization=authorization, candidate=candidate)
     return DemoOrderExecutionPlanV1(
         schema_version=SCHEMA_VERSION,
         plan_id=plan_id,
@@ -741,6 +834,7 @@ def build_demo_order_execution_plan(
         symbol=candidate.symbol,
         action=candidate.plan.action,
         legs=legs,
+        resume_until=resume_until,
     )
 
 
@@ -779,6 +873,7 @@ def _plan_from_payload(payload: dict[str, object]) -> DemoOrderExecutionPlanV1:
         symbol=payload["symbol"],
         action=payload["action"],
         legs=tuple(_plan_leg_from_payload(leg) for leg in payload["legs"]),
+        resume_until=payload.get("resume_until"),
     )
 
 
@@ -1800,6 +1895,7 @@ class SER8DemoOrderSendControl:
         candidate: SignalCandidate,
         *,
         allowlist: DemoAccountAllowlistV1,
+        authorization: ExecutionAuthorizationV1 | None = None,
         maximum_claim_age_seconds: float = DEFAULT_MAXIMUM_CLAIM_AGE_SECONDS,
         now: datetime | None = None,
     ) -> DemoOrderExecutionReceiptV1 | DemoOrderExecutionPlanReceiptV1:
@@ -1814,7 +1910,20 @@ class SER8DemoOrderSendControl:
         RECONCILIATION/FAILED respectively. Never collapses the plan to
         its first (or any single) leg (requirement 3); never resends a leg
         that already has an attempt row, in any state (requirement 8).
-        """
+
+        ``authorization`` (SER8 DURABLE PARTIAL PLAN RESUME CONTRACT V1),
+        when supplied, must be the exact ``ExecutionAuthorizationV1``
+        this ``claim`` was claimed from -- its ``expires_at`` is used to
+        compute and persist this plan's bounded durable-resume deadline
+        (see :func:`build_demo_order_execution_plan`/
+        :func:`_durable_resume_until`), consumed later ONLY by
+        :meth:`resume_plan`. Omitting it (the default, preserving every
+        existing caller byte-for-byte) produces a plan with no durable
+        resume authority at all -- :meth:`resume_plan` will then refuse
+        to resume it, unconditionally. This parameter changes nothing
+        about THIS call's own INITIAL-send semantics (the 60-second
+        ``maximum_claim_age_seconds`` bound below is completely
+        unaffected by it, by design -- see requirement 1)."""
         if maximum_claim_age_seconds <= 0:
             raise SER8DemoOrderSendError("maximum_claim_age_seconds must be positive")
         captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -1865,7 +1974,9 @@ class SER8DemoOrderSendControl:
 
         # 6: build the deterministic, immutable aggregate execution plan --
         # pure, no side effects yet.
-        plan = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo_authorization)
+        plan = build_demo_order_execution_plan(
+            claim, decision, candidate, demo_authorization=demo_authorization, authorization=authorization,
+        )
 
         # 7: persist the plan BEFORE any leg is ever attempted.
         self._persist_plan(plan, created_at=captured_at.isoformat())
@@ -2032,7 +2143,6 @@ class SER8DemoOrderSendControl:
         claim: ExecutionAuthorizationClaimV1,
         *,
         allowlist: DemoAccountAllowlistV1,
-        maximum_claim_age_seconds: float = DEFAULT_MAXIMUM_CLAIM_AGE_SECONDS,
         now: datetime | None = None,
     ) -> DemoOrderExecutionReceiptV1 | DemoOrderExecutionPlanReceiptV1:
         """Resumes an ALREADY-PERSISTED execution plan for this claim,
@@ -2048,50 +2158,61 @@ class SER8DemoOrderSendControl:
         creates a new claim (the SAME, already-persisted ``claim`` is
         independently re-verified here, never re-claimed).
 
-        Every invariant this reuses is the SAME one :meth:`send` itself
-        enforces: the demo account gate, claim staleness
-        (``maximum_claim_age_seconds`` -- the SAME default, so a claim
-        that has gone stale since its original claim() call fails closed
-        here exactly as it would for a fresh send() call, never silently
-        exempted), and this module's own established per-leg one-shot
-        guard (``_reserve_leg_attempt``) -- an already-attempted leg, in
-        ANY state (including UNKNOWN), is NEVER resent; an UNKNOWN leg
-        BLOCKS every leg after it from being attempted, exactly like a
-        fresh :meth:`send` call.
+        DURABLE RESUME AUTHORITY (SER8 DURABLE PARTIAL PLAN RESUME
+        CONTRACT V1): unlike :meth:`send`, this method does NOT re-check
+        the claim's own ``claimed_at`` against a 60-second freshness
+        bound -- that bound governs ONLY the moment a plan is first
+        created (see :meth:`send`'s own docstring, requirement 1, and
+        this module's standing architectural rule: initial claim
+        freshness is never weakened). An old claim being reused here is
+        NOT "the claim presented as freshly valid again" -- it is proof
+        that a specific, already-authorized, already-persisted plan
+        exists, and continuation is governed entirely by the PLAN's own
+        durable resume authority, ``plan.resume_until`` (a bounded
+        deadline computed ONCE at plan-creation time from the ORIGINAL
+        authorization's own ``expires_at`` and the standing 900-second
+        signal-freshness ceiling -- never re-derived, never extended
+        beyond either). A plan with no persisted ``resume_until``
+        (created without ``authorization`` supplied to :meth:`send`) can
+        never be resumed at all. A plan whose ``resume_until`` has
+        passed raises :class:`SER8DemoOrderResumeWindowExpiredError` --
+        FAIL CLOSED, zero sends, permanently, until a human reviews it;
+        this window is never extended or silently renewed by any retry.
+
+        Every OTHER invariant this reuses is the SAME one :meth:`send`
+        itself enforces: the demo account gate, and this module's own
+        established per-leg one-shot guard (``_reserve_leg_attempt``) --
+        an already-attempted leg, in ANY state (including UNKNOWN), is
+        NEVER resent; an UNKNOWN leg BLOCKS every leg after it from being
+        attempted, exactly like a fresh :meth:`send` call.
 
         Raises :class:`SER8DemoOrderSendError` if no plan has ever been
         persisted for this claim (there is nothing to resume -- call
-        :meth:`send` for a genuinely new claim instead), or if the
-        persisted plan does not belong to the exact supplied claim.
-        Raises :class:`SER8DemoOrderAlreadyAttemptedError` if every leg
-        already has a send attempt (nothing to resume). Otherwise raises
-        the SAME exception types as :meth:`send` --
+        :meth:`send` for a genuinely new claim instead), if the
+        persisted plan does not belong to the exact supplied claim, or if
+        the plan carries no durable resume authority at all. Raises
+        :class:`SER8DemoOrderResumeWindowExpiredError` if the resume
+        window has passed. Raises :class:`SER8DemoOrderAlreadyAttemptedError`
+        if every leg already has a send attempt (nothing to resume).
+        Otherwise raises the SAME exception types as :meth:`send` --
         :class:`SER8DemoOrderPendingError`/
         :class:`SER8DemoOrderReconciliationRequiredError`/
         :class:`SER8DemoOrderPartialExecutionError`/
         :class:`SER8DemoOrderRejectedError` -- for the SAME aggregate
         outcomes, and returns the SAME receipt types on COMPLETE.
         """
-        if maximum_claim_age_seconds <= 0:
-            raise SER8DemoOrderSendError("maximum_claim_age_seconds must be positive")
         captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
         # 1: demo account gate -- inherited unchanged, re-verified fresh.
+        # This check is stateless/timeless (see
+        # ser8_demo_account_safety_gate.py's own docstring) -- it is
+        # never affected by how much wall-clock time has passed.
         try:
             demo_authorization = verify_demo_account_authorization(claim, allowlist=allowlist, now=captured_at)
         except DemoAccountSafetyGateError as exc:
             raise SER8DemoOrderSendError(f"demo account safety gate denied this claim: {exc}") from exc
 
-        # 2: claim staleness -- the SAME invariant send() itself enforces.
-        claimed_at = datetime.fromisoformat(claim.claimed_at)
-        claim_age = (captured_at - claimed_at).total_seconds()
-        if claim_age < 0 or claim_age > maximum_claim_age_seconds:
-            raise SER8DemoOrderSendError(
-                f"claim age {claim_age:.1f}s is outside the allowed "
-                f"{maximum_claim_age_seconds:.1f}s send window -- cannot resume"
-            )
-
-        # 3: the plan must already exist -- resume_plan() never creates
+        # 2: the plan must already exist -- resume_plan() never creates
         # or rebuilds one.
         plan = self._load_plan_for_claim(claim.claim_id)
         if plan is None:
@@ -2102,6 +2223,21 @@ class SER8DemoOrderSendControl:
         if plan.claim_id != claim.claim_id or plan.authorization_id != claim.authorization_id:
             raise SER8DemoOrderSendError(
                 "persisted execution plan does not belong to the exact supplied claim -- refusing to resume"
+            )
+
+        # 3: durable resume authority -- REPLACES (never re-applies) the
+        # tight initial-claim-age bound; see this method's own docstring.
+        if plan.resume_until is None:
+            raise SER8DemoOrderSendError(
+                f"plan {plan.plan_id} carries no persisted durable resume authority (resume_until); "
+                "cannot safely resume -- this plan was created without an authorization supplied to send()"
+            )
+        resume_deadline = datetime.fromisoformat(plan.resume_until)
+        if captured_at > resume_deadline:
+            raise SER8DemoOrderResumeWindowExpiredError(
+                f"plan {plan.plan_id}'s durable resume window expired at {plan.resume_until} "
+                f"(now={captured_at.isoformat()}); refusing to send any remaining leg -- "
+                "this plan is permanently incomplete until a human reviews it"
             )
 
         already_attempted = {leg.leg_id: self._existing_leg_receipt(leg.leg_id) for leg in plan.legs}
@@ -2187,6 +2323,7 @@ class SER8DemoOrderSendControl:
 __all__ = [
     "DEFAULT_MAXIMUM_CLAIM_AGE_SECONDS",
     "DEMO_EXECUTOR_MAGIC_NUMBER",
+    "DURABLE_RESUME_SIGNAL_FRESHNESS_CEILING_SECONDS",
     "REQUEST_CSV_FIELDS",
     "RESULT_CSV_FIELDS",
     "SCHEMA_VERSION",
@@ -2204,6 +2341,7 @@ __all__ = [
     "SER8DemoOrderPendingError",
     "SER8DemoOrderReconciliationRequiredError",
     "SER8DemoOrderRejectedError",
+    "SER8DemoOrderResumeWindowExpiredError",
     "SER8DemoOrderSendControl",
     "SER8DemoOrderSendError",
     "SER8DemoOrderTransportError",

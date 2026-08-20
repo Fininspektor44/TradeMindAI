@@ -309,7 +309,10 @@ def _full_real_claim(chain: fixtures._Chain, *, multi_leg: bool = False, request
     return pipeline, claim, result.decision, candidate
 
 
-def _seed_partial_plan(pipeline, claim, decision, candidate, *, attempted_states: dict, now: datetime | None = None):
+def _seed_partial_plan(
+    pipeline, claim, decision, candidate, *, attempted_states: dict, now: datetime | None = None,
+    resumable: bool = True,
+):
     """Persists a REAL execution plan plus a send attempt for ONLY the
     legs named in ``attempted_states`` -- leaving every other leg with NO
     attempt row at all, precisely simulating a process that crashed
@@ -317,12 +320,23 @@ def _seed_partial_plan(pipeline, claim, decision, candidate, *, attempted_states
     tests/test_ser8_mt5_demo_order_send.py's own
     ``_seed_plan_with_partial_attempts`` exactly (deliberately duplicated
     rather than cross-imported, matching this session's own established
-    per-file test-helper convention)."""
+    per-file test-helper convention). ``resumable=True`` (the default)
+    recovers the REAL, already-persisted ``ExecutionAuthorizationV1`` for
+    this claim so the seeded plan carries a genuine durable
+    ``resume_until``, exactly what a real worker cycle's own send() call
+    would have persisted."""
     now = now or datetime.now(timezone.utc)
     allowlist = DemoAccountAllowlistV1(account_ids=(_ACCOUNT,))
     control = SER8DemoOrderSendControl(registry=pipeline.registry, transport=FakeDemoOrderTransport())
     demo_authorization = verify_demo_account_authorization(claim, allowlist=allowlist, now=now)
-    plan = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo_authorization)
+    authorization = None
+    if resumable:
+        authorization_control = SER8ExecutionAuthorizationControl(registry=pipeline.registry, final_verdict=pipeline.final_verdict)
+        authorization = authorization_control.get_authorization(claim.authorization_id)
+        assert authorization is not None, "expected a real, already-persisted authorization for this claim"
+    plan = build_demo_order_execution_plan(
+        claim, decision, candidate, demo_authorization=demo_authorization, authorization=authorization,
+    )
     control._persist_plan(plan, created_at=now.isoformat())
 
     for leg in plan.legs:
@@ -590,7 +604,7 @@ def test_worker_resumes_genuinely_unattempted_legs_after_partial_send(tmp_path: 
     monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
 
     summary = worker_module.run_one_cycle(_worker_args(chain))
-    assert summary.cycle_status == "EXECUTION_COMPLETE"
+    assert summary.cycle_status == "EXECUTION_RESUMED"
     assert summary.candidate_status == "RESUMABLE"
     assert summary.broker_sends_this_cycle == 2
     assert {req.entry_index for req in fake.calls} == {2, 3}
@@ -624,9 +638,40 @@ def test_worker_dry_run_reports_resumable_without_ever_sending(tmp_path: Path, m
     assert len(fake.calls) == 0  # dry-run never constructs/uses the real transport.
 
     real_summary = worker_module.run_one_cycle(_worker_args(chain))
-    assert real_summary.cycle_status == "EXECUTION_COMPLETE"
+    assert real_summary.cycle_status == "EXECUTION_RESUMED"
     assert real_summary.broker_sends_this_cycle == 2
     assert {req.entry_index for req in fake.calls} == {2, 3}
+
+
+def test_worker_reports_resume_window_expired_zero_sends(tmp_path: Path, monkeypatch) -> None:
+    """Scenario G at the worker level: the machine returns only after the
+    plan's own durable resume window has passed -- the worker reports
+    RESUME_WINDOW_EXPIRED explicitly (never a generic denial), with
+    execution_plan_id/claim_id/resume_until/unattempted_legs all still
+    populated for the operator, and zero broker sends."""
+    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-resume-expired")
+    pipeline, claim, decision, candidate = _full_real_claim(chain, multi_leg=True)
+    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    far_future = datetime.now(timezone.utc) + timedelta(seconds=1000)
+    summary = worker_module.run_one_cycle(_worker_args(chain), now=far_future)
+    assert summary.cycle_status == "RESUME_WINDOW_EXPIRED"
+    assert summary.broker_sends_this_cycle == 0
+    assert len(fake.calls) == 0
+    assert summary.execution_plan_id != "-"
+    assert summary.claim_id != "-"
+    assert summary.resume_until != "-"
+    assert summary.unattempted_legs == 2
+
+    # Every further tick -- still expired, still zero sends, forever.
+    for _ in range(3):
+        again = worker_module.run_one_cycle(_worker_args(chain), now=far_future)
+        assert again.cycle_status == "RESUME_WINDOW_EXPIRED"
+        assert again.broker_sends_this_cycle == 0
+    assert len(fake.calls) == 0
 
 
 # ---------------------------------------------------------------------------
