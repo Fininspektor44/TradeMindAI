@@ -674,6 +674,42 @@ def test_worker_reports_resume_window_expired_zero_sends(tmp_path: Path, monkeyp
     assert len(fake.calls) == 0
 
 
+def test_worker_reports_tampered_resume_authority_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    """SER8 DURABLE RESUME AUTHORITY INTEGRITY V1: a plan whose
+    resume_until was tampered directly in persisted storage (without
+    also recomputing resume_authority_hash to match) is caught by the
+    worker's own get_plan_for_candidate read -- reported as a clean,
+    explicit FAIL_CLOSED_PLAN_INTEGRITY cycle_status, never an uncaught
+    crash, and zero broker sends."""
+    import sqlite3
+
+    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-resume-tampered")
+    pipeline, claim, decision, candidate = _full_real_claim(chain, multi_leg=True)
+    plan = _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+
+    db = sqlite3.connect(chain.db_path)
+    row = db.execute(
+        "SELECT payload_json FROM ser8_mt5_demo_order_plans WHERE plan_id=?", (plan.plan_id,)
+    ).fetchone()
+    payload = json.loads(row[0])
+    payload["resume_until"] = (datetime.fromisoformat(payload["resume_until"]) + timedelta(hours=1)).isoformat()
+    db.execute(
+        "UPDATE ser8_mt5_demo_order_plans SET payload_json=? WHERE plan_id=?",
+        (json.dumps(payload, sort_keys=True), plan.plan_id),
+    )
+    db.commit()
+    db.close()
+
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    summary = worker_module.run_one_cycle(_worker_args(chain))
+    assert summary.cycle_status == "FAIL_CLOSED_PLAN_INTEGRITY"
+    assert summary.broker_sends_this_cycle == 0
+    assert len(fake.calls) == 0
+    assert "integrity" in summary.risk_block_reason.lower()
+
+
 # ---------------------------------------------------------------------------
 # 11/12: authorization already exists -- idempotent reuse vs conflict.
 # ---------------------------------------------------------------------------

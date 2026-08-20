@@ -113,6 +113,26 @@ closed authorization/claim/send layers:
        <= 60 seconds old, and the demo account gate still applies --
        none of that is weakened by durable resume existing.
 
+    TAMPER-EVIDENT RESUME AUTHORITY (SER8 DURABLE RESUME AUTHORITY
+    INTEGRITY V1): ``resume_until`` is authorization-critical persisted
+    data -- it alone decides whether an unattempted broker leg may still
+    be submitted after a restart -- so it is bound into a separate,
+    independently-persisted ``resume_authority_hash`` covering every
+    identity field it is meaningless without (``execution_plan_id``/
+    ``candidate_signal_id``/``hypothesis_id``/``account_id``/
+    ``authorization_id``/``claim_id``/``decision_id``/the plan's own
+    ``plan_hash``/``plan_created_at``). Every plan reconstruction (not
+    only inside ``resume_plan`` -- also this worker's own ``ALREADY_
+    PROCESSED``/observation path) recomputes this hash fresh and compares
+    it against the separately-stored original; any of those fields
+    altered in persisted storage without also recomputing the stored
+    hash to match fails closed immediately, before ``resume_until`` is
+    ever read for any purpose. ``execution_plan_id`` itself stays fully
+    deterministic and independent of wall-clock creation time -- only
+    the SEPARATE ``resume_authority_hash``/``created_at`` fields vary
+    with ``now``, so repeated ticks for the same candidate never produce
+    a second plan merely because time passed.
+
 DRY-RUN: performs candidate selection, eligibility, and risk evaluation
 exactly like a real cycle, and previews the plan Risk Manager WOULD
 produce -- but calls no authorization, claim, send, or resume_plan at
@@ -516,7 +536,20 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
     # script's own module docstring for the full restart-safety
     # rationale. It is NOT automatically "fully processed", though: any
     # leg with no send attempt yet is safely resumable via resume_plan.
-    plan = send_control.get_plan_for_candidate(candidate.signal_id)
+    #
+    # SER8 DURABLE RESUME AUTHORITY INTEGRITY V1: this read itself can
+    # fail closed -- get_plan_for_candidate re-verifies the plan's own
+    # resume_authority_hash on every reconstruction, so a tampered
+    # resume_until (or any identity field it is bound to) is caught HERE,
+    # before this cycle ever considers observing OR resuming it. Reported
+    # cleanly as its own cycle_status, never an uncaught crash.
+    try:
+        plan = send_control.get_plan_for_candidate(candidate.signal_id)
+    except SER8DemoOrderSendError as exc:
+        summary.candidate_status = "PLAN_INTEGRITY_FAILED"
+        summary.cycle_status = "FAIL_CLOSED_PLAN_INTEGRITY"
+        summary.risk_block_reason = str(exc)
+        return summary
     if plan is not None:
         summary.claim_id = plan.claim_id
         summary.execution_plan_id = plan.plan_id

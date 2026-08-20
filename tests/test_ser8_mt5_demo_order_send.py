@@ -2993,6 +2993,29 @@ def _plan_row_count(control: SER8DemoOrderSendControl) -> int:
         db.close()
 
 
+def _tamper_plan_payload(control: SER8DemoOrderSendControl, plan_id: str, mutate) -> None:
+    """Directly edits ONE field of an already-persisted plan's own
+    ``payload_json`` -- via a raw UPDATE, exactly like an operator hand-
+    editing the SQLite file or a targeted external mutation -- WITHOUT
+    recomputing ``resume_authority_hash``/``plan_hash`` to match. This is
+    the precise threat model SER8 DURABLE RESUME AUTHORITY INTEGRITY V1
+    defends against: a field changed without its accompanying stored
+    hash also being recomputed."""
+    db = sqlite3.connect(control.path)
+    try:
+        row = db.execute("SELECT payload_json FROM ser8_mt5_demo_order_plans WHERE plan_id=?", (plan_id,)).fetchone()
+        assert row is not None, f"no persisted plan {plan_id!r} to tamper with"
+        payload = json.loads(row[0])
+        mutate(payload)
+        db.execute(
+            "UPDATE ser8_mt5_demo_order_plans SET payload_json=? WHERE plan_id=?",
+            (json.dumps(payload, sort_keys=True), plan_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_scenario_a_filled_then_two_unattempted_legs_resume_exactly_once(tmp_path: Path) -> None:
     """A) plan persisted, #1 FILLED, #2/#3 unattempted, restart -- #1 zero
     resend, #2/#3 resumed exactly once."""
@@ -3325,6 +3348,183 @@ def test_resume_plan_seeded_without_authorization_has_no_resume_until_and_cannot
     with pytest.raises(SER8DemoOrderSendError, match="no persisted durable resume authority"):
         resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
     assert transport.calls == []
+
+
+# ---------------------------------------------------------------------------
+# SER8 DURABLE RESUME AUTHORITY INTEGRITY V1: resume_until is bound to a
+# separate, tamper-evident resume_authority_hash covering every identity
+# field it is meaningless without -- mirroring the SAME reconstruct-then-
+# compare pattern already established for DemoOrderRequestV1.request_hash.
+# ---------------------------------------------------------------------------
+
+
+def test_scenario_a_valid_plan_authority_hash_verifies_and_resumes(tmp_path: Path) -> None:
+    """A) valid new plan -> authority hash verifies -> resume succeeds
+    inside the window."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"}, context=context,
+    )
+    plan = control.get_plan_for_candidate(candidate.signal_id)
+    assert plan.resume_until is not None
+    assert plan.resume_authority_hash is not None
+    assert plan.hypothesis_id == context.hypothesis_id
+    assert plan.created_at is not None
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    receipt = resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=30))
+    assert isinstance(receipt, DemoOrderExecutionPlanReceiptV1)
+    assert receipt.aggregate_state == "COMPLETE"
+    assert len(transport.calls) == 2
+
+
+def test_scenario_b_resume_until_tampered_later_fails_integrity(tmp_path: Path) -> None:
+    """B) change resume_until +1 hour directly in persisted storage ->
+    integrity failure -> zero sends."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    plan = _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"}, context=context,
+    )
+    original_deadline = datetime.fromisoformat(plan.resume_until)
+    tampered = (original_deadline + timedelta(hours=1)).isoformat()
+    _tamper_plan_payload(control, plan.plan_id, lambda payload: payload.__setitem__("resume_until", tampered))
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderSendError, match="integrity check"):
+        resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=30))
+    assert transport.calls == []
+    # Even a plain observation read (get_plan_for_candidate) refuses to
+    # trust the tampered plan -- fail closed everywhere, not just resume.
+    with pytest.raises(SER8DemoOrderSendError, match="integrity check"):
+        control.get_plan_for_candidate(candidate.signal_id)
+
+
+def test_scenario_c_resume_until_tampered_earlier_also_fails_integrity(tmp_path: Path) -> None:
+    """C) change resume_until -1 minute -> integrity failure -> zero sends
+    (tampering is rejected regardless of direction -- never silently
+    accepted just because it happens to be MORE conservative)."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    plan = _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"}, context=context,
+    )
+    original_deadline = datetime.fromisoformat(plan.resume_until)
+    tampered = (original_deadline - timedelta(minutes=1)).isoformat()
+    _tamper_plan_payload(control, plan.plan_id, lambda payload: payload.__setitem__("resume_until", tampered))
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderSendError, match="integrity check"):
+        resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=30))
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize(
+    "field_name,new_value",
+    [
+        ("authorization_id", "EA-tampered0000000"),
+        ("claim_id", "EAC-tampered0000000"),
+        ("plan_id", "EOP-tampered0000000"),
+        ("candidate_signal_id", "sig-tampered"),
+        ("demo_account_id", "99999999"),
+        ("hypothesis_id", "rpi-v1:sha256:" + "9" * 64 + ":0"),
+        ("decision_id", "RD-tampered0000000"),
+    ],
+)
+def test_scenarios_d_e_f_identity_tamper_fails_closed(tmp_path: Path, field_name: str, new_value: str) -> None:
+    """D/E/F (+ extra identity fields for completeness): tampering
+    authorization_id, claim_id, execution_plan_id, candidate_signal_id,
+    account, hypothesis_id, or decision_id -- each bound into
+    resume_authority_hash -- fails closed, zero sends."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    plan = _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"}, context=context,
+    )
+    _tamper_plan_payload(control, plan.plan_id, lambda payload: payload.__setitem__(field_name, new_value))
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderSendError):
+        resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=30))
+    assert transport.calls == []
+
+
+def test_scenario_g_restart_at_plus_90_seconds_untampered_still_resumes(tmp_path: Path) -> None:
+    """G) restart at +90s with completely untouched persisted state ->
+    resume still works (the integrity check itself never produces a
+    false positive for genuinely untampered data)."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"}, context=context,
+    )
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    receipt = resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW + timedelta(seconds=90))
+    assert isinstance(receipt, DemoOrderExecutionPlanReceiptV1)
+    assert receipt.aggregate_state == "COMPLETE"
+    assert len(transport.calls) == 2
+
+
+def test_scenario_h_restart_after_genuine_untampered_expiry_fails_closed(tmp_path: Path) -> None:
+    """H) restart after a genuine, untampered resume_until ->
+    RESUME_WINDOW_EXPIRED -> zero sends (the integrity check passes --
+    the data is genuine -- but the window itself has legitimately
+    closed)."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    plan = _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"}, context=context,
+    )
+    resume_deadline = datetime.fromisoformat(plan.resume_until)
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderResumeWindowExpiredError):
+        resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=resume_deadline + timedelta(seconds=1))
+    assert transport.calls == []
+
+
+def test_scenario_j_repeated_ticks_produce_one_deterministic_plan_only(tmp_path: Path) -> None:
+    """J) same candidate/same authorized basket across repeated scheduler
+    ticks -> one deterministic execution plan only -- plan_id (and every
+    leg's own leg_id) is byte-identical regardless of wall-clock ``now``,
+    even though resume_authority_hash/created_at legitimately differ per
+    call (they are never used to detect "is this the same candidate",
+    only plan_id/plan_hash are)."""
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    authorization_control = SER8ExecutionAuthorizationControl(registry=context.registry, final_verdict=context.final_verdict)
+    authorization = authorization_control.get_authorization(claim.authorization_id)
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+
+    plan_1 = build_demo_order_execution_plan(
+        claim, decision, candidate, demo_authorization=demo_authorization, authorization=authorization,
+        now=NOW,
+    )
+    plan_2 = build_demo_order_execution_plan(
+        claim, decision, candidate, demo_authorization=demo_authorization, authorization=authorization,
+        now=NOW + timedelta(seconds=45),
+    )
+    assert plan_1.plan_id == plan_2.plan_id
+    assert plan_1.plan_hash == plan_2.plan_hash
+    assert [leg.leg_id for leg in plan_1.legs] == [leg.leg_id for leg in plan_2.legs]
+    # created_at/resume_authority_hash legitimately differ (different
+    # "now"), but that never creates a second PLAN identity -- persisting
+    # either one is idempotent via the SAME plan_id primary key.
+    assert plan_1.created_at != plan_2.created_at
+    assert plan_1.resume_authority_hash != plan_2.resume_authority_hash
+
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    control._persist_plan(plan_1, created_at=NOW.isoformat())
+    control._persist_plan(plan_2, created_at=(NOW + timedelta(seconds=45)).isoformat())  # idempotent no-op.
+    assert _plan_row_count(control) == 1
 
 
 def test_resume_plan_reverifies_demo_account_gate(tmp_path: Path) -> None:

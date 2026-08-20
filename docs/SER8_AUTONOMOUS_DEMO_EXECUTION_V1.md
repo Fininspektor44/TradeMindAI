@@ -71,6 +71,24 @@ Each cycle:
    A plan built without an authorization supplied to `send` (only
    possible via the legacy single-shot pipeline, never this worker)
    carries no durable resume authority at all and can never be resumed.
+
+   **Tamper-evident (SER8 DURABLE RESUME AUTHORITY INTEGRITY V1)**:
+   `resume_until` is authorization-critical — it alone decides whether an
+   unattempted leg may still be submitted after a restart — so it is
+   bound into a separate, independently-persisted `resume_authority_hash`
+   covering `execution_plan_id`/`candidate_signal_id`/`hypothesis_id`/
+   `account_id`/`authorization_id`/`claim_id`/`decision_id`/the plan's
+   own `plan_hash`/`plan_created_at`. Every reconstruction of a plan
+   (not only inside `resume_plan` — also this worker's own `ALREADY_
+   PROCESSED` observation path) recomputes this hash fresh and compares
+   it against the separately-stored original — any of those fields
+   altered in persisted storage without also recomputing the stored hash
+   to match fails closed immediately, before `resume_until` is ever read
+   for anything. `execution_plan_id` itself stays fully deterministic
+   and independent of wall-clock creation time; only the separate
+   `resume_authority_hash`/`plan_created_at` fields vary with `now`, so
+   repeated scheduler ticks for the same candidate never produce a
+   second plan merely because time passed.
 3. Otherwise runs `evaluate_ser8_research_risk_gate` fresh. A BLOCK is
    reported and produces no execution. An ALLOW proceeds to
    `SER8ExecutionAuthorizationControl.authorize` →

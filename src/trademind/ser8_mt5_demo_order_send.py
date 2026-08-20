@@ -211,6 +211,7 @@ _REQUEST_HASH_DOMAIN = b"trademind:ser8:mt5-demo-order-request:v2"
 _RECEIPT_HASH_DOMAIN = b"trademind:ser8:mt5-demo-order-receipt:v2"
 _PLAN_HASH_DOMAIN = b"trademind:ser8:mt5-demo-order-execution-plan:v1"
 _LEG_HASH_DOMAIN = b"trademind:ser8:mt5-demo-order-execution-leg:v1"
+_RESUME_AUTHORITY_HASH_DOMAIN = b"trademind:ser8:mt5-demo-order-resume-authority:v1"
 
 # One fixed magic number for this whole demo-executor product line -- not a
 # trading parameter, only broker-side bookkeeping metadata, so this MVP
@@ -672,7 +673,34 @@ class DemoOrderExecutionPlanV1:
     this is operational metadata about WHEN continuation remains
     authorized, not part of WHAT was authorized -- mirroring every other
     wall-clock-only field excluded from an identity hash elsewhere in
-    this lineage (e.g. ``SER8ResearchRiskGateEvidenceV1.evaluated_at``)."""
+    this lineage (e.g. ``SER8ResearchRiskGateEvidenceV1.evaluated_at``).
+
+    ``hypothesis_id``/``created_at``/``resume_until`` are an ALL-OR-
+    NOTHING bundle -- either every one is supplied (a plan built WITH
+    durable resume authority) or none is (``resume_authority_hash`` is
+    then also ``None``, and :meth:`resume_plan` refuses it
+    unconditionally; SER8 DURABLE RESUME AUTHORITY INTEGRITY V1,
+    requirement 9 -- a legacy/no-authority plan is never granted
+    inferred resume authority).
+
+    ``resume_authority_hash`` (SER8 DURABLE RESUME AUTHORITY INTEGRITY
+    V1) is a SEPARATE, independently-computed content hash binding
+    ``resume_until`` to every identity field it is meaningless without --
+    ``plan_id``/``candidate_signal_id``/``hypothesis_id``/``demo_account_id``/
+    ``authorization_id``/``claim_id``/``decision_id``/``plan_hash``/
+    ``created_at`` -- exactly mirroring the SAME established
+    reconstruct-then-compare pattern this codebase already uses for
+    ``DemoOrderRequestV1.request_hash`` (see :func:`get_leg_request`'s own
+    ``request.request_hash != request_payload.get("request_hash")``
+    check): computed fresh, `field(init=False)`, from whatever raw values
+    were just supplied, and ONLY meaningful when the CALLER (here,
+    :func:`_plan_from_payload`) explicitly compares it against the
+    SEPARATELY, independently persisted ``resume_authority_hash`` value
+    read directly from storage. If ``resume_until`` (or any of the
+    other bound fields) is altered in persisted storage without also
+    recomputing this stored hash to match, the mismatch is detected at
+    the very next reconstruction -- BEFORE ``resume_until`` is ever
+    checked or used (requirement 2)."""
 
     schema_version: str
     plan_id: str
@@ -685,7 +713,10 @@ class DemoOrderExecutionPlanV1:
     action: str
     legs: tuple[DemoOrderPlanLegV1, ...]
     resume_until: str | None = None
+    hypothesis_id: str | None = None
+    created_at: str | None = None
     plan_hash: str = field(init=False)
+    resume_authority_hash: str | None = field(init=False)
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -712,21 +743,45 @@ class DemoOrderExecutionPlanV1:
             seen_indices.add(leg.entry_index)
         if tuple(leg.entry_index for leg in self.legs) != tuple(sorted(seen_indices)):
             raise SER8DemoOrderSendError("execution plan legs must be strictly ordered by entry_index")
-        if self.resume_until is not None:
-            if type(self.resume_until) is not str:
-                raise SER8DemoOrderSendError("resume_until must be a string or None")
-            try:
-                parsed_resume_until = datetime.fromisoformat(self.resume_until)
-            except ValueError as exc:
-                raise SER8DemoOrderSendError("resume_until must be an ISO timestamp") from exc
-            if parsed_resume_until.tzinfo is None or parsed_resume_until.utcoffset() is None:
-                raise SER8DemoOrderSendError("resume_until must be timezone-aware")
+
+        for value, field_name in ((self.resume_until, "resume_until"), (self.created_at, "created_at")):
+            if value is not None:
+                if type(value) is not str:
+                    raise SER8DemoOrderSendError(f"{field_name} must be a string or None")
+                try:
+                    parsed = datetime.fromisoformat(value)
+                except ValueError as exc:
+                    raise SER8DemoOrderSendError(f"{field_name} must be an ISO timestamp") from exc
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise SER8DemoOrderSendError(f"{field_name} must be timezone-aware")
+        if self.hypothesis_id is not None:
+            _nonempty_str(self.hypothesis_id, field_name="hypothesis_id")
+
+        # requirement 9: durable resume authority is all-or-nothing --
+        # never partially inferred.
+        bundle = (self.resume_until, self.hypothesis_id, self.created_at)
+        if any(item is not None for item in bundle) and any(item is None for item in bundle):
+            raise SER8DemoOrderSendError(
+                "resume_until/hypothesis_id/created_at must be supplied together or not at all -- "
+                "durable resume authority is never partially granted"
+            )
 
         object.__setattr__(
             self,
             "plan_hash",
             sha256_bytes(_PLAN_HASH_DOMAIN + b"\x00" + canonical_json_bytes(self.semantic_projection())),
         )
+
+        resume_authority_hash = None
+        if self.resume_until is not None:
+            resume_authority_hash = _resume_authority_hash(
+                plan_id=self.plan_id, candidate_signal_id=self.candidate_signal_id,
+                hypothesis_id=self.hypothesis_id, account_id=self.demo_account_id,
+                authorization_id=self.authorization_id, claim_id=self.claim_id, decision_id=self.decision_id,
+                plan_hash=self.plan_hash, created_at=self.created_at, resume_until=self.resume_until,
+            )
+        object.__setattr__(self, "resume_authority_hash", resume_authority_hash)
+
         canonical_json_bytes(self.to_payload())
 
     def semantic_projection(self) -> dict[str, object]:
@@ -747,7 +802,37 @@ class DemoOrderExecutionPlanV1:
         payload = self.semantic_projection()
         payload["plan_hash"] = self.plan_hash
         payload["resume_until"] = self.resume_until
+        payload["hypothesis_id"] = self.hypothesis_id
+        payload["created_at"] = self.created_at
+        payload["resume_authority_hash"] = self.resume_authority_hash
         return payload
+
+
+def _resume_authority_hash(
+    *, plan_id: str, candidate_signal_id: str, hypothesis_id: str, account_id: str,
+    authorization_id: str, claim_id: str, decision_id: str, plan_hash: str,
+    created_at: str, resume_until: str,
+) -> str:
+    """Binds the durable resume deadline to every identity field it is
+    meaningless without (SER8 DURABLE RESUME AUTHORITY INTEGRITY V1).
+    ``plan_hash`` is itself already a content hash over every leg
+    (volume/price/order_type/sl/tp), so including it here transitively
+    binds resume authority to the exact authorized basket too -- a
+    tampered leg invalidates this hash exactly as surely as a tampered
+    ``resume_until`` does."""
+    payload = {
+        "execution_plan_id": plan_id,
+        "candidate_signal_id": candidate_signal_id,
+        "hypothesis_id": hypothesis_id,
+        "account_id": account_id,
+        "authorization_id": authorization_id,
+        "claim_id": claim_id,
+        "decision_id": decision_id,
+        "plan_hash": plan_hash,
+        "plan_created_at": created_at,
+        "resume_until": resume_until,
+    }
+    return sha256_bytes(_RESUME_AUTHORITY_HASH_DOMAIN + b"\x00" + canonical_json_bytes(payload))
 
 
 def _durable_resume_until(
@@ -776,26 +861,32 @@ def build_demo_order_execution_plan(
     *,
     demo_authorization: DemoAccountAuthorizationV1,
     authorization: ExecutionAuthorizationV1 | None = None,
+    now: datetime | None = None,
 ) -> DemoOrderExecutionPlanV1:
     """Pure and deterministic -- no I/O, no persistence, no transport call.
     Builds the COMPLETE ordered leg plan straight from ``decision.orders``
     (Risk Manager's own sizing output, the sole sizing authority) and
     ``candidate.plan`` (the already-bound SL/TP), in ``entry_index`` order.
-    Calling this twice for the identical, untouched inputs yields a
-    byte-identical ``plan_id``/``plan_hash`` and byte-identical legs --
-    required for safe crash/restart resumption (requirement 9).
+    Calling this twice for the identical, untouched inputs (including the
+    identical ``now``, when supplied) yields a byte-identical
+    ``plan_id``/``plan_hash``/``resume_authority_hash`` and byte-identical
+    legs -- required for safe crash/restart resumption (requirement 9).
+    ``plan_id`` itself NEVER depends on ``now``/wall-clock creation time
+    (SER8 DURABLE RESUME AUTHORITY INTEGRITY V1, requirement 7/8) -- only
+    the SEPARATE ``resume_authority_hash``/``created_at`` fields do.
 
     ``authorization``, when supplied, MUST be the exact
     ``ExecutionAuthorizationV1`` this ``claim`` was claimed from (checked
-    by the caller, :meth:`SER8DemoOrderSendControl.send`, before this
-    function is ever called) -- its own ``expires_at`` is read to compute
-    and persist this plan's bounded durable-resume deadline (see
-    :func:`_durable_resume_until`). Omitting it (the default) produces a
-    plan with ``resume_until=None`` -- no durable resume authority at
-    all; :meth:`SER8DemoOrderSendControl.resume_plan` refuses to resume
-    such a plan unconditionally. This keeps every existing caller that
-    never supplies ``authorization`` (e.g. ``run_ser8_real_demo_pipeline.py``)
-    byte-for-byte unaffected."""
+    below) -- its own ``expires_at`` and ``hypothesis_id`` are read to
+    compute and persist this plan's bounded, integrity-protected durable
+    resume authority (``resume_until``/``resume_authority_hash`` -- see
+    :func:`_durable_resume_until`/:func:`_resume_authority_hash`).
+    Omitting it (the default) produces a plan with NO durable resume
+    authority at all (``resume_until``/``hypothesis_id``/``created_at``/
+    ``resume_authority_hash`` all ``None``); :meth:`SER8DemoOrderSendControl.
+    resume_plan` refuses to resume such a plan unconditionally. This
+    keeps every existing caller that never supplies ``authorization``
+    (e.g. ``run_ser8_real_demo_pipeline.py``) byte-for-byte unaffected."""
     total_legs = len(decision.orders)
     ordered = sorted(decision.orders, key=lambda order: order.entry_index)
     legs = tuple(
@@ -816,12 +907,17 @@ def build_demo_order_execution_plan(
         claim_id=claim.claim_id, decision_id=decision.decision_id, candidate_signal_id=candidate.signal_id
     )
     resume_until = None
+    hypothesis_id = None
+    created_at = None
     if authorization is not None:
         if authorization.authorization_id != claim.authorization_id:
             raise SER8DemoOrderSendError(
                 "supplied authorization does not match the claim's own recorded authorization_id -- "
                 "refusing to compute a durable resume window from mismatched lineage"
             )
+        captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        created_at = captured_at.isoformat()
+        hypothesis_id = authorization.hypothesis_id
         resume_until = _durable_resume_until(authorization=authorization, candidate=candidate)
     return DemoOrderExecutionPlanV1(
         schema_version=SCHEMA_VERSION,
@@ -835,6 +931,8 @@ def build_demo_order_execution_plan(
         action=candidate.plan.action,
         legs=legs,
         resume_until=resume_until,
+        hypothesis_id=hypothesis_id,
+        created_at=created_at,
     )
 
 
@@ -861,8 +959,21 @@ def _plan_from_payload(payload: dict[str, object]) -> DemoOrderExecutionPlanV1:
     leg data (order_type/planned_price/volume/sl/tp) is EXACTLY what
     :func:`build_demo_order_execution_plan` computed from the ORIGINAL,
     genuine ALLOW decision at plan-creation time -- reading it back is not
-    re-deriving or inventing anything."""
-    return DemoOrderExecutionPlanV1(
+    re-deriving or inventing anything.
+
+    SER8 DURABLE RESUME AUTHORITY INTEGRITY V1 (requirement 2): the
+    reconstructed plan's own FRESHLY recomputed ``resume_authority_hash``
+    (derived from whatever ``resume_until``/``hypothesis_id``/
+    ``created_at``/identity fields this payload currently holds) is
+    explicitly compared against the SEPARATE, independently-persisted
+    ``resume_authority_hash`` value stored alongside them in this SAME
+    payload -- exactly the established reconstruct-then-compare pattern
+    :func:`SER8DemoOrderSendControl.get_leg_request` already uses for
+    ``request_hash``. A mismatch (any bound field altered without also
+    recomputing the stored hash to match) fails closed HERE, before
+    ``resume_until`` is ever read by a caller for any purpose -- observing
+    a candidate's plan state or resuming it alike."""
+    plan = DemoOrderExecutionPlanV1(
         schema_version=payload["schema_version"],
         plan_id=payload["plan_id"],
         claim_id=payload["claim_id"],
@@ -874,7 +985,16 @@ def _plan_from_payload(payload: dict[str, object]) -> DemoOrderExecutionPlanV1:
         action=payload["action"],
         legs=tuple(_plan_leg_from_payload(leg) for leg in payload["legs"]),
         resume_until=payload.get("resume_until"),
+        hypothesis_id=payload.get("hypothesis_id"),
+        created_at=payload.get("created_at"),
     )
+    if plan.resume_authority_hash != payload.get("resume_authority_hash"):
+        raise SER8DemoOrderSendError(
+            f"persisted execution plan {plan.plan_id}'s durable resume authority failed its own "
+            "integrity check -- resume_until (or an identity field it is bound to) does not match "
+            "its own persisted resume_authority_hash; refusing to trust it for any purpose"
+        )
+    return plan
 
 
 @dataclass(frozen=True, slots=True)
@@ -1976,6 +2096,7 @@ class SER8DemoOrderSendControl:
         # pure, no side effects yet.
         plan = build_demo_order_execution_plan(
             claim, decision, candidate, demo_authorization=demo_authorization, authorization=authorization,
+            now=captured_at,
         )
 
         # 7: persist the plan BEFORE any leg is ever attempted.
