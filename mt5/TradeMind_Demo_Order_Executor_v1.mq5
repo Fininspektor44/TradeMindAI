@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.4"
-#property description "TradeMind SER8 Demo Order Executor v1.4"
+#property version   "1.5"
+#property description "TradeMind SER8 Demo Order Executor v1.5"
 #property description "EXECUTOR ONLY. Reads at most one pending SER8 order"
 #property description "request per timer tick, independently verifies the"
 #property description "account/login and request identity, sends exactly"
@@ -50,6 +50,18 @@
 #property description "No other clock in this file (capture timestamps,"
 #property description "timer cadence) changed -- this fixes only the"
 #property description "HistorySelect query interval."
+#property description "v1.5 adds ONE new read-only column to the SAME"
+#property description "deal-history export: profit (DEAL_PROFIT), the"
+#property description "broker's own authoritative realized P/L for a deal."
+#property description "Combined with the already-exported entry column"
+#property description "(DEAL_ENTRY_IN/DEAL_ENTRY_OUT), this is the narrow,"
+#property description "additive evidence SER8's autonomous demo execution"
+#property description "outcome-capture bridge needs to record a CLOSED"
+#property description "trade's own exit price/timestamp/realized P/L from"
+#property description "authoritative broker evidence, never inferred. No"
+#property description "other column, row, or export changed; still no"
+#property description "OrderSend/CTrade call anywhere in either export"
+#property description "function."
 
 #include <Trade\Trade.mqh>
 
@@ -833,7 +845,7 @@ bool ExportDealHistorySnapshot()
    FileWrite(
       handle,
       "time_msc","account_login","deal_ticket","order_ticket","position_id","symbol","magic",
-      "side","volume","price","entry","time_deal_msc"
+      "side","volume","price","entry","time_deal_msc","profit"
    );
 
    long captured_msc=UtcNowMsc();
@@ -873,7 +885,8 @@ bool ExportDealHistorySnapshot()
             DoubleToString(HistoryDealGetDouble(ticket,DEAL_VOLUME),8),
             DoubleToString(HistoryDealGetDouble(ticket,DEAL_PRICE),digits),
             EnumTail(EnumToString(entry),"DEAL_ENTRY_"),
-            (long)HistoryDealGetInteger(ticket,DEAL_TIME_MSC)
+            (long)HistoryDealGetInteger(ticket,DEAL_TIME_MSC),
+            DoubleToString(HistoryDealGetDouble(ticket,DEAL_PROFIT),2)
          );
          written++;
       }

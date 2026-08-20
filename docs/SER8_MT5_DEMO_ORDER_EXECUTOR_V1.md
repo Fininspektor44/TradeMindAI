@@ -1,4 +1,19 @@
-# TradeMind SER8 MT5 Demo Order Executor v1.4
+# TradeMind SER8 MT5 Demo Order Executor v1.5
+
+## v1.5 — profit в экспорте истории сделок (для outcome-capture моста)
+
+Добавлена ОДНА новая read-only колонка `profit` (`DEAL_PROFIT`) в
+`ExportDealHistorySnapshot` (тот же `mt5_risk_deals_utc_<login>.csv`,
+тот же таймерный каденс). Причина: SER8 AUTONOMOUS CONTINUOUS DEMO
+EXECUTION V1 добавляет узкий, чисто аддитивный "outcome capture" мост
+(`trademind.ser8_demo_trade_outcome_capture`), который должен уметь
+зафиксировать реализованный P/L ЗАКРЫТОЙ сделки из авторитетных
+данных брокера, а не вычислять/угадывать его сам. До v1.5 экспорт уже
+содержал `entry` (`DEAL_ENTRY_IN`/`DEAL_ENTRY_OUT`) и `time_deal_msc`,
+но не `profit` -- реализованный P/L был доступен только вручную в
+терминале. Никакая другая колонка, строка или функция не изменена;
+по-прежнему нет ни одного вызова `OrderSend`/`CTrade` ни в одной из
+функций экспорта.
 
 ## v1.4 — исправление домена времени HistorySelect (server time, не GMT)
 

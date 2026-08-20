@@ -900,6 +900,40 @@ def test_authorization_carries_no_broker_ticket_or_fill_field() -> None:
 
 
 # ---------------------------------------------------------------------------
+# get_authorization -- narrow, read-only accessor added for SER8
+# AUTONOMOUS CONTINUOUS DEMO EXECUTION V1's outcome-capture bridge.
+# ---------------------------------------------------------------------------
+
+
+def test_get_authorization_returns_the_persisted_authorization(tmp_path: Path) -> None:
+    context, eligibility, scope, candidate, result, control = _authorized_case(tmp_path)
+    authorization = control.authorize(eligibility, scope, candidate, result, now=NOW)
+
+    fetched = control.get_authorization(authorization.authorization_id)
+    assert fetched is not None
+    assert fetched.authorization_hash == authorization.authorization_hash
+    assert fetched.hypothesis_id == authorization.hypothesis_id
+    assert fetched.live_candidate_signal_id == authorization.live_candidate_signal_id
+    assert fetched.account_id == authorization.account_id
+
+
+def test_get_authorization_returns_none_for_unknown_id(tmp_path: Path) -> None:
+    context, eligibility, scope, candidate, result, control = _authorized_case(tmp_path)
+    assert control.get_authorization("EA-does-not-exist") is None
+
+
+def test_get_authorization_never_grants_or_mutates_anything(tmp_path: Path) -> None:
+    context, eligibility, scope, candidate, result, control = _authorized_case(tmp_path)
+    authorization = control.authorize(eligibility, scope, candidate, result, now=NOW)
+
+    before = sqlite3.connect(context.db_path).execute("SELECT COUNT(*) FROM ser8_execution_authorizations").fetchone()[0]
+    for _ in range(5):
+        control.get_authorization(authorization.authorization_id)
+    after = sqlite3.connect(context.db_path).execute("SELECT COUNT(*) FROM ser8_execution_authorizations").fetchone()[0]
+    assert before == after == 1
+
+
+# ---------------------------------------------------------------------------
 # 14-15: existing research-risk-gate/risk/core tests remain green; full
 # pytest green -- run separately as part of this task's own VALIDATION.
 # ---------------------------------------------------------------------------

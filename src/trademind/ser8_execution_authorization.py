@@ -451,6 +451,28 @@ class SER8ExecutionAuthorizationControl:
                 db.rollback()
                 raise
 
+    def get_authorization(self, authorization_id: str) -> ExecutionAuthorizationV1 | None:
+        """Public, read-only accessor for one already-persisted
+        authorization by its ``authorization_id`` -- ``None`` if no such
+        row exists. Reconstructed independently from the persisted row
+        via the SAME :func:`_authorization_from_row` helper
+        :meth:`authorize` itself uses; the returned object's own
+        ``authorization_hash`` re-verification is inherited automatically
+        via ``ExecutionAuthorizationV1.__post_init__``. Gives downstream
+        read-only consumers (e.g. an outcome-capture bridge that only
+        holds a leg receipt's ``authorization_id``) a stable way to
+        recover the hypothesis/account/candidate lineage an authorization
+        was issued for, without granting any new authorization or
+        touching this table's write path."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM ser8_execution_authorizations WHERE authorization_id=?",
+                (authorization_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _authorization_from_row(row)
+
 
 def _authorization_from_row(row: sqlite3.Row) -> ExecutionAuthorizationV1:
     payload = json.loads(row["payload_json"])

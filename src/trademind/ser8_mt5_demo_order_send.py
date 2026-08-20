@@ -1669,6 +1669,59 @@ class SER8DemoOrderSendControl:
             )
         return request
 
+    def get_plan_claim_id_for_candidate(self, candidate_signal_id: str) -> str | None:
+        """Public, read-only accessor: does an execution plan already
+        exist for this ``candidate_signal_id``, and if so, which
+        ``claim_id`` root does it live under? Returns ``None`` if no plan
+        has ever been persisted for this candidate.
+
+        This is the ONE-SHOT anchor an autonomous execution worker uses
+        to decide whether a candidate has ALREADY produced an
+        authoritative execution plan -- and must therefore never be
+        re-evaluated, re-authorized, re-claimed, or re-sent, even across
+        a process restart. ``plan_id`` is itself content-derived from
+        ``(claim_id, decision_id, candidate_signal_id)``, so a fresh risk
+        re-evaluation after a live account/market snapshot has moved on
+        can legitimately compute a DIFFERENT ``decision_id`` for the
+        "same" candidate; calling :meth:`send` again in that case would
+        risk treating an already-attempted leg as brand new. Checking
+        this accessor FIRST, before any fresh risk/authorize/claim
+        attempt, is what makes that unsafe path unreachable -- once any
+        plan exists for a candidate, an autonomous caller must only
+        observe it (e.g. via :meth:`list_leg_ids_for_claim` +
+        :meth:`get_leg_receipt`), never resend it. When more than one
+        plan somehow exists for the same candidate, the most recently
+        created one is returned. Never touches the transport."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT claim_id FROM ser8_mt5_demo_order_plans WHERE candidate_signal_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (candidate_signal_id,),
+            ).fetchone()
+        return row["claim_id"] if row is not None else None
+
+    def list_filled_leg_ids_for_account(self, demo_account_id: str) -> tuple[str, ...]:
+        """Every leg identity, across ALL claims, currently persisted
+        FILLED for this demo account -- the generic discovery entrypoint
+        an outcome-capture bridge needs (never hard-codes a specific
+        claim or ticket), mirroring :meth:`list_pending_leg_ids_for_account`
+        exactly. Read-only; never touches the transport."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT claim_id, payload_json, request_json FROM ser8_mt5_demo_order_leg_receipts "
+                "WHERE payload_json IS NOT NULL ORDER BY entry_index"
+            ).fetchall()
+        filled: list[str] = []
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if payload.get("result_state") != "FILLED":
+                continue
+            request_payload = json.loads(row["request_json"])
+            if request_payload.get("demo_account_id") != demo_account_id:
+                continue
+            filled.append(row["claim_id"])
+        return tuple(filled)
+
     def send(
         self,
         claim: ExecutionAuthorizationClaimV1,
