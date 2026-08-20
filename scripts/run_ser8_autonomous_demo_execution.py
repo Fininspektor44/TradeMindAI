@@ -44,22 +44,38 @@ provably safe, without weakening or duplicating anything in the already-
 closed authorization/claim/send layers:
 
   * Before ANY fresh risk evaluation, it checks
-    ``SER8DemoOrderSendControl.get_plan_claim_id_for_candidate`` -- a new,
-    narrow, read-only accessor. If an execution PLAN already exists for
-    this candidate, the worker NEVER re-evaluates risk, NEVER re-
-    authorizes, NEVER re-claims, and NEVER calls ``send`` again for it --
-    it only OBSERVES the already-persisted leg states. This is the ONE-
-    SHOT anchor: a plan is persisted (by ``send`` itself) BEFORE any leg
-    is ever attempted, so "does a plan exist" is a stable, restart-safe,
-    durable fact.
-  * Only a candidate with NO persisted plan gets a fresh, single,
+    ``SER8DemoOrderSendControl.get_plan_for_candidate`` -- a read-only
+    accessor. If an execution PLAN already exists for this candidate,
+    the worker NEVER re-evaluates risk, NEVER re-authorizes, and NEVER
+    re-claims for it -- a plan is persisted (by ``send``/``resume_plan``)
+    BEFORE any leg is ever attempted, so "does a plan exist" is a
+    stable, restart-safe, durable fact, and re-deriving a NEW plan for
+    the same candidate is never attempted.
+  * An existing plan is NOT automatically "fully processed", though.
+    Every persisted leg is inspected: if EVERY leg already has a send
+    attempt (in ANY state -- FILLED, PENDING, a terminal non-fill, or
+    even UNKNOWN), there is genuinely nothing left to do and the cycle
+    reports ``ALREADY_PROCESSED``. If ANY leg has NO send attempt yet
+    (e.g. a process crashed after leg #1 succeeded but before leg #2 was
+    ever attempted), the worker calls
+    ``SER8DemoOrderSendControl.resume_plan`` -- the ONLY authoritative
+    way to continue an existing plan -- which re-verifies the SAME
+    invariants a fresh ``send`` call would (demo account gate, claim
+    staleness) using the SAME already-persisted ``claim`` (reloaded via
+    ``SER8ExecutionAuthorizationClaimControl.get_claim`` -- never
+    re-claimed) and attempts ONLY the genuinely unattempted legs, built
+    EXCLUSIVELY from the plan's own frozen leg data -- never a freshly
+    re-evaluated ``RiskDecision``. ``resume_plan`` never creates a new
+    plan and never creates a new claim; an already-attempted leg (in ANY
+    state, including UNKNOWN) is NEVER resent, and an UNKNOWN leg BLOCKS
+    every leg after it from being attempted, exactly like a fresh
+    ``send`` call.
+  * Only a candidate with NO persisted plan at all gets a fresh, single,
     uninterrupted risk-eval -> authorize -> claim -> send call chain,
     entirely within one Python call (never split across a restart
     boundary) -- so the ``RiskDecision`` object ``send`` receives is
     always the SAME one ``authorize``/``claim`` were just computed
-    against, and ``send``'s own crash-resume logic (skip already-
-    attempted legs) is always operating on a plan keyed by a
-    ``decision_id`` this exact process just produced.
+    against.
   * If a process crashes strictly BETWEEN ``authorize`` succeeding and
     ``send`` ever being called (so no plan was ever persisted), the OLD
     authorization simply sits there until its own TTL
@@ -71,22 +87,32 @@ closed authorization/claim/send layers:
     the task's own audit question: NO new authorization-cleanup
     mechanism is needed; the existing TTL is sufficient, and the worker
     only needs to fail closed on conflict rather than invent a bypass.
-  * If a process crashes AFTER ``send`` has already persisted a plan and
-    attempted at least one leg, the plan-existence check above means
-    this candidate is NEVER touched again by this worker -- an
-    intentionally conservative, explicitly-safe outcome (a partially-
-    sent multi-leg basket can stall short of its remaining legs after a
-    crash in that narrow window) that is always visible via this
-    script's own observability line (``legs_existing`` vs ``pending``/
-    ``filled``) for human follow-up, rather than risk ANY code path that
-    could double-send a leg under a changed ``decision_id``.
+  * ``resume_plan`` re-checks the SAME claim-staleness bound
+    (``DEFAULT_MAXIMUM_CLAIM_AGE_SECONDS`` = 60s from the ORIGINAL
+    ``claimed_at``) a fresh ``send`` call would -- resuming a plan whose
+    claim has gone stale fails closed exactly like sending fresh legs
+    under it would, never silently exempted. In practice this means
+    resume is reliable within roughly the same scheduler tick as the
+    crash (the worker's default 1-minute cadence); a restart beyond that
+    window leaves the plan stalled at whatever legs were already
+    attempted -- an explicit, visible (via this script's own
+    observability line), fail-closed outcome, never a bypass of an
+    already-established freshness invariant.
 
 DRY-RUN: performs candidate selection, eligibility, and risk evaluation
 exactly like a real cycle, and previews the plan Risk Manager WOULD
-produce -- but calls no authorization, claim, or send at all (not even to
-persist an idempotent no-op), so it can never consume the candidate,
-never conflicts with a concurrent/later real cycle, and never creates
-misleading terminal execution state.
+produce -- but calls no authorization, claim, send, or resume_plan at
+all (not even to persist an idempotent no-op), so it can NEVER consume
+the candidate, NEVER create or touch any execution-side persistent
+state (no ``ExecutionAuthorizationV1``, no ``ExecutionAuthorizationClaimV1``,
+no execution plan, no leg attempt, no outcome row), and therefore can
+NEVER conflict with a concurrent/later real cycle even if the live MT5
+account/positions snapshot drifts between the dry-run and the real run
+that follows it (the REAL Windows incident this task's spec describes --
+a PREVIEW that silently created a real authorization, later conflicting
+with a real run once the snapshot moved -- is structurally impossible
+here, because dry-run mode returns before ANY execution-side control's
+write path is ever reached).
 
 OUTCOME CAPTURE: every cycle also calls
 ``trademind.ser8_demo_trade_outcome_capture.SER8DemoTradeOutcomeControl.
@@ -118,7 +144,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -150,6 +176,7 @@ from trademind.ser8_execution_authorization import (  # noqa: E402
     SER8ExecutionAuthorizationError,
 )
 from trademind.ser8_execution_authorization_claim import (  # noqa: E402
+    ExecutionAuthorizationClaimV1,
     SER8ExecutionAuthorizationClaimConflict,
     SER8ExecutionAuthorizationClaimControl,
     SER8ExecutionAuthorizationClaimError,
@@ -258,9 +285,17 @@ class CycleSummary:
 
 
 def _observe_claim_legs(send_control: SER8DemoOrderSendControl, claim_id: str, summary: CycleSummary) -> None:
+    """Recomputes every leg-state count on ``summary`` from scratch --
+    idempotent regardless of how many times it is called for the same
+    cycle (e.g. once before a resume attempt to size the observation, and
+    again after -- see ``_execute_and_observe``'s own call), never
+    accumulating across calls."""
     leg_ids = send_control.list_leg_ids_for_claim(claim_id)
     summary.legs_total = len(leg_ids)
     summary.legs_existing = len(leg_ids)
+    summary.filled = 0
+    summary.pending = 0
+    summary.terminal_failures = 0
     for leg_id in leg_ids:
         receipt = send_control.get_leg_receipt(leg_id)
         if receipt is None:
@@ -271,6 +306,47 @@ def _observe_claim_legs(send_control: SER8DemoOrderSendControl, claim_id: str, s
             summary.pending += 1
         elif receipt.result_state != "UNKNOWN":
             summary.terminal_failures += 1
+
+
+def _execute_and_observe(
+    *,
+    real_send_control: SER8DemoOrderSendControl,
+    claim: ExecutionAuthorizationClaimV1,
+    summary: CycleSummary,
+    action: Callable[[], object],
+) -> None:
+    """Shared exception-handling/observability tail for BOTH a fresh
+    ``send()`` call and a ``resume_plan()`` call -- ``action`` is a
+    zero-argument callable performing exactly one of the two. Both raise
+    the SAME exception types for the SAME aggregate outcomes (see
+    ``SER8DemoOrderSendControl._resolve_plan_outcome``), so this single
+    handler is correct for either, and counts actual NEW broker sends via
+    a before/after leg-id diff -- never assumed from the exception type
+    alone."""
+    pre_leg_ids = set(real_send_control.list_leg_ids_for_claim(claim.claim_id))
+    try:
+        action()
+        summary.cycle_status = "EXECUTION_COMPLETE"
+    except SER8DemoOrderPendingError:
+        summary.cycle_status = "EXECUTION_PENDING"
+    except SER8DemoOrderReconciliationRequiredError as exc:
+        summary.cycle_status = "EXECUTION_PENDING_RECONCILIATION"
+        summary.risk_block_reason = str(exc)
+    except SER8DemoOrderPartialExecutionError as exc:
+        summary.cycle_status = "EXECUTION_PARTIAL"
+        summary.risk_block_reason = str(exc)
+    except SER8DemoOrderRejectedError as exc:
+        summary.cycle_status = "EXECUTION_FAILED"
+        summary.risk_block_reason = str(exc)
+    except SER8DemoOrderAlreadyAttemptedError:
+        summary.cycle_status = "ALREADY_PROCESSED"
+    except SER8DemoOrderSendError as exc:
+        summary.cycle_status = "FAIL_CLOSED_SEND_DENIED"
+        summary.risk_block_reason = str(exc)
+    post_leg_ids = set(real_send_control.list_leg_ids_for_claim(claim.claim_id))
+    summary.broker_sends_this_cycle = len(post_leg_ids - pre_leg_ids)
+    _observe_claim_legs(real_send_control, claim.claim_id, summary)
+    summary.legs_newly_submitted = summary.broker_sends_this_cycle
 
 
 def _capture_outcomes(
@@ -399,17 +475,61 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
     outcome_control = SER8DemoTradeOutcomeControl(registry=pipeline.registry)
 
     # ONE-SHOT ANCHOR: a candidate with an already-persisted execution
-    # plan is NEVER re-evaluated, re-authorized, re-claimed, or re-sent --
-    # see this script's own module docstring for the full restart-safety
-    # rationale.
-    existing_claim_id = send_control.get_plan_claim_id_for_candidate(candidate.signal_id)
-    if existing_claim_id is not None:
-        summary.candidate_status = "ALREADY_PROCESSED"
-        summary.claim_id = existing_claim_id
-        summary.cycle_status = "ALREADY_PROCESSED"
-        _observe_claim_legs(send_control, existing_claim_id, summary)
+    # plan is NEVER re-evaluated, re-authorized, or re-claimed -- see this
+    # script's own module docstring for the full restart-safety
+    # rationale. It is NOT automatically "fully processed", though: any
+    # leg with no send attempt yet is safely resumable via resume_plan.
+    plan = send_control.get_plan_for_candidate(candidate.signal_id)
+    if plan is not None:
+        summary.claim_id = plan.claim_id
+        summary.execution_plan_id = plan.plan_id
+        summary.authorization_id = plan.authorization_id
+        leg_ids = send_control.list_leg_ids_for_claim(plan.claim_id)
+        receipts = {leg_id: send_control.get_leg_receipt(leg_id) for leg_id in leg_ids}
+        fully_attempted = len(leg_ids) == len(plan.legs) and all(r is not None for r in receipts.values())
+
+        if fully_attempted:
+            summary.candidate_status = "ALREADY_PROCESSED"
+            summary.cycle_status = "ALREADY_PROCESSED"
+            _observe_claim_legs(send_control, plan.claim_id, summary)
+            summary.outcomes_ingested = _capture_outcomes_report_only(
+                outcome_control=outcome_control, send_control=send_control,
+                authorization_control=authorization_control, account=args.account, deals_csv=deals_csv, now=now,
+            )
+            return summary
+
+        # Some legs are genuinely unattempted -- resumable through
+        # resume_plan ONLY. resume_plan is a REAL send-capable operation
+        # (it may call the transport for the remaining legs), so
+        # --dry-run must report this state WITHOUT ever reaching it.
+        summary.candidate_status = "RESUMABLE"
+        _observe_claim_legs(send_control, plan.claim_id, summary)
+        if args.dry_run:
+            summary.cycle_status = "DRY_RUN_WOULD_RESUME"
+            return summary
+
+        claim = claim_control.get_claim(plan.authorization_id)
+        if claim is None:
+            summary.cycle_status = "FAIL_CLOSED_RESUME_NO_CLAIM"
+            summary.risk_block_reason = (
+                f"execution plan {plan.plan_id} exists but no claim was ever persisted for "
+                f"authorization_id {plan.authorization_id!r}; cannot safely resume"
+            )
+            return summary
+
+        allowlist = DemoAccountAllowlistV1(account_ids=tuple(args.demo_account_allowlist))
+        common_files_dir = Path(args.common_files_dir).expanduser()
+        real_transport = FileBridgeDemoOrderTransport(
+            common_files_dir=common_files_dir, login=args.account,
+            poll_interval_seconds=args.transport_poll_seconds, timeout_seconds=args.transport_timeout_seconds,
+        )
+        real_send_control = SER8DemoOrderSendControl(registry=pipeline.registry, transport=real_transport)
+        _execute_and_observe(
+            real_send_control=real_send_control, claim=claim, summary=summary,
+            action=lambda: real_send_control.resume_plan(claim, allowlist=allowlist, now=now),
+        )
         summary.outcomes_ingested = _capture_outcomes_report_only(
-            outcome_control=outcome_control, send_control=send_control,
+            outcome_control=outcome_control, send_control=real_send_control,
             authorization_control=authorization_control, account=args.account, deals_csv=deals_csv, now=now,
         )
         return summary
@@ -508,31 +628,10 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
     )
     real_send_control = SER8DemoOrderSendControl(registry=pipeline.registry, transport=real_transport)
 
-    pre_leg_ids = set(real_send_control.list_leg_ids_for_claim(claim.claim_id))
-    try:
-        real_send_control.send(claim, result.decision, candidate, allowlist=allowlist, now=now)
-        summary.cycle_status = "EXECUTION_COMPLETE"
-    except SER8DemoOrderPendingError:
-        summary.cycle_status = "EXECUTION_PENDING"
-    except SER8DemoOrderReconciliationRequiredError as exc:
-        summary.cycle_status = "EXECUTION_PENDING_RECONCILIATION"
-        summary.risk_block_reason = str(exc)
-    except SER8DemoOrderPartialExecutionError as exc:
-        summary.cycle_status = "EXECUTION_PARTIAL"
-        summary.risk_block_reason = str(exc)
-    except SER8DemoOrderRejectedError as exc:
-        summary.cycle_status = "EXECUTION_FAILED"
-        summary.risk_block_reason = str(exc)
-    except SER8DemoOrderAlreadyAttemptedError:
-        summary.cycle_status = "ALREADY_PROCESSED"
-    except SER8DemoOrderSendError as exc:
-        summary.cycle_status = "FAIL_CLOSED_SEND_DENIED"
-        summary.risk_block_reason = str(exc)
-    post_leg_ids = set(real_send_control.list_leg_ids_for_claim(claim.claim_id))
-    summary.broker_sends_this_cycle = len(post_leg_ids - pre_leg_ids)
-
-    _observe_claim_legs(real_send_control, claim.claim_id, summary)
-    summary.legs_newly_submitted = summary.broker_sends_this_cycle
+    _execute_and_observe(
+        real_send_control=real_send_control, claim=claim, summary=summary,
+        action=lambda: real_send_control.send(claim, result.decision, candidate, allowlist=allowlist, now=now),
+    )
 
     summary.outcomes_ingested = _capture_outcomes_report_only(
         outcome_control=outcome_control, send_control=real_send_control,
@@ -544,7 +643,7 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
 def _cycle_exit_code(cycle_status: str) -> int:
     if cycle_status in (
         "NO_ELIGIBLE_CANDIDATE", "RISK_BLOCK", "ALREADY_PROCESSED", "EXECUTION_COMPLETE",
-        "EXECUTION_PENDING", "DRY_RUN_WOULD_EXECUTE",
+        "EXECUTION_PENDING", "DRY_RUN_WOULD_EXECUTE", "DRY_RUN_WOULD_RESUME",
     ):
         return 0
     return 1

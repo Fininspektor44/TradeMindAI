@@ -947,6 +947,47 @@ def test_claim_carries_no_broker_ticket_or_fill_field() -> None:
 
 
 # ---------------------------------------------------------------------------
+# get_claim -- narrow, read-only accessor added for SER8 AUTONOMOUS
+# WORKER RESTART RESUME + DRY-RUN PURITY V1's restart-resume path (a
+# resuming worker holds a plan's own authorization_id, not a claim
+# object, and must recover the exact claim it was built from).
+# ---------------------------------------------------------------------------
+
+
+def test_get_claim_returns_the_persisted_claim(tmp_path: Path) -> None:
+    context, authorization, claim_control = _claimed_case(tmp_path)
+    claim = claim_control.claim(authorization, claimant_id="ser8-adapter-session-1", now=NOW)
+
+    fetched = claim_control.get_claim(authorization.authorization_id)
+    assert fetched is not None
+    assert fetched.claim_id == claim.claim_id
+    assert fetched.claim_hash == claim.claim_hash
+    assert fetched.claimant_id == "ser8-adapter-session-1"
+    assert fetched.risk_decision_id == authorization.risk_decision_id
+    assert fetched.live_candidate_signal_id == authorization.live_candidate_signal_id
+
+
+def test_get_claim_returns_none_for_never_claimed_authorization(tmp_path: Path) -> None:
+    context, authorization, claim_control = _claimed_case(tmp_path)
+    assert claim_control.get_claim(authorization.authorization_id) is None
+
+
+def test_get_claim_never_creates_or_mutates_anything(tmp_path: Path) -> None:
+    context, authorization, claim_control = _claimed_case(tmp_path)
+    claim_control.claim(authorization, claimant_id="ser8-adapter-session-1", now=NOW)
+
+    before = sqlite3.connect(context.db_path).execute(
+        "SELECT COUNT(*) FROM ser8_execution_authorization_claims"
+    ).fetchone()[0]
+    for _ in range(5):
+        claim_control.get_claim(authorization.authorization_id)
+    after = sqlite3.connect(context.db_path).execute(
+        "SELECT COUNT(*) FROM ser8_execution_authorization_claims"
+    ).fetchone()[0]
+    assert before == after == 1
+
+
+# ---------------------------------------------------------------------------
 # 11-12: existing authorization/risk/research tests remain green; full
 # pytest green -- run separately as part of this task's own VALIDATION.
 # ---------------------------------------------------------------------------

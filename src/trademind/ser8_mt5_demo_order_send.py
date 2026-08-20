@@ -744,6 +744,44 @@ def build_demo_order_execution_plan(
     )
 
 
+def _plan_leg_from_payload(payload: dict[str, object]) -> DemoOrderPlanLegV1:
+    return DemoOrderPlanLegV1(
+        entry_index=payload["entry_index"],
+        leg_id=payload["leg_id"],
+        order_type=payload["order_type"],
+        planned_price=payload["planned_price"],
+        effective_entry_price=payload["effective_entry_price"],
+        allocation=payload["allocation"],
+        volume=payload["volume"],
+        sl=payload["sl"],
+        tp=payload["tp"],
+    )
+
+
+def _plan_from_payload(payload: dict[str, object]) -> DemoOrderExecutionPlanV1:
+    """Reconstructs the immutable, already-persisted execution plan from
+    its own persisted JSON payload -- never re-derived from a freshly
+    re-evaluated RiskDecision/SignalCandidate. This is what makes crash/
+    restart resumption of unattempted legs possible (see
+    :meth:`SER8DemoOrderSendControl.resume_plan`): the plan's own frozen
+    leg data (order_type/planned_price/volume/sl/tp) is EXACTLY what
+    :func:`build_demo_order_execution_plan` computed from the ORIGINAL,
+    genuine ALLOW decision at plan-creation time -- reading it back is not
+    re-deriving or inventing anything."""
+    return DemoOrderExecutionPlanV1(
+        schema_version=payload["schema_version"],
+        plan_id=payload["plan_id"],
+        claim_id=payload["claim_id"],
+        authorization_id=payload["authorization_id"],
+        decision_id=payload["decision_id"],
+        candidate_signal_id=payload["candidate_signal_id"],
+        demo_account_id=payload["demo_account_id"],
+        symbol=payload["symbol"],
+        action=payload["action"],
+        legs=tuple(_plan_leg_from_payload(leg) for leg in payload["legs"]),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class DemoOrderTransportResult:
     """The broker's raw, unclassified response to one order request,
@@ -1678,27 +1716,60 @@ class SER8DemoOrderSendControl:
         This is the ONE-SHOT anchor an autonomous execution worker uses
         to decide whether a candidate has ALREADY produced an
         authoritative execution plan -- and must therefore never be
-        re-evaluated, re-authorized, re-claimed, or re-sent, even across
-        a process restart. ``plan_id`` is itself content-derived from
-        ``(claim_id, decision_id, candidate_signal_id)``, so a fresh risk
+        RE-EVALUATED, RE-AUTHORIZED, or RE-CLAIMED, even across a process
+        restart (``plan_id`` is itself content-derived from ``(claim_id,
+        decision_id, candidate_signal_id)``, so a fresh risk
         re-evaluation after a live account/market snapshot has moved on
         can legitimately compute a DIFFERENT ``decision_id`` for the
-        "same" candidate; calling :meth:`send` again in that case would
-        risk treating an already-attempted leg as brand new. Checking
-        this accessor FIRST, before any fresh risk/authorize/claim
-        attempt, is what makes that unsafe path unreachable -- once any
-        plan exists for a candidate, an autonomous caller must only
-        observe it (e.g. via :meth:`list_leg_ids_for_claim` +
-        :meth:`get_leg_receipt`), never resend it. When more than one
-        plan somehow exists for the same candidate, the most recently
-        created one is returned. Never touches the transport."""
+        "same" candidate; calling :meth:`send` fresh in that case would
+        risk treating an already-attempted leg as brand new). An existing
+        plan is NOT automatically "fully processed", though -- a leg with
+        no send attempt yet may still be safely resumed, but ONLY through
+        :meth:`resume_plan`, never through a fresh :meth:`send` call (see
+        :meth:`get_plan_for_candidate`/:meth:`resume_plan` for the full
+        resumption path). When more than one plan somehow exists for the
+        same candidate, the most recently created one is returned. Never
+        touches the transport."""
+        plan = self.get_plan_for_candidate(candidate_signal_id)
+        return plan.claim_id if plan is not None else None
+
+    def get_plan_for_candidate(self, candidate_signal_id: str) -> DemoOrderExecutionPlanV1 | None:
+        """Public, read-only accessor: the full, already-persisted
+        execution plan for this ``candidate_signal_id`` -- ``None`` if no
+        plan has ever been persisted for this candidate. Reconstructed
+        independently from the persisted row (never re-derived from a
+        freshly re-evaluated RiskDecision/SignalCandidate); the returned
+        object's own ``plan_hash`` re-verification is inherited
+        automatically via ``DemoOrderExecutionPlanV1.__post_init__``.
+        Gives an autonomous caller everything :meth:`resume_plan` needs to
+        continue this plan's unattempted legs, and everything needed to
+        inspect its ``authorization_id``/``decision_id``/``claim_id``
+        lineage, without granting any new authorization or touching this
+        table's write path. When more than one plan somehow exists for
+        the same candidate, the most recently created one is returned."""
         with self._connect() as db:
             row = db.execute(
-                "SELECT claim_id FROM ser8_mt5_demo_order_plans WHERE candidate_signal_id=? "
+                "SELECT payload_json FROM ser8_mt5_demo_order_plans WHERE candidate_signal_id=? "
                 "ORDER BY created_at DESC LIMIT 1",
                 (candidate_signal_id,),
             ).fetchone()
-        return row["claim_id"] if row is not None else None
+        if row is None:
+            return None
+        return _plan_from_payload(json.loads(row["payload_json"]))
+
+    def _load_plan_for_claim(self, claim_id: str) -> DemoOrderExecutionPlanV1 | None:
+        """Private counterpart of :meth:`get_plan_for_candidate`, looked
+        up by ``claim_id`` instead -- used internally by
+        :meth:`resume_plan`, which is handed a claim, not a candidate."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload_json FROM ser8_mt5_demo_order_plans WHERE claim_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (claim_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _plan_from_payload(json.loads(row["payload_json"]))
 
     def list_filled_leg_ids_for_account(self, demo_account_id: str) -> tuple[str, ...]:
         """Every leg identity, across ALL claims, currently persisted
@@ -1883,6 +1954,20 @@ class SER8DemoOrderSendControl:
             )
             leg_receipts.append(receipt)
 
+        return self._resolve_plan_outcome(plan, claim, leg_receipts)
+
+    def _resolve_plan_outcome(
+        self,
+        plan: DemoOrderExecutionPlanV1,
+        claim: ExecutionAuthorizationClaimV1,
+        leg_receipts: list[DemoOrderExecutionReceiptV1],
+    ) -> DemoOrderExecutionReceiptV1 | DemoOrderExecutionPlanReceiptV1:
+        """Shared tail for :meth:`send` and :meth:`resume_plan`: turns a
+        list of per-leg receipts (whichever mix of pre-existing and
+        freshly-attempted this call produced) into the SAME return value/
+        exception :meth:`send` has always produced -- extracted verbatim,
+        not re-derived, so both entrypoints are provably identical in
+        their outcome semantics."""
         aggregate_state = _aggregate_state(leg_receipts, total_legs=len(plan.legs))
 
         if len(plan.legs) == 1:
@@ -1941,6 +2026,162 @@ class SER8DemoOrderSendControl:
             f"execution plan {plan.plan_id} for claim {claim.claim_id} failed on every leg. "
             f"leg states: {leg_states}"
         )
+
+    def resume_plan(
+        self,
+        claim: ExecutionAuthorizationClaimV1,
+        *,
+        allowlist: DemoAccountAllowlistV1,
+        maximum_claim_age_seconds: float = DEFAULT_MAXIMUM_CLAIM_AGE_SECONDS,
+        now: datetime | None = None,
+    ) -> DemoOrderExecutionReceiptV1 | DemoOrderExecutionPlanReceiptV1:
+        """Resumes an ALREADY-PERSISTED execution plan for this claim,
+        attempting ONLY the legs that have no send-attempt record yet --
+        using EXCLUSIVELY the plan's own already-persisted, immutable leg
+        data (frozen at the original :meth:`send` call's own plan-
+        creation step), NEVER a freshly re-evaluated ``RiskDecision``
+        (which cannot be safely reconstructed after a process restart --
+        see this module's own crash/restart-safety discussion). This is
+        the ONLY authoritative way to continue a plan across a restart.
+        It NEVER creates a new plan (the plan is looked up, never
+        rebuilt via :func:`build_demo_order_execution_plan`) and NEVER
+        creates a new claim (the SAME, already-persisted ``claim`` is
+        independently re-verified here, never re-claimed).
+
+        Every invariant this reuses is the SAME one :meth:`send` itself
+        enforces: the demo account gate, claim staleness
+        (``maximum_claim_age_seconds`` -- the SAME default, so a claim
+        that has gone stale since its original claim() call fails closed
+        here exactly as it would for a fresh send() call, never silently
+        exempted), and this module's own established per-leg one-shot
+        guard (``_reserve_leg_attempt``) -- an already-attempted leg, in
+        ANY state (including UNKNOWN), is NEVER resent; an UNKNOWN leg
+        BLOCKS every leg after it from being attempted, exactly like a
+        fresh :meth:`send` call.
+
+        Raises :class:`SER8DemoOrderSendError` if no plan has ever been
+        persisted for this claim (there is nothing to resume -- call
+        :meth:`send` for a genuinely new claim instead), or if the
+        persisted plan does not belong to the exact supplied claim.
+        Raises :class:`SER8DemoOrderAlreadyAttemptedError` if every leg
+        already has a send attempt (nothing to resume). Otherwise raises
+        the SAME exception types as :meth:`send` --
+        :class:`SER8DemoOrderPendingError`/
+        :class:`SER8DemoOrderReconciliationRequiredError`/
+        :class:`SER8DemoOrderPartialExecutionError`/
+        :class:`SER8DemoOrderRejectedError` -- for the SAME aggregate
+        outcomes, and returns the SAME receipt types on COMPLETE.
+        """
+        if maximum_claim_age_seconds <= 0:
+            raise SER8DemoOrderSendError("maximum_claim_age_seconds must be positive")
+        captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+
+        # 1: demo account gate -- inherited unchanged, re-verified fresh.
+        try:
+            demo_authorization = verify_demo_account_authorization(claim, allowlist=allowlist, now=captured_at)
+        except DemoAccountSafetyGateError as exc:
+            raise SER8DemoOrderSendError(f"demo account safety gate denied this claim: {exc}") from exc
+
+        # 2: claim staleness -- the SAME invariant send() itself enforces.
+        claimed_at = datetime.fromisoformat(claim.claimed_at)
+        claim_age = (captured_at - claimed_at).total_seconds()
+        if claim_age < 0 or claim_age > maximum_claim_age_seconds:
+            raise SER8DemoOrderSendError(
+                f"claim age {claim_age:.1f}s is outside the allowed "
+                f"{maximum_claim_age_seconds:.1f}s send window -- cannot resume"
+            )
+
+        # 3: the plan must already exist -- resume_plan() never creates
+        # or rebuilds one.
+        plan = self._load_plan_for_claim(claim.claim_id)
+        if plan is None:
+            raise SER8DemoOrderSendError(
+                f"no execution plan has ever been persisted for claim {claim.claim_id}; nothing to "
+                "resume -- call send() to create one"
+            )
+        if plan.claim_id != claim.claim_id or plan.authorization_id != claim.authorization_id:
+            raise SER8DemoOrderSendError(
+                "persisted execution plan does not belong to the exact supplied claim -- refusing to resume"
+            )
+
+        already_attempted = {leg.leg_id: self._existing_leg_receipt(leg.leg_id) for leg in plan.legs}
+        if all(receipt is not None for receipt in already_attempted.values()):
+            raise SER8DemoOrderAlreadyAttemptedError(
+                f"every leg of plan {plan.plan_id} already has a send attempt; nothing to resume"
+            )
+
+        leg_receipts: list[DemoOrderExecutionReceiptV1] = []
+        blocked = False
+        for leg in plan.legs:
+            if blocked:
+                break
+
+            existing = already_attempted[leg.leg_id]
+            if existing is not None:
+                leg_receipts.append(existing)
+                if existing.result_state == "UNKNOWN":
+                    blocked = True
+                continue
+
+            # Built EXCLUSIVELY from the plan's own already-persisted,
+            # immutable leg + top-level fields -- never a freshly
+            # re-evaluated RiskDecision/SignalCandidate/SizedOrder. This
+            # is byte-identical to what build_demo_order_leg_request
+            # would have produced originally: plan.legs[i]'s own
+            # order_type/planned_price/volume/sl/tp ARE that original
+            # computation's output, frozen at plan-creation time.
+            request = DemoOrderRequestV1(
+                schema_version=SCHEMA_VERSION, parent_claim_id=plan.claim_id, entry_index=leg.entry_index,
+                claim_id=leg.leg_id, authorization_id=plan.authorization_id, demo_account_id=plan.demo_account_id,
+                symbol=plan.symbol, action=plan.action, order_type=leg.order_type, volume=leg.volume,
+                price=leg.planned_price, sl=leg.sl, tp=leg.tp, magic=DEMO_EXECUTOR_MAGIC_NUMBER,
+                comment=f"SER8:{leg.leg_id[-20:]}",
+            )
+            attempt_id = _attempt_id(claim.account_id, leg.leg_id)
+
+            self._reserve_leg_attempt(
+                leg_id=leg.leg_id, plan_id=plan.plan_id, parent_claim_id=claim.claim_id,
+                entry_index=leg.entry_index, attempt_id=attempt_id, request=request,
+                demo_authorization=demo_authorization, captured_at=captured_at,
+            )
+
+            common_kwargs = dict(
+                claim_id=leg.leg_id,
+                plan_id=plan.plan_id,
+                parent_claim_id=claim.claim_id,
+                entry_index=leg.entry_index,
+                authorization_id=claim.authorization_id,
+                demo_gate_hash=demo_authorization.gate_hash,
+                request_hash=request.request_hash,
+                attempt_id=attempt_id,
+                recorded_at=captured_at.isoformat(),
+                requested_volume=request.volume,
+                requested_price=request.price,
+            )
+
+            try:
+                transport_result = self.transport.send(request)
+            except Exception:
+                receipt = self._finalize(result_state="UNKNOWN", **common_kwargs)
+                leg_receipts.append(receipt)
+                blocked = True
+                continue
+
+            result_state = _classify_result(request, transport_result)
+            receipt = self._finalize(
+                result_state=result_state,
+                retcode=transport_result.retcode,
+                retcode_description=transport_result.retcode_description,
+                order_ticket=transport_result.order_ticket,
+                deal_ticket=transport_result.deal_ticket,
+                position_ticket=transport_result.position_ticket,
+                filled_volume=transport_result.filled_volume,
+                filled_price=transport_result.filled_price,
+                **common_kwargs,
+            )
+            leg_receipts.append(receipt)
+
+        return self._resolve_plan_outcome(plan, claim, leg_receipts)
 
 
 __all__ = [

@@ -2888,3 +2888,288 @@ def test_list_pending_leg_ids_for_account_filters_by_account(tmp_path: Path) -> 
 
     assert control.list_pending_leg_ids_for_account(LOGIN) != ()
     assert control.list_pending_leg_ids_for_account("99999999") == ()
+
+
+# ---------------------------------------------------------------------------
+# resume_plan -- SER8 AUTONOMOUS WORKER RESTART RESUME + DRY-RUN PURITY V1.
+# An existing plan is NOT automatically "fully processed": a leg with no
+# send attempt yet (a genuine process crash strictly between attempting
+# one leg and the next) may be safely resumed, but ONLY through
+# resume_plan, using EXCLUSIVELY the plan's own already-persisted,
+# immutable leg data -- never a freshly re-evaluated RiskDecision.
+# ---------------------------------------------------------------------------
+
+
+def _seed_plan_with_partial_attempts(
+    control: SER8DemoOrderSendControl, claim, decision, candidate, *, allowlist, attempted_states: dict[int, str],
+    now: datetime | None = None,
+):
+    """Persists a REAL execution plan (via build_demo_order_execution_plan
+    -- the SAME pure builder send()/resume_plan() themselves use) plus a
+    send attempt for ONLY the legs named in ``attempted_states`` --
+    leaving every other leg with NO attempt row at all, precisely
+    simulating a process that crashed strictly between attempting one leg
+    and the next (never reachable from a single send() call, which always
+    attempts every leg in order unless blocked by UNKNOWN). 'FILLED'/
+    'PENDING' finalize a receipt in that state; 'UNKNOWN' reserves the
+    attempt but never finalizes it -- the SAME self-heal-to-UNKNOWN path
+    ``_existing_leg_receipt`` already establishes for a genuine
+    mid-attempt crash, not a separately invented state."""
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    now = now or NOW
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=allowlist, now=now)
+    plan = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo_authorization)
+    control._persist_plan(plan, created_at=now.isoformat())
+
+    for leg in plan.legs:
+        if leg.entry_index not in attempted_states:
+            continue
+        state = attempted_states[leg.entry_index]
+        request = DemoOrderRequestV1(
+            schema_version=SCHEMA_VERSION, parent_claim_id=plan.claim_id, entry_index=leg.entry_index,
+            claim_id=leg.leg_id, authorization_id=plan.authorization_id, demo_account_id=plan.demo_account_id,
+            symbol=plan.symbol, action=plan.action, order_type=leg.order_type, volume=leg.volume,
+            price=leg.planned_price, sl=leg.sl, tp=leg.tp, magic=DEMO_EXECUTOR_MAGIC_NUMBER,
+            comment=f"SER8:{leg.leg_id[-20:]}",
+        )
+        attempt_id = f"EAO-{leg.leg_id}"
+        control._reserve_leg_attempt(
+            leg_id=leg.leg_id, plan_id=plan.plan_id, parent_claim_id=plan.claim_id, entry_index=leg.entry_index,
+            attempt_id=attempt_id, request=request, demo_authorization=demo_authorization, captured_at=now,
+        )
+        if state == "UNKNOWN":
+            continue
+        common = dict(
+            claim_id=leg.leg_id, plan_id=plan.plan_id, parent_claim_id=plan.claim_id, entry_index=leg.entry_index,
+            authorization_id=plan.authorization_id, demo_gate_hash=demo_authorization.gate_hash,
+            request_hash=request.request_hash, attempt_id=attempt_id, recorded_at=now.isoformat(),
+            requested_volume=request.volume, requested_price=request.price,
+        )
+        if state == "FILLED":
+            control._finalize(
+                result_state="FILLED", retcode=10009, retcode_description="Request completed",
+                order_ticket=f"{leg.entry_index}01", deal_ticket=f"{leg.entry_index}02",
+                position_ticket=f"{leg.entry_index}03", filled_volume=leg.volume, filled_price=leg.planned_price,
+                **common,
+            )
+        elif state == "PENDING":
+            control._finalize(
+                result_state="PENDING", retcode=10009, retcode_description="done",
+                order_ticket=f"7331245{leg.entry_index}", deal_ticket="0", position_ticket="0",
+                filled_volume=None, filled_price=None, **common,
+            )
+        else:
+            raise AssertionError(f"unsupported seed state: {state}")
+    return plan
+
+
+def _plan_row_count(control: SER8DemoOrderSendControl) -> int:
+    db = sqlite3.connect(control.path)
+    try:
+        return db.execute("SELECT COUNT(*) FROM ser8_mt5_demo_order_plans").fetchone()[0]
+    finally:
+        db.close()
+
+
+def test_scenario_a_filled_then_two_unattempted_legs_resume_exactly_once(tmp_path: Path) -> None:
+    """A) plan persisted, #1 FILLED, #2/#3 unattempted, restart -- #1 zero
+    resend, #2/#3 resumed exactly once."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"},
+    )
+    assert control.get_leg_receipt(leg_identity(claim.claim_id, 2, total_legs=3)) is None
+    assert control.get_leg_receipt(leg_identity(claim.claim_id, 3, total_legs=3)) is None
+
+    resumable = SER8DemoOrderSendControl(
+        registry=context.registry, transport=FakeDemoOrderTransport(result_factory=_clean_result)
+    )
+    receipt = resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+
+    assert isinstance(receipt, DemoOrderExecutionPlanReceiptV1)
+    assert receipt.aggregate_state == "COMPLETE"
+    states = {r.entry_index: r.result_state for r in receipt.leg_receipts}
+    assert states == {1: "FILLED", 2: "FILLED", 3: "FILLED"}
+    assert len(resumable.transport.calls) == 2  # ONLY legs #2 and #3 -- leg #1 never resent.
+    assert {req.entry_index for req in resumable.transport.calls} == {2, 3}
+    assert _plan_row_count(control) == 1  # no new plan created.
+
+
+def test_scenario_b_filled_and_pending_then_one_unattempted_leg_resumes_once(tmp_path: Path) -> None:
+    """B) plan persisted, #1 FILLED, #2 PENDING, #3 unattempted, restart --
+    #1/#2 zero resend, #3 resumed exactly once."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN),
+        attempted_states={1: "FILLED", 2: "PENDING"},
+    )
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderPendingError):
+        resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+
+    assert len(transport.calls) == 1  # ONLY leg #3.
+    assert transport.calls[0].entry_index == 3
+    leg2_receipt = resumable.get_leg_receipt(leg_identity(claim.claim_id, 2, total_legs=3))
+    assert leg2_receipt.result_state == "PENDING"  # never touched/resent.
+    leg3_receipt = resumable.get_leg_receipt(leg_identity(claim.claim_id, 3, total_legs=3))
+    assert leg3_receipt.result_state == "FILLED"
+
+
+def test_scenario_c_unknown_leg_blocks_resume_zero_sends(tmp_path: Path) -> None:
+    """C) plan persisted, #1 UNKNOWN, #2/#3 unattempted, restart -- FAIL
+    CLOSED, #1/#2/#3 zero broker sends."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "UNKNOWN"},
+    )
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderReconciliationRequiredError):
+        resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+
+    assert transport.calls == []  # #2 and #3 never attempted -- #1 is UNKNOWN and blocks everything after it.
+    assert resumable.get_leg_receipt(leg_identity(claim.claim_id, 1, total_legs=3)).result_state == "UNKNOWN"
+    assert resumable.get_leg_receipt(leg_identity(claim.claim_id, 2, total_legs=3)) is None
+    assert resumable.get_leg_receipt(leg_identity(claim.claim_id, 3, total_legs=3)) is None
+
+    # Run across several more scheduler ticks -- still zero sends, still
+    # fails closed the same way, never invents a bypass.
+    for _ in range(3):
+        with pytest.raises(SER8DemoOrderReconciliationRequiredError):
+            resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+        assert transport.calls == []
+
+
+def test_scenario_d_crash_before_any_leg_resumes_the_original_plan(tmp_path: Path) -> None:
+    """D) crash immediately AFTER plan persistence but BEFORE leg #1 --
+    restart resumes the ORIGINAL plan (not a new plan/claim), sending
+    every leg exactly once."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    plan = _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={},
+    )
+    assert _plan_row_count(control) == 1
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    receipt = resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+
+    assert isinstance(receipt, DemoOrderExecutionPlanReceiptV1)
+    assert receipt.aggregate_state == "COMPLETE"
+    assert receipt.plan_id == plan.plan_id  # the ORIGINAL plan, never rebuilt.
+    assert len(transport.calls) == 3
+    assert {req.entry_index for req in transport.calls} == {1, 2, 3}
+    assert _plan_row_count(control) == 1  # still exactly one plan row -- never a second one.
+
+    # A repeated resume attempt (another scheduler tick) finds every leg
+    # already attempted -- nothing left to resume, and zero new sends.
+    with pytest.raises(SER8DemoOrderAlreadyAttemptedError):
+        resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    assert len(transport.calls) == 3
+
+
+def test_resume_plan_never_creates_a_second_claim(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"},
+    )
+
+    db = sqlite3.connect(context.db_path)
+    before = db.execute("SELECT COUNT(*) FROM ser8_execution_authorization_claims").fetchone()[0]
+    db.close()
+
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport(result_factory=_clean_result))
+    resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+
+    db = sqlite3.connect(context.db_path)
+    after = db.execute("SELECT COUNT(*) FROM ser8_execution_authorization_claims").fetchone()[0]
+    db.close()
+    assert after == before  # resume_plan never calls claim() again.
+
+
+def test_resume_plan_with_no_persisted_plan_fails_closed(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    with pytest.raises(SER8DemoOrderSendError, match="nothing to resume"):
+        control.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    assert control.transport.calls == []
+
+
+def test_resume_plan_reverifies_claim_staleness(tmp_path: Path) -> None:
+    """resume_plan re-checks the SAME claim-age invariant a fresh send()
+    call would -- a claim that has gone stale since its original claim()
+    fails closed here too, never silently exempted."""
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"},
+    )
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderSendError, match="send window"):
+        resumable.resume_plan(
+            claim, allowlist=_allowlist(LOGIN), maximum_claim_age_seconds=60.0, now=NOW + timedelta(seconds=120),
+        )
+    assert transport.calls == []
+
+
+def test_resume_plan_reverifies_demo_account_gate(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={1: "FILLED"},
+    )
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderSendError):
+        resumable.resume_plan(claim, allowlist=_allowlist("99999999"), now=NOW)
+    assert transport.calls == []
+
+
+def test_resume_plan_single_leg_plan_unwraps_to_solo_receipt(tmp_path: Path) -> None:
+    """resume_plan on a single-leg plan with no attempt at all reaches the
+    SAME backward-compatible single-receipt unwrap _resolve_plan_outcome
+    already gives send()."""
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    _seed_plan_with_partial_attempts(
+        control, claim, decision, candidate, allowlist=_allowlist(LOGIN), attempted_states={},
+    )
+
+    transport = FakeDemoOrderTransport(result_factory=_clean_result)
+    resumable = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    receipt = resumable.resume_plan(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    assert isinstance(receipt, DemoOrderExecutionReceiptV1)
+    assert receipt.result_state == "FILLED"
+    assert len(transport.calls) == 1
+
+
+def test_resume_plan_never_calls_metatrader5_or_reimplements_a_second_sizing_path() -> None:
+    import ast
+    import inspect
+    import textwrap
+
+    import trademind.ser8_mt5_demo_order_send as module
+
+    source = textwrap.dedent(inspect.getsource(module.SER8DemoOrderSendControl.resume_plan))
+    tree = ast.parse(source)
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    assert not (imported & {"MetaTrader5"})
+    for forbidden in ("SizedOrder(", "RiskDecision(", "evaluate_risk("):
+        assert forbidden not in source

@@ -336,6 +336,25 @@ class SER8ExecutionAuthorizationClaimControl:
                 db.rollback()
                 raise
 
+    def get_claim(self, authorization_id: str) -> ExecutionAuthorizationClaimV1 | None:
+        """Public, read-only accessor for an already-persisted claim by
+        its ``authorization_id`` (the table's own primary key) --
+        ``None`` if this authorization has never been claimed.
+        Reconstructed independently from the persisted row via the SAME
+        :func:`_claim_from_row` helper :meth:`claim` itself uses. Gives
+        downstream read-only consumers (e.g. an autonomous execution
+        worker resuming an already-persisted plan across a restart) a
+        stable way to recover the exact claim object an execution plan
+        was built from, without granting or mutating anything."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM ser8_execution_authorization_claims WHERE authorization_id=?",
+                (authorization_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _claim_from_row(row)
+
 
 def _claim_from_row(row: sqlite3.Row) -> ExecutionAuthorizationClaimV1:
     payload = json.loads(row["payload_json"])

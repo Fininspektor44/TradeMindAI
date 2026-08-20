@@ -31,15 +31,28 @@ Each cycle:
    `run_ser8_real_demo_pipeline.py`).
 2. If this candidate already has a persisted execution plan (a `plan_id`
    under `ser8_mt5_demo_order_plans`, keyed by `candidate_signal_id`),
-   the worker **never** re-evaluates, re-authorizes, re-claims, or
-   re-sends — it only observes the plan's already-persisted leg states.
-   This is the one-shot anchor that makes the whole loop restart-safe;
-   see `run_ser8_autonomous_demo_execution.py`'s own module docstring for
-   the full design rationale (`RiskDecision.decision_id` is sensitive to
-   live MT5 account/positions drift and is never persisted anywhere
+   the worker **never** re-evaluates, re-authorizes, or re-claims — this
+   is the one-shot anchor that makes the whole loop restart-safe; see
+   `run_ser8_autonomous_demo_execution.py`'s own module docstring for the
+   full design rationale (`RiskDecision.decision_id` is sensitive to live
+   MT5 account/positions drift and is never persisted anywhere
    reloadable, so a candidate with no plan yet always gets one single,
    uninterrupted risk-eval → authorize → claim → send call chain, never
-   split across a restart boundary).
+   split across a restart boundary). An existing plan is **not**
+   automatically "fully processed", though: if every leg already has a
+   send attempt (in any state, including UNKNOWN), the cycle reports
+   `ALREADY_PROCESSED`; if any leg genuinely has no send attempt yet (a
+   process crash strictly between two legs), the worker calls
+   `SER8DemoOrderSendControl.resume_plan` — the ONLY authoritative way to
+   continue an existing plan, using EXCLUSIVELY the plan's own frozen leg
+   data, never a freshly re-evaluated `RiskDecision` — which re-verifies
+   the demo account gate and claim staleness exactly as a fresh `send`
+   call would, reloads the SAME already-persisted claim (never
+   re-claims), and attempts only the genuinely unattempted legs. An
+   UNKNOWN leg still blocks every leg after it, exactly like `send`
+   itself. `--dry-run` never reaches `resume_plan` (a real send-capable
+   operation) — it reports `DRY_RUN_WOULD_RESUME` instead, with zero
+   broker sends.
 3. Otherwise runs `evaluate_ser8_research_risk_gate` fresh. A BLOCK is
    reported and produces no execution. An ALLOW proceeds to
    `SER8ExecutionAuthorizationControl.authorize` →
@@ -67,14 +80,21 @@ Each cycle:
 
 `--dry-run` runs candidate selection, eligibility, and Risk Manager
 evaluation exactly like a real cycle and prints what WOULD be sent, but
-calls no authorization, claim, or send at all — zero broker sends, and
-the candidate is never consumed, so a real cycle immediately afterward is
-unaffected.
+calls no authorization, claim, send, or resume at all — zero broker
+sends, and zero rows written to any execution-side table (no
+`ExecutionAuthorizationV1`, no `ExecutionAuthorizationClaimV1`, no
+execution plan, no leg attempt, no outcome row). This is deliberately
+stronger than "the candidate is not consumed": even if the live MT5
+account/positions snapshot drifts between the dry-run and a real run
+immediately afterward — the real Windows incident that motivated this —
+the dry-run cannot possibly have created a conflicting authorization,
+because it never reaches any control's write path in the first place.
 
 **This worker never itself sends an order to the broker.** It only ever
-produces an authorized, claimed, `SER8DemoOrderSendControl.send()` call —
-the same production primitive that has always existed — which round-trips
-through the file bridge to the terminal.
+produces an authorized, claimed, `SER8DemoOrderSendControl.send()` (or,
+resuming an existing plan, `.resume_plan()`) call — the same production
+primitives that have always existed — which round-trip through the file
+bridge to the terminal.
 
 ## 3. RECONCILIATION
 
@@ -132,10 +152,17 @@ authoritative record needed.
   execution path — no bypass, override, or force flag exists anywhere in
   this loop.
 - One candidate produces at most one authoritative execution plan, ever
-  — proven by `get_plan_claim_id_for_candidate` gating every fresh
-  evaluation attempt, and independently backstopped by
-  `SER8DemoOrderSendControl.send`'s own pre-existing per-leg
-  `_reserve_leg_attempt` uniqueness guard.
+  — proven by `get_plan_for_candidate` gating every fresh risk/authorize/
+  claim attempt, and independently backstopped by
+  `SER8DemoOrderSendControl.send`/`.resume_plan`'s own shared, pre-existing
+  per-leg `_reserve_leg_attempt` uniqueness guard (an already-attempted
+  leg, in any state including UNKNOWN, is never resent by either entry
+  point).
+- A plan's unattempted legs (a genuine crash strictly between two legs)
+  are resumable ONLY through `resume_plan`, which never creates a second
+  plan and never creates a second claim for the same plan — proven by
+  dedicated tests asserting the plans/claims table row counts are
+  unchanged by a resume.
 - `--account`/`--demo-account-allowlist` are both required, explicit, and
   cross-checked at startup — the worker never silently defaults to a
   live account, and fails closed immediately if `--account` is not a

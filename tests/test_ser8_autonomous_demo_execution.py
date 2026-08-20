@@ -34,9 +34,16 @@ worker_module = importlib.import_module("run_ser8_autonomous_demo_execution")
 import test_run_ser8_real_demo_pipeline as fixtures  # noqa: E402
 
 from trademind.discovery.hypothesis_registry import HypothesisRegistry  # noqa: E402
+from trademind.ser8_demo_account_safety_gate import (  # noqa: E402
+    DemoAccountAllowlistV1,
+    verify_demo_account_authorization,
+)
 from trademind.ser8_demo_trade_outcome_capture import SER8DemoTradeOutcomeControl  # noqa: E402
 from trademind.ser8_execution_authorization import (  # noqa: E402
     SER8ExecutionAuthorizationControl,
+)
+from trademind.ser8_execution_authorization_claim import (  # noqa: E402
+    SER8ExecutionAuthorizationClaimControl,
 )
 from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
     DEMO_EXECUTOR_MAGIC_NUMBER,
@@ -47,6 +54,7 @@ from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
     DemoOrderTransportResult,
     FakeDemoOrderTransport,
     SER8DemoOrderSendControl,
+    build_demo_order_execution_plan,
     leg_identity,
 )
 from trademind.ser8_research_risk_gate import evaluate_ser8_research_risk_gate  # noqa: E402
@@ -262,6 +270,103 @@ def _seed_leg(
     return leg_id
 
 
+def _full_real_claim(chain: fixtures._Chain, *, multi_leg: bool = False, requested_risk_pct: float | None = None):
+    """Real ACCEPTED hypothesis -> eligibility -> scope -> the REAL
+    journaled candidate -> a real ALLOW RiskDecision -> a real, claimed
+    ExecutionAuthorizationClaimV1 -- everything a direct
+    SER8DemoOrderSendControl.resume_plan test needs, built through the
+    SAME production calls the worker itself uses (never hand-constructed
+    lineage objects)."""
+    from trademind.discovery.hypothesis_tradeable_scope import bind_hypothesis_tradeable_scope
+    from trademind.discovery.research_eligibility_boundary import present_eligible_artifact
+
+    pipeline = fixtures.pipeline_module.build_research_pipeline(
+        db_path=chain.db_path, orchestrator_db_path=chain.orchestrator_db_path, artifact_root=chain.artifact_root,
+        holdout_key_env=fixtures._KEY_ENV, holdout_key_id=fixtures._KEY_ID,
+        holdout_primary_metric=fixtures._METRIC, holdout_parameters={},
+    )
+    eligibility = present_eligible_artifact(chain.hypothesis_id, registry=pipeline.registry, final_verdict=pipeline.final_verdict)
+    scope = bind_hypothesis_tradeable_scope(chain.hypothesis_id, registry=pipeline.registry, artifact_store=pipeline.artifacts)
+    real_signal_id = _last_candidate_signal_id(chain)
+    candidate = candidate_from_dict(json.loads(
+        (chain.data_root / "live_signal_runtime_v1" / "candidates.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    ))
+    assert candidate.signal_id == real_signal_id
+
+    result = evaluate_ser8_research_risk_gate(
+        eligibility, scope, candidate, registry=pipeline.registry, final_verdict=pipeline.final_verdict,
+        login=_ACCOUNT, account_csv=chain.data_root / "mt5" / f"mt5_risk_account_utc_{_ACCOUNT}.csv",
+        positions_csv=chain.data_root / "mt5" / f"mt5_risk_positions_utc_{_ACCOUNT}.csv",
+        symbols_csv=chain.data_root / "mt5" / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv",
+        profile=fixtures.pipeline_module.profile_from_dict(json.loads(_REAL_SUPERVISED_DEMO_PROFILE.read_text(encoding="utf-8"))),
+        requested_risk_pct=requested_risk_pct,
+    )
+    assert result.decision.state == "ALLOW"
+    authorization_control = SER8ExecutionAuthorizationControl(registry=pipeline.registry, final_verdict=pipeline.final_verdict)
+    authorization = authorization_control.authorize(eligibility, scope, candidate, result)
+    claim_control = SER8ExecutionAuthorizationClaimControl(registry=pipeline.registry)
+    claim = claim_control.claim(authorization, claimant_id="worker:ser8-autonomous-demo-execution")
+    return pipeline, claim, result.decision, candidate
+
+
+def _seed_partial_plan(pipeline, claim, decision, candidate, *, attempted_states: dict, now: datetime | None = None):
+    """Persists a REAL execution plan plus a send attempt for ONLY the
+    legs named in ``attempted_states`` -- leaving every other leg with NO
+    attempt row at all, precisely simulating a process that crashed
+    strictly between attempting one leg and the next. Mirrors
+    tests/test_ser8_mt5_demo_order_send.py's own
+    ``_seed_plan_with_partial_attempts`` exactly (deliberately duplicated
+    rather than cross-imported, matching this session's own established
+    per-file test-helper convention)."""
+    now = now or datetime.now(timezone.utc)
+    allowlist = DemoAccountAllowlistV1(account_ids=(_ACCOUNT,))
+    control = SER8DemoOrderSendControl(registry=pipeline.registry, transport=FakeDemoOrderTransport())
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=allowlist, now=now)
+    plan = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo_authorization)
+    control._persist_plan(plan, created_at=now.isoformat())
+
+    for leg in plan.legs:
+        if leg.entry_index not in attempted_states:
+            continue
+        state = attempted_states[leg.entry_index]
+        request = DemoOrderRequestV1(
+            schema_version=SCHEMA_VERSION, parent_claim_id=plan.claim_id, entry_index=leg.entry_index,
+            claim_id=leg.leg_id, authorization_id=plan.authorization_id, demo_account_id=plan.demo_account_id,
+            symbol=plan.symbol, action=plan.action, order_type=leg.order_type, volume=leg.volume,
+            price=leg.planned_price, sl=leg.sl, tp=leg.tp, magic=DEMO_EXECUTOR_MAGIC_NUMBER,
+            comment=f"SER8:{leg.leg_id[-20:]}",
+        )
+        attempt_id = f"EAO-{leg.leg_id}"
+        control._reserve_leg_attempt(
+            leg_id=leg.leg_id, plan_id=plan.plan_id, parent_claim_id=plan.claim_id, entry_index=leg.entry_index,
+            attempt_id=attempt_id, request=request, demo_authorization=demo_authorization, captured_at=now,
+        )
+        if state == "UNKNOWN":
+            continue
+        common = dict(
+            claim_id=leg.leg_id, plan_id=plan.plan_id, parent_claim_id=plan.claim_id, entry_index=leg.entry_index,
+            authorization_id=plan.authorization_id, demo_gate_hash=demo_authorization.gate_hash,
+            request_hash=request.request_hash, attempt_id=attempt_id, recorded_at=now.isoformat(),
+            requested_volume=request.volume, requested_price=request.price,
+        )
+        if state == "FILLED":
+            control._finalize(
+                result_state="FILLED", retcode=10009, retcode_description="Request completed",
+                order_ticket=f"{leg.entry_index}01", deal_ticket=f"{leg.entry_index}02",
+                position_ticket=f"{leg.entry_index}03", filled_volume=leg.volume, filled_price=leg.planned_price,
+                **common,
+            )
+        elif state == "PENDING":
+            control._finalize(
+                result_state="PENDING", retcode=10009, retcode_description="done",
+                order_ticket=f"7331245{leg.entry_index}", deal_ticket="0", position_ticket="0",
+                filled_volume=None, filled_price=None, **common,
+            )
+        else:
+            raise AssertionError(f"unsupported seed state: {state}")
+    return plan
+
+
 # ---------------------------------------------------------------------------
 # 1: no candidate.
 # ---------------------------------------------------------------------------
@@ -454,16 +559,74 @@ def test_restart_after_unknown_leg_never_resends(tmp_path: Path, monkeypatch) ->
     assert calls_after_first == 2  # leg #1 (sent) + leg #2 (attempted, UNKNOWN) -- leg #3 never touched.
 
     # "Restart": a brand new run_one_cycle call, simulating a fresh
-    # process. The plan already exists for this candidate -- the worker
-    # must NEVER re-evaluate, re-authorize, re-claim, or re-send.
+    # process. The plan already exists for this candidate, and leg #3 has
+    # no send attempt yet -- the worker attempts a genuine resume through
+    # resume_plan(), which re-verifies the SAME invariants and finds leg
+    # #2 is still UNKNOWN -- blocking leg #3 from ever being attempted,
+    # exactly like the original send() call would. Zero broker sends;
+    # never re-authorize, re-claim, or resend an already-attempted leg.
     second = worker_module.run_one_cycle(_worker_args(chain))
-    assert second.cycle_status == "ALREADY_PROCESSED"
+    assert second.cycle_status == "EXECUTION_PENDING_RECONCILIATION"
     assert second.broker_sends_this_cycle == 0
     assert len(fake.calls) == calls_after_first  # no new transport calls at all.
 
     third = worker_module.run_one_cycle(_worker_args(chain))
-    assert third.cycle_status == "ALREADY_PROCESSED"
+    assert third.cycle_status == "EXECUTION_PENDING_RECONCILIATION"
+    assert third.broker_sends_this_cycle == 0
     assert len(fake.calls) == calls_after_first
+
+
+def test_worker_resumes_genuinely_unattempted_legs_after_partial_send(tmp_path: Path, monkeypatch) -> None:
+    """Scenario A end-to-end through the worker: a plan with leg #1
+    FILLED and legs #2/#3 never attempted at all (a genuine crash
+    strictly between leg #1 and leg #2, never reachable from a single
+    send() call) is safely resumed -- leg #1 is never resent, legs #2/#3
+    are each sent exactly once, across multiple scheduler ticks."""
+    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-resume-a")
+    pipeline, claim, decision, candidate = _full_real_claim(chain, multi_leg=True)
+    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    summary = worker_module.run_one_cycle(_worker_args(chain))
+    assert summary.cycle_status == "EXECUTION_COMPLETE"
+    assert summary.candidate_status == "RESUMABLE"
+    assert summary.broker_sends_this_cycle == 2
+    assert {req.entry_index for req in fake.calls} == {2, 3}
+    assert summary.filled == 3
+    assert summary.legs_total == 3
+
+    # Multiple further scheduler ticks: the plan is now fully attempted --
+    # ALREADY_PROCESSED, zero further sends, forever.
+    for _ in range(3):
+        again = worker_module.run_one_cycle(_worker_args(chain))
+        assert again.cycle_status == "ALREADY_PROCESSED"
+        assert again.broker_sends_this_cycle == 0
+    assert len(fake.calls) == 2
+
+
+def test_worker_dry_run_reports_resumable_without_ever_sending(tmp_path: Path, monkeypatch) -> None:
+    """--dry-run must never call resume_plan (a REAL send-capable
+    operation) -- an existing plan with unattempted legs is reported as
+    DRY_RUN_WOULD_RESUME, with zero broker sends, and a subsequent REAL
+    cycle still correctly resumes it afterward."""
+    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-resume-dryrun")
+    pipeline, claim, decision, candidate = _full_real_claim(chain, multi_leg=True)
+    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    dry_summary = worker_module.run_one_cycle(_worker_args(chain, dry_run=True))
+    assert dry_summary.cycle_status == "DRY_RUN_WOULD_RESUME"
+    assert dry_summary.broker_sends_this_cycle == 0
+    assert len(fake.calls) == 0  # dry-run never constructs/uses the real transport.
+
+    real_summary = worker_module.run_one_cycle(_worker_args(chain))
+    assert real_summary.cycle_status == "EXECUTION_COMPLETE"
+    assert real_summary.broker_sends_this_cycle == 2
+    assert {req.entry_index for req in fake.calls} == {2, 3}
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +832,106 @@ def test_dry_run_then_real_run_both_succeed(tmp_path: Path, monkeypatch) -> None
     real_summary = worker_module.run_one_cycle(_worker_args(chain))
     assert real_summary.cycle_status == "EXECUTION_COMPLETE"
     assert len(fake.calls) == 1
+
+
+def _rewrite_account_snapshot(chain: fixtures._Chain, *, balance: float, equity: float) -> None:
+    """Rewrites ONLY the MT5 account export with a different
+    balance/equity (and a fresh capture timestamp) -- simulating the
+    unified executor's own risk-refresh timer moving the live snapshot
+    forward between two evaluation moments, which changes
+    RiskDecision.decision_id (it is a function of the account snapshot
+    content -- see risk_manager's own _decision_identity())."""
+    captured = datetime.now(timezone.utc) - timedelta(seconds=5)
+    account_fields = [
+        "time_msc", "account_login", "server", "currency", "balance", "equity", "margin",
+        "free_margin", "margin_level", "leverage", "open_positions", "trade_allowed",
+        "terminal_connected",
+    ]
+    account_rows = [{
+        "time_msc": fixtures._msc(captured), "account_login": _ACCOUNT, "server": "Demo-Server",
+        "currency": "USD", "balance": balance, "equity": equity, "margin": 0.0,
+        "free_margin": equity, "margin_level": 0, "leverage": 100, "open_positions": 0,
+        "trade_allowed": 1, "terminal_connected": 1,
+    }]
+    fixtures._write_csv(chain.data_root / "mt5" / f"mt5_risk_account_utc_{_ACCOUNT}.csv", account_fields, account_rows)
+
+
+def test_drifting_mt5_snapshot_dry_run_then_real_run_never_conflicts(tmp_path: Path, monkeypatch) -> None:
+    """GAP 2 regression: the real Windows incident this task's own spec
+    describes -- a PREVIEW that silently created a real execution
+    authorization, later conflicting with a real run once the MT5
+    snapshot moved and RiskDecision.decision_id changed. Proves this is
+    structurally impossible for this worker: --dry-run computes a
+    RiskDecision from the account snapshot as it stands at dry-run time,
+    persists NOTHING, then the snapshot is deliberately mutated so a
+    fresh evaluation would compute a DIFFERENT decision_id, and the
+    immediately-following real run must proceed cleanly against the NEW
+    current RiskDecision -- never blocked by a conflict the dry-run
+    itself could not possibly have caused."""
+    chain = _prepared_chain(tmp_path)
+
+    # Compute the RiskDecision directly (read-only -- no authorize/claim)
+    # BEFORE the snapshot mutation, to prove decision_id genuinely
+    # differs afterward -- not merely assume it (the whole point of this
+    # regression). Mirrors test_conflicting_authorization_fails_closed_
+    # never_bypassed's own read-only evaluation pattern.
+    from trademind.discovery.hypothesis_tradeable_scope import bind_hypothesis_tradeable_scope
+    from trademind.discovery.research_eligibility_boundary import present_eligible_artifact
+
+    probe_pipeline = fixtures.pipeline_module.build_research_pipeline(
+        db_path=chain.db_path, orchestrator_db_path=chain.orchestrator_db_path, artifact_root=chain.artifact_root,
+        holdout_key_env=fixtures._KEY_ENV, holdout_key_id=fixtures._KEY_ID,
+        holdout_primary_metric=fixtures._METRIC, holdout_parameters={},
+    )
+    probe_eligibility = present_eligible_artifact(chain.hypothesis_id, registry=probe_pipeline.registry, final_verdict=probe_pipeline.final_verdict)
+    probe_scope = bind_hypothesis_tradeable_scope(chain.hypothesis_id, registry=probe_pipeline.registry, artifact_store=probe_pipeline.artifacts)
+    probe_candidate = candidate_from_dict(json.loads(
+        (chain.data_root / "live_signal_runtime_v1" / "candidates.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    ))
+    decision_before = evaluate_ser8_research_risk_gate(
+        probe_eligibility, probe_scope, probe_candidate, registry=probe_pipeline.registry,
+        final_verdict=probe_pipeline.final_verdict, login=_ACCOUNT,
+        account_csv=chain.data_root / "mt5" / f"mt5_risk_account_utc_{_ACCOUNT}.csv",
+        positions_csv=chain.data_root / "mt5" / f"mt5_risk_positions_utc_{_ACCOUNT}.csv",
+        symbols_csv=chain.data_root / "mt5" / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv",
+        profile=fixtures.pipeline_module.profile_from_dict(json.loads(_REAL_SUPERVISED_DEMO_PROFILE.read_text(encoding="utf-8"))),
+    ).decision
+    assert decision_before.state == "ALLOW"
+
+    dry_summary = worker_module.run_one_cycle(_worker_args(chain, dry_run=True))
+    assert dry_summary.cycle_status == "DRY_RUN_WOULD_EXECUTE"
+    assert dry_summary.risk_state == "ALLOW"
+
+    _assert_zero_rows(
+        chain.db_path, "ser8_execution_authorizations", "ser8_execution_authorization_claims",
+        "ser8_mt5_demo_order_plans", "ser8_mt5_demo_order_leg_receipts", "ser8_demo_trade_outcomes",
+    )
+
+    # The account snapshot moves on (the unified executor's own
+    # risk-refresh timer) -- a fresh RiskDecision for the SAME candidate
+    # will now hash differently. Proven directly, not assumed.
+    _rewrite_account_snapshot(chain, balance=10_483.27, equity=10_512.90)
+    decision_after = evaluate_ser8_research_risk_gate(
+        probe_eligibility, probe_scope, probe_candidate, registry=probe_pipeline.registry,
+        final_verdict=probe_pipeline.final_verdict, login=_ACCOUNT,
+        account_csv=chain.data_root / "mt5" / f"mt5_risk_account_utc_{_ACCOUNT}.csv",
+        positions_csv=chain.data_root / "mt5" / f"mt5_risk_positions_utc_{_ACCOUNT}.csv",
+        symbols_csv=chain.data_root / "mt5" / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv",
+        profile=fixtures.pipeline_module.profile_from_dict(json.loads(_REAL_SUPERVISED_DEMO_PROFILE.read_text(encoding="utf-8"))),
+    ).decision
+    assert decision_after.decision_id != decision_before.decision_id  # genuinely a different decision now.
+
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+    real_summary = worker_module.run_one_cycle(_worker_args(chain))
+
+    assert real_summary.cycle_status not in (
+        "FAIL_CLOSED_AUTHORIZATION_CONFLICT", "FAIL_CLOSED_AUTHORIZATION_DENIED",
+        "FAIL_CLOSED_CLAIM_CONFLICT", "FAIL_CLOSED_CLAIM_DENIED",
+    )
+    assert real_summary.cycle_status == "EXECUTION_COMPLETE"
+    assert len(fake.calls) == 1
+    assert real_summary.risk_state == "ALLOW"
 
 
 # ---------------------------------------------------------------------------
