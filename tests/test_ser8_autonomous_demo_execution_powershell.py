@@ -59,7 +59,6 @@ def test_installer_passes_every_parameter_to_the_wrapper_task_command() -> None:
     assert "-RuntimeRoot `\"$RuntimeRoot`\"" in text
     assert "-Mt5ExportDir `\"$Mt5ExportDir`\"" in text
     assert "-SealedHoldoutPath `\"$SealedHoldoutPath`\"" in text
-    assert "-HoldoutPrimaryMetric `\"$HoldoutPrimaryMetric`\"" in text
     assert "-RiskProfile `\"$RiskProfile`\"" in text
     assert "-CommonFilesDir `\"$CommonFilesDir`\"" in text
     assert "-Db " not in text
@@ -74,10 +73,58 @@ def test_wrapper_forwards_every_parameter_to_python_cli_unchanged_flags() -> Non
     assert '"--runtime-root", $RuntimeRoot,' in text
     assert '"--mt5-export-dir", $Mt5ExportDir,' in text
     assert '"--sealed-holdout-path", $SealedHoldoutPath,' in text
-    assert '"--holdout-primary-metric", $HoldoutPrimaryMetric,' in text
     assert '"--risk-profile", $RiskProfile,' in text
     assert '"--common-files-dir", $CommonFilesDir,' in text
     assert '"--demo-account-allowlist"' in text
+
+
+# ---------------------------------------------------------------------------
+# SER8 AUTONOMOUS WINDOWS HOLDOUT METRIC ARGUMENT FIX V1: --holdout-
+# primary-metric is genuinely optional at the Python side, and neither
+# PowerShell script ever bakes in a dangling/empty native argument for it
+# -- PowerShell silently drops an empty-string array element when
+# splatting into a NATIVE executable call (the confirmed real Windows
+# root cause), so the wrapper must forward this flag ONLY when the
+# operator actually set a non-empty value.
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_only_forwards_holdout_primary_metric_when_non_empty() -> None:
+    text = WRAPPER_SCRIPT.read_text(encoding="utf-8")
+    # The flag is never baked into the unconditional base $arguments list...
+    base_block = "\n".join(_executable_lines(
+        text[text.index("$arguments = @("):text.index("if ($HoldoutPrimaryMetric)")]
+    ))
+    assert "--holdout-primary-metric" not in base_block
+    # ...it is appended ONLY inside an explicit non-empty guard.
+    assert "if ($HoldoutPrimaryMetric) {" in text
+    guard_block = text[text.index("if ($HoldoutPrimaryMetric) {"):text.index("if ($DryRun) {")]
+    assert '"--holdout-primary-metric", $HoldoutPrimaryMetric' in guard_block
+    # Default wrapper invocation (the operator never sets it) therefore
+    # produces valid argv with the flag entirely absent -- never a
+    # dangling "--holdout-primary-metric" with no value.
+    assert '[string]$HoldoutPrimaryMetric = ""' in text
+
+
+def test_installer_only_forwards_holdout_primary_metric_when_non_empty() -> None:
+    text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    base_block = "\n".join(_executable_lines(
+        text[text.index('$taskArguments = "'):text.index("if ($HoldoutPrimaryMetric)")]
+    ))
+    assert "-HoldoutPrimaryMetric" not in base_block
+    assert "if ($HoldoutPrimaryMetric) {" in text
+    guard_block = text[text.index("if ($HoldoutPrimaryMetric) {"):text.index("if ($DryRun) {")]
+    assert "-HoldoutPrimaryMetric `\"$HoldoutPrimaryMetric`\"" in guard_block
+    assert '[string]$HoldoutPrimaryMetric = ""' in text
+
+
+def test_wrapper_forwards_explicit_nonempty_holdout_primary_metric() -> None:
+    """An operator-supplied non-empty value is still forwarded correctly
+    -- the fix only omits the flag when genuinely empty, never silently
+    drops a real operator-supplied value."""
+    text = WRAPPER_SCRIPT.read_text(encoding="utf-8")
+    guard_block = text[text.index("if ($HoldoutPrimaryMetric) {"):text.index("if ($DryRun) {")]
+    assert '$arguments += @("--holdout-primary-metric", $HoldoutPrimaryMetric)' in guard_block
 
 
 def test_python_cli_flags_themselves_are_unchanged() -> None:

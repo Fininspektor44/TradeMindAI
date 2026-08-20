@@ -498,7 +498,7 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
         artifact_root=artifact_root,
         holdout_key_env=args.holdout_key_env or pipeline_module.DEFAULT_HOLDOUT_KEY_ENV,
         holdout_key_id=args.holdout_key_id or pipeline_module.DEFAULT_HOLDOUT_KEY_ID,
-        holdout_primary_metric=args.holdout_primary_metric,
+        holdout_primary_metric=args.holdout_primary_metric or "",
         holdout_parameters={},
     )
 
@@ -763,7 +763,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidates", type=Path, default=None)
     parser.add_argument("--mt5-export-dir", type=Path, required=True)
     parser.add_argument("--sealed-holdout-path", type=Path, required=True)
-    parser.add_argument("--holdout-primary-metric", required=True)
+    parser.add_argument(
+        "--holdout-primary-metric", default=None,
+        help=(
+            "Optional -- irrelevant to autonomous execution of an ALREADY-ACCEPTED hypothesis. "
+            "This worker never advances the research lifecycle (no advance_research_state call), "
+            "so the holdout evaluator build_research_pipeline constructs is never actually invoked "
+            "(matching run_ser8_real_demo_pipeline.py's own --holdout-primary-metric default=None / "
+            "'or \"\"' fallback). Only matters if this worker is ever pointed at a hypothesis that is "
+            "NOT yet ACCEPTED, which fails closed on its own via present_eligible_artifact regardless."
+        ),
+    )
     parser.add_argument("--holdout-key-env", default=None)
     parser.add_argument("--holdout-key-id", default=None)
     parser.add_argument("--risk-profile", type=Path, required=True)

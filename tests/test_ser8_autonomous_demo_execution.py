@@ -915,6 +915,76 @@ def test_dry_run_then_real_run_both_succeed(tmp_path: Path, monkeypatch) -> None
     assert len(fake.calls) == 1
 
 
+# ---------------------------------------------------------------------------
+# SER8 AUTONOMOUS WINDOWS HOLDOUT METRIC ARGUMENT FIX V1: --holdout-
+# primary-metric is optional -- an ALREADY-ACCEPTED hypothesis never
+# triggers a holdout evaluation (this worker never calls
+# advance_research_state), so the value is never actually read. Confirmed
+# real Windows failure: PowerShell silently drops an empty-string array
+# element when splatting into a native python.exe call, so the fixed
+# wrapper now omits the flag entirely rather than passing a dangling
+# empty value -- these tests prove the Python CLI itself tolerates that
+# (--holdout-primary-metric entirely absent from argv), reaching a real
+# cycle with zero broker sends in dry-run, exactly like the previously-
+# required-value shape already proven elsewhere in this file.
+# ---------------------------------------------------------------------------
+
+
+def test_omitted_metric_flag_still_parses_and_dry_run_reaches_worker_cycle(tmp_path: Path) -> None:
+    """The Windows wrapper now OMITS --holdout-primary-metric entirely
+    when unset -- argparse's own default=None must accept that (no usage
+    error), and the cycle must still reach a genuine dry-run preview of
+    the real candidate, never fail at argument parsing."""
+    chain = _prepared_chain(tmp_path)
+    args = _worker_args(chain, dry_run=True, holdout_primary_metric=None)
+    assert args.holdout_primary_metric is None
+
+    summary = worker_module.run_one_cycle(args)
+    assert summary.cycle_status == "DRY_RUN_WOULD_EXECUTE"
+    assert summary.candidate_seen == "YES"
+    assert summary.risk_state == "ALLOW"
+
+
+def test_omitted_metric_flag_dry_run_sends_zero_broker_orders(tmp_path: Path, monkeypatch) -> None:
+    """Zero broker sends in dry-run holds regardless of whether
+    --holdout-primary-metric was ever supplied."""
+    chain = _prepared_chain(tmp_path)
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    summary = worker_module.run_one_cycle(_worker_args(chain, dry_run=True, holdout_primary_metric=None))
+    assert summary.cycle_status == "DRY_RUN_WOULD_EXECUTE"
+    assert summary.broker_sends_this_cycle == 0
+    assert len(fake.calls) == 0
+    _assert_zero_rows(
+        chain.db_path, "ser8_execution_authorizations", "ser8_execution_authorization_claims",
+        "ser8_mt5_demo_order_plans", "ser8_mt5_demo_order_leg_receipts",
+    )
+
+    # And a REAL (non-dry-run) cycle also still works end to end without
+    # --holdout-primary-metric ever being supplied -- proving the value
+    # is genuinely never read for an already-ACCEPTED hypothesis, not
+    # merely tolerated in dry-run.
+    real_summary = worker_module.run_one_cycle(_worker_args(chain, holdout_primary_metric=None))
+    assert real_summary.cycle_status == "EXECUTION_COMPLETE"
+    assert len(fake.calls) == 1
+
+
+def test_holdout_primary_metric_omitted_from_argv_entirely_still_parses() -> None:
+    """Proves the argparse contract itself, independent of any fixture:
+    the CLI must accept an argv list that never mentions
+    --holdout-primary-metric at all (exactly what the fixed PowerShell
+    wrapper now produces by default) without raising SystemExit."""
+    parser = worker_module.build_arg_parser()
+    argv = [
+        "--db", "x.db", "--hypothesis-id", "h", "--account", "1",
+        "--demo-account-allowlist", "1", "--runtime-root", "r", "--mt5-export-dir", "m",
+        "--sealed-holdout-path", "s", "--risk-profile", "rp", "--common-files-dir", "c",
+    ]
+    args = parser.parse_args(argv)  # must not raise SystemExit.
+    assert args.holdout_primary_metric is None
+
+
 def _rewrite_account_snapshot(chain: fixtures._Chain, *, balance: float, equity: float) -> None:
     """Rewrites ONLY the MT5 account export with a different
     balance/equity (and a fresh capture timestamp) -- simulating the

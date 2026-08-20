@@ -80,11 +80,28 @@ try {
         "--runtime-root", $RuntimeRoot,
         "--mt5-export-dir", $Mt5ExportDir,
         "--sealed-holdout-path", $SealedHoldoutPath,
-        "--holdout-primary-metric", $HoldoutPrimaryMetric,
         "--risk-profile", $RiskProfile,
         "--common-files-dir", $CommonFilesDir,
         "--once"
     )
+    # CONFIRMED REAL WINDOWS FAILURE (SER8 AUTONOMOUS WINDOWS HOLDOUT
+    # METRIC ARGUMENT FIX V1): PowerShell silently DROPS an empty-string
+    # array element when splatting @arguments into a NATIVE executable
+    # call (python.exe below) -- "--holdout-primary-metric", "" does NOT
+    # produce a literal empty-string argv value; the flag NAME survives
+    # but its value vanishes, so the Python CLI's argparse sees a
+    # dangling option and exits with a usage error BEFORE any
+    # authorization/claim/send is ever attempted. --holdout-primary-metric
+    # is also genuinely optional at the Python side (run_ser8_autonomous_
+    # demo_execution.py's own --holdout-primary-metric default=None --
+    # this worker never advances the research lifecycle, so the value is
+    # never actually read for an already-ACCEPTED hypothesis). The fix is
+    # therefore two-layered: the flag is OPTIONAL on the Python side, AND
+    # this wrapper only ever forwards it when genuinely non-empty --
+    # never passes a dangling/empty native argument at all.
+    if ($HoldoutPrimaryMetric) {
+        $arguments += @("--holdout-primary-metric", $HoldoutPrimaryMetric)
+    }
     if ($DryRun) {
         $arguments += "--dry-run"
     }

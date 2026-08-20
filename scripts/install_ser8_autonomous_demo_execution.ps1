@@ -84,8 +84,16 @@ $allowlistArgument = ($DemoAccountAllowlist | ForEach-Object { "`"$_`"" }) -join
 $taskArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`" " +
     "-DatabasePath `"$DatabasePath`" -HypothesisId `"$HypothesisId`" -Account `"$Account`" " +
     "-DemoAccountAllowlist $allowlistArgument -RuntimeRoot `"$RuntimeRoot`" -Mt5ExportDir `"$Mt5ExportDir`" " +
-    "-SealedHoldoutPath `"$SealedHoldoutPath`" -HoldoutPrimaryMetric `"$HoldoutPrimaryMetric`" " +
+    "-SealedHoldoutPath `"$SealedHoldoutPath`" " +
     "-RiskProfile `"$RiskProfile`" -CommonFilesDir `"$CommonFilesDir`""
+# -HoldoutPrimaryMetric is irrelevant to autonomous execution of an
+# already-ACCEPTED hypothesis (see run_ser8_autonomous_demo_execution.ps1's
+# own comment on this exact same parameter for the confirmed real Windows
+# root cause) -- only forwarded when the operator genuinely set it, never
+# baked in as a dangling empty value.
+if ($HoldoutPrimaryMetric) {
+    $taskArguments += " -HoldoutPrimaryMetric `"$HoldoutPrimaryMetric`""
+}
 if ($DryRun) {
     $taskArguments += " -DryRun"
 }
