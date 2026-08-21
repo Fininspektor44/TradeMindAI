@@ -26,6 +26,7 @@ from trademind.ser8_historical_data import (  # noqa: E402
     publish_dataset,
     source_proof_result,
     verify_dataset,
+    verify_inventory_account_identities,
     write_inventory_artifacts,
 )
 from trademind.ser8_historical_replay import load_research_policy  # noqa: E402
@@ -35,7 +36,16 @@ from trademind.signal_statistics_provenance import sha256_bytes  # noqa: E402
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("verify-source", "collect", "verify-inventory"), required=True)
-    parser.add_argument("--account", default="67206924")
+    parser.add_argument(
+        "--execution-account",
+        required=True,
+        help="Account whose real broker export defines the research/execution universe",
+    )
+    parser.add_argument(
+        "--market-data-account",
+        required=True,
+        help="Already-authenticated MT5 Python account used only for historical rates",
+    )
     parser.add_argument("--mt5-export-dir", type=Path)
     parser.add_argument("--terminal-path", type=Path)
     parser.add_argument("--timeframe", default="M5")
@@ -68,7 +78,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _require_export(args: argparse.Namespace) -> Path:
     if args.mt5_export_dir is None:
         raise HistoricalDataError("BROKER_UNIVERSE_PATH_REQUIRED", "--mt5-export-dir is required")
-    return args.mt5_export_dir.expanduser().resolve() / f"mt5_risk_symbols_utc_{args.account}.csv"
+    return (
+        args.mt5_export_dir.expanduser().resolve()
+        / f"mt5_risk_symbols_utc_{args.execution_account}.csv"
+    )
 
 
 def _collect(args: argparse.Namespace) -> dict[str, object]:
@@ -96,9 +109,13 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
         inventory_path=args.inventory,
         compatibility_path=args.compatibility_csv,
     )
-    universe = load_broker_universe(symbols_csv, account_login=args.account)
+    universe_sha256 = sha256_bytes(symbols_csv.read_bytes())
+    universe = load_broker_universe(
+        symbols_csv,
+        account_login=args.execution_account,
+    )
     source = MetaTrader5HistorySource(
-        account_login=args.account,
+        market_data_account_login=args.market_data_account,
         terminal_path=args.terminal_path.expanduser().resolve() if args.terminal_path else None,
     )
     captured_at = datetime.now(timezone.utc)
@@ -159,6 +176,9 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                     source_proof=proof,
                     symbol_metadata=symbol_metadata,
                     broker_symbol=broker_symbol,
+                    execution_account_login=args.execution_account,
+                    execution_universe_source=symbols_csv.name,
+                    execution_universe_sha256=universe_sha256,
                     timeframe=timeframe,
                     requested_from_utc=requested_from,
                     requested_to_utc=requested_to,
@@ -209,9 +229,23 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
         "schema_version": INVENTORY_SCHEMA_VERSION,
         "captured_at_utc": captured_at.isoformat().replace("+00:00", "Z"),
         "source_proof": dict(proof),
+        "execution_account_login": str(args.execution_account),
+        "market_data_account_login": str(args.market_data_account),
+        "execution_universe_source": symbols_csv.name,
+        "market_data_source_type": proof["source_type"],
+        "market_data_account_server": proof["market_data_account_server"],
+        "market_data_account_company": proof.get("market_data_account_company")
+        or proof.get("terminal_company"),
+        "market_data_account_currency": proof.get("market_data_account_currency"),
+        "cross_account_provenance": {
+            "execution_account_login": str(args.execution_account),
+            "market_data_account_login": str(args.market_data_account),
+            "accounts_claimed_equivalent": False,
+            "price_feeds_claimed_byte_identical": False,
+            "research_evidence_scope": "MARKET_DATA_SOURCE_OBSERVED_NOT_EXECUTION_PRICE_EQUIVALENCE",
+        },
         "broker_universe_path": str(symbols_csv),
-        "broker_universe_sha256": sha256_bytes(symbols_csv.read_bytes()),
-        "account_login": str(args.account),
+        "broker_universe_sha256": universe_sha256,
         "timeframe": timeframe,
         "requested_from_utc": requested_from.isoformat().replace("+00:00", "Z"),
         "requested_to_utc": requested_to.isoformat().replace("+00:00", "Z"),
@@ -237,12 +271,23 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
 
 def _verify_inventory(args: argparse.Namespace) -> dict[str, object]:
     payload = load_inventory(args.inventory.expanduser().resolve())
+    verify_inventory_account_identities(
+        payload,
+        execution_account_login=args.execution_account,
+        market_data_account_login=args.market_data_account,
+    )
     verified = 0
     for entry in payload["entries"]:
         dataset_dir = entry.get("dataset_dir")
         if dataset_dir is not None:
             manifest = verify_dataset(Path(str(dataset_dir)))
-            if manifest["dataset_sha256"] != entry.get("dataset_sha256"):
+            if (
+                manifest["dataset_sha256"] != entry.get("dataset_sha256")
+                or manifest["execution_account_login"]
+                != payload["execution_account_login"]
+                or manifest["market_data_account_login"]
+                != payload["market_data_account_login"]
+            ):
                 raise HistoricalDataError(
                     "INVENTORY_DATASET_MISMATCH",
                     f"inventory dataset mismatch for {entry['symbol']}",
@@ -250,6 +295,8 @@ def _verify_inventory(args: argparse.Namespace) -> dict[str, object]:
             verified += 1
     return {
         "status": "INVENTORY_VERIFIED",
+        "execution_account_login": payload["execution_account_login"],
+        "market_data_account_login": payload["market_data_account_login"],
         "inventory_sha256": payload["inventory_sha256"],
         "total_broker_symbols": payload["total_broker_symbols"],
         "verified_dataset_count": verified,
@@ -267,12 +314,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.mode == "verify-source":
             _require_export(args)
             # Universe validation is part of capability proof, not merely MT5 initialization.
-            load_broker_universe(_require_export(args), account_login=args.account)
+            universe_path = _require_export(args)
+            load_broker_universe(
+                universe_path,
+                account_login=args.execution_account,
+            )
             source = MetaTrader5HistorySource(
-                account_login=args.account,
+                market_data_account_login=args.market_data_account,
                 terminal_path=args.terminal_path.expanduser().resolve() if args.terminal_path else None,
             )
-            result = source_proof_result(source.source_proof())
+            result = source_proof_result(
+                source.source_proof(),
+                execution_account_login=args.execution_account,
+                execution_universe_source=universe_path.name,
+            )
         elif args.mode == "collect":
             result = _collect(args)
         else:

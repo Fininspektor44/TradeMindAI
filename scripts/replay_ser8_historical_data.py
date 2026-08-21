@@ -13,7 +13,11 @@ from typing import Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from trademind.ser8_historical_data import HistoricalDataError  # noqa: E402
+from trademind.ser8_historical_data import (  # noqa: E402
+    HistoricalDataError,
+    load_inventory,
+    verify_inventory_account_identities,
+)
 from trademind.ser8_historical_replay import (  # noqa: E402
     build_research_readiness_inventory,
     load_research_policy,
@@ -22,6 +26,8 @@ from trademind.ser8_historical_replay import (  # noqa: E402
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--execution-account", required=True)
+    parser.add_argument("--market-data-account", required=True)
     parser.add_argument(
         "--historical-inventory",
         type=Path,
@@ -49,8 +55,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
         policy = load_research_policy(args.policy.expanduser().resolve())
+        historical_inventory_path = args.historical_inventory.expanduser().resolve()
+        verify_inventory_account_identities(
+            load_inventory(historical_inventory_path),
+            execution_account_login=args.execution_account,
+            market_data_account_login=args.market_data_account,
+        )
         result = build_research_readiness_inventory(
-            historical_inventory_path=args.historical_inventory.expanduser().resolve(),
+            historical_inventory_path=historical_inventory_path,
             replay_root=args.replay_root.expanduser().resolve(),
             policy=policy,
             output_path=args.output.expanduser().resolve(),

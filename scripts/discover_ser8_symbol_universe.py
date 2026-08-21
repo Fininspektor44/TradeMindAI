@@ -17,8 +17,8 @@ observes and reports. The ONLY thing this script writes, and only when
 ``ser8_symbol_universe`` table -- a point-in-time snapshot for operator
 visibility, never consulted by the risk/authorization/execution chain.
 
-INPUTS (all optional except ``--mt5-export-dir``/``--account``):
-  * ``--mt5-export-dir``/``--account``: the REAL MT5 symbol export
+INPUTS (all optional except ``--mt5-export-dir``/``--execution-account``):
+  * ``--mt5-export-dir``/``--execution-account``: the REAL MT5 symbol export
     (``mt5_risk_symbols_utc_<account>.csv``) the unified executor EA
     already writes -- the SAME file ``trademind.mt5_risk_adapter`` and
     the autonomous worker's own risk gate already consume. This is the
@@ -143,7 +143,15 @@ def _print_inventory(entries: Sequence[SymbolUniverseEntryV1], *, ranked_queue: 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mt5-export-dir", type=Path, required=True, help="Directory containing the real MT5 symbol export CSVs")
-    parser.add_argument("--account", required=True, help="MT5 account/login the symbol export belongs to")
+    parser.add_argument(
+        "--execution-account",
+        required=True,
+        help="Execution account/login whose real symbol export defines the target universe",
+    )
+    parser.add_argument(
+        "--market-data-account",
+        help="Market-data account bound by --historical-inventory; required with that option",
+    )
     parser.add_argument("--runtime-root", type=Path, default=None, help="Live candidate runtime root (default: data/live_signal_runtime_v1)")
     parser.add_argument("--candidates", type=Path, nargs="*", default=(), help="Additional candidate journal path(s) to scan")
     parser.add_argument("--data-root", type=Path, default=None)
@@ -173,16 +181,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     data_root = Path(args.data_root).expanduser() if args.data_root else repo_root / "data"
     runtime_root = Path(args.runtime_root).expanduser() if args.runtime_root else data_root / "live_signal_runtime_v1"
     mt5_export_dir = Path(args.mt5_export_dir).expanduser()
-    symbols_csv = mt5_export_dir / f"mt5_risk_symbols_utc_{args.account}.csv"
+    symbols_csv = mt5_export_dir / f"mt5_risk_symbols_utc_{args.execution_account}.csv"
 
     candidates_paths = [runtime_root / "candidates.jsonl"] + [Path(p).expanduser() for p in args.candidates]
     correlations_path = Path(args.correlations).expanduser() if args.correlations else repo_root / "config" / "mt5" / "correlation_groups_v1.json"
     correlation_config = _read_correlation_config(correlations_path)
     verified_research = {}
     if args.historical_inventory:
+        if not args.market_data_account:
+            print("--historical-inventory requires --market-data-account", file=sys.stderr)
+            return 2
         try:
             historical_rows, verified_research = load_verified_research_readiness(
-                Path(args.historical_inventory).expanduser().resolve()
+                Path(args.historical_inventory).expanduser().resolve(),
+                execution_account_login=args.execution_account,
+                market_data_account_login=args.market_data_account,
             )
         except Exception as exc:  # noqa: BLE001 -- one fail-closed operator error.
             print(f"historical readiness inventory failed verification: {exc}", file=sys.stderr)

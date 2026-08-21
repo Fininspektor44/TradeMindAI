@@ -37,6 +37,14 @@ INVENTORY_SCHEMA_VERSION = "ser8-historical-data-inventory-v1"
 SOURCE_PROOF_SCHEMA_VERSION = "ser8-mt5-history-source-proof-v1"
 COLLECTOR_VERSION = "1.0.0"
 SOURCE_TYPE = "MT5_PYTHON_COPY_RATES_RANGE"
+READ_ONLY_MT5_OPERATIONS = (
+    "initialize",
+    "terminal_info",
+    "account_info",
+    "version",
+    "symbol_info",
+    "copy_rates_range",
+)
 BAR_FIELDS = (
     "time_utc",
     "symbol",
@@ -147,6 +155,14 @@ def _number_text(value: float) -> str:
     return format(float(value), ".17g")
 
 
+def _positive_finite_or_none(value: object) -> float | None:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
 def _sha256_hex(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -243,17 +259,70 @@ def load_broker_universe(symbols_csv: Path, *, account_login: str) -> tuple[Brok
     return tuple(by_symbol[symbol] for symbol in sorted(by_symbol))
 
 
+def verify_cross_account_symbol_compatibility(
+    *,
+    broker_symbol: BrokerSymbolV1,
+    market_data_symbol_metadata: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind source metadata to one symbol already present in the execution universe."""
+    execution_symbol = broker_symbol.symbol.strip().upper()
+    market_data_symbol = str(market_data_symbol_metadata.get("name") or "").strip().upper()
+    if market_data_symbol != execution_symbol:
+        raise HistoricalDataError(
+            "BROKER_SYMBOL_IDENTITY_MISMATCH",
+            f"market-data source returned {market_data_symbol!r} for execution symbol {execution_symbol!r}",
+        )
+
+    execution_tick_size = _positive_finite_or_none(broker_symbol.source_row.get("tick_size"))
+    market_data_tick_size = _positive_finite_or_none(
+        market_data_symbol_metadata.get("trade_tick_size")
+    )
+    tick_size_compared = execution_tick_size is not None and market_data_tick_size is not None
+    tick_size_compatible: bool | None = None
+    if tick_size_compared:
+        tick_size_compatible = math.isclose(
+            execution_tick_size,
+            market_data_tick_size,
+            rel_tol=1e-9,
+            abs_tol=max(execution_tick_size, market_data_tick_size) * 1e-12,
+        )
+        if not tick_size_compatible:
+            raise HistoricalDataError(
+                "BROKER_SYMBOL_SEMANTICS_MISMATCH",
+                f"{execution_symbol} trade tick size differs: execution={execution_tick_size!r}, "
+                f"market_data={market_data_tick_size!r}",
+            )
+
+    return {
+        "execution_symbol_in_universe": True,
+        "execution_symbol": execution_symbol,
+        "market_data_symbol": market_data_symbol,
+        "exact_symbol_identity_verified": True,
+        "execution_trade_mode": broker_symbol.trade_mode,
+        "market_data_trade_mode": market_data_symbol_metadata.get("trade_mode_name"),
+        "execution_tick_size": execution_tick_size,
+        "market_data_trade_tick_size": market_data_tick_size,
+        "trade_tick_size_compared": tick_size_compared,
+        "trade_tick_size_compatible": tick_size_compatible,
+    }
+
+
 class MetaTrader5HistorySource:
     """Narrow read-only adapter around the official MetaTrader5 package."""
 
     def __init__(
         self,
         *,
-        account_login: str,
+        market_data_account_login: str,
         terminal_path: Path | None = None,
         module: Any | None = None,
     ) -> None:
-        self.account_login = str(account_login).strip()
+        self.market_data_account_login = str(market_data_account_login).strip()
+        if not self.market_data_account_login:
+            raise HistoricalDataError(
+                "MARKET_DATA_ACCOUNT_REQUIRED",
+                "market-data account login is required",
+            )
         self.terminal_path = terminal_path
         self._mt5 = module
         self._proof: dict[str, object] | None = None
@@ -279,11 +348,12 @@ class MetaTrader5HistorySource:
             self.close()
             raise HistoricalDataError("MT5_NOT_CONNECTED", "MT5 terminal is not connected")
         actual_login = str(getattr(account, "login", ""))
-        if actual_login != self.account_login:
+        if actual_login != self.market_data_account_login:
             self.close()
             raise HistoricalDataError(
                 "MT5_ACCOUNT_MISMATCH",
-                f"active MT5 account {actual_login!r} does not match {self.account_login!r}",
+                "active MT5 market-data account "
+                f"{actual_login!r} does not match {self.market_data_account_login!r}",
             )
         server = str(getattr(account, "server", "") or "").strip()
         company = str(getattr(account, "company", "") or "").strip()
@@ -295,19 +365,19 @@ class MetaTrader5HistorySource:
         self._proof = {
             "schema_version": SOURCE_PROOF_SCHEMA_VERSION,
             "source_type": SOURCE_TYPE,
-            "account_login": actual_login,
-            "account_server": server,
-            "account_company": company or None,
-            "account_currency": str(getattr(account, "currency", "") or "") or None,
+            "market_data_account_login": actual_login,
+            "market_data_account_server": server,
+            "market_data_account_company": company or None,
+            "market_data_account_currency": str(getattr(account, "currency", "") or "") or None,
             "terminal_company": terminal_company or None,
             "terminal_name": str(getattr(terminal, "name", "") or "") or None,
             "terminal_path": str(getattr(terminal, "path", "") or "") or None,
             "terminal_connected": True,
             "terminal_trade_allowed_observed": bool(getattr(terminal, "trade_allowed", False)),
             "mt5_version": list(version) if version is not None else None,
-            "authenticated_account_verified": True,
+            "authenticated_market_data_account_verified": True,
             "utc_contract": "copy_rates_range inputs and returned epoch seconds interpreted as UTC",
-            "read_only_operations": ["initialize", "terminal_info", "account_info", "version", "symbol_info", "copy_rates_range"],
+            "read_only_operations": list(READ_ONLY_MT5_OPERATIONS),
         }
         return dict(self._proof)
 
@@ -355,6 +425,9 @@ class MetaTrader5HistorySource:
             "trade_mode_name": trade_mode_name,
             "digits": int(getattr(info, "digits", 0)),
             "point": point,
+            "trade_tick_size": _positive_finite_or_none(
+                getattr(info, "trade_tick_size", None)
+            ),
         }
 
     def copy_rates(
@@ -519,6 +592,9 @@ def build_dataset_manifest(
     source_proof: Mapping[str, object],
     symbol_metadata: Mapping[str, object],
     broker_symbol: BrokerSymbolV1,
+    execution_account_login: str,
+    execution_universe_source: str,
+    execution_universe_sha256: str,
     timeframe: str,
     requested_from_utc: datetime,
     requested_to_utc: datetime,
@@ -526,6 +602,29 @@ def build_dataset_manifest(
     source_capture_utc: datetime,
     collector_code_sha256: str,
 ) -> tuple[dict[str, object], bytes]:
+    execution_account = str(execution_account_login).strip()
+    market_data_account = str(source_proof.get("market_data_account_login") or "").strip()
+    if not execution_account:
+        raise HistoricalDataError("EXECUTION_ACCOUNT_REQUIRED", "execution account login is required")
+    if broker_symbol.source_row.get("account_login") != execution_account:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_ACCOUNT_MISMATCH",
+            "dataset execution account does not match its broker-universe row",
+        )
+    if not market_data_account or source_proof.get("source_type") != SOURCE_TYPE:
+        raise HistoricalDataError(
+            "MARKET_DATA_SOURCE_PROOF_INVALID",
+            "verified market-data account/source identity is required",
+        )
+    if source_proof.get("authenticated_market_data_account_verified") is not True:
+        raise HistoricalDataError(
+            "MARKET_DATA_SOURCE_PROOF_INVALID",
+            "market-data account verification is absent",
+        )
+    compatibility = verify_cross_account_symbol_compatibility(
+        broker_symbol=broker_symbol,
+        market_data_symbol_metadata=symbol_metadata,
+    )
     quality = validate_historical_bars(
         bars,
         symbol=broker_symbol.symbol,
@@ -537,9 +636,15 @@ def build_dataset_manifest(
     dataset_identity = {
         "schema_version": DATASET_SCHEMA_VERSION,
         "source_type": SOURCE_TYPE,
-        "broker_server": source_proof.get("account_server"),
-        "broker_company": source_proof.get("account_company") or source_proof.get("terminal_company"),
-        "account_login": source_proof.get("account_login"),
+        "market_data_source_type": SOURCE_TYPE,
+        "execution_account_login": execution_account,
+        "market_data_account_login": market_data_account,
+        "execution_universe_source": execution_universe_source,
+        "execution_universe_sha256": execution_universe_sha256,
+        "market_data_account_server": source_proof.get("market_data_account_server"),
+        "market_data_account_company": source_proof.get("market_data_account_company")
+        or source_proof.get("terminal_company"),
+        "market_data_account_currency": source_proof.get("market_data_account_currency"),
         "symbol": broker_symbol.symbol,
         "timeframe": timeframe.strip().upper(),
         "requested_from_utc": _utc_text(requested_from_utc),
@@ -549,6 +654,9 @@ def build_dataset_manifest(
         "bars_sha256": bars_sha256,
         "symbol_point": symbol_metadata.get("point"),
         "symbol_digits": symbol_metadata.get("digits"),
+        "symbol_compatibility_verified": True,
+        "execution_symbol_tick_size": compatibility["execution_tick_size"],
+        "market_data_symbol_trade_tick_size": compatibility["market_data_trade_tick_size"],
         "expected_interval_seconds": expected_interval_seconds,
     }
     digest = hashlib.sha256()
@@ -562,6 +670,20 @@ def build_dataset_manifest(
         "dataset_sha256": dataset_sha256,
         "source_capture_utc": _utc_text(source_capture_utc),
         "source_proof": dict(source_proof),
+        "cross_account_provenance": {
+            "execution_account_login": execution_account,
+            "market_data_account_login": market_data_account,
+            "accounts_claimed_equivalent": False,
+            "price_feeds_claimed_byte_identical": False,
+            "research_evidence_scope": "MARKET_DATA_SOURCE_OBSERVED_NOT_EXECUTION_PRICE_EQUIVALENCE",
+        },
+        "symbol_compatibility": compatibility,
+        "execution_symbol_metadata": {
+            "account_login": execution_account,
+            "name": broker_symbol.symbol,
+            "trade_mode": broker_symbol.trade_mode,
+            "trade_tick_size": compatibility["execution_tick_size"],
+        },
         "source_symbol_metadata": dict(symbol_metadata),
         "broker_trade_mode": broker_symbol.trade_mode,
         "asset_class": broker_symbol.asset_class,
@@ -680,11 +802,48 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
     if manifest.get("accepted_historical_data") is not bool(quality["data_integrity_pass"]):
         raise HistoricalDataError("DATASET_ACCEPTANCE_MISMATCH", f"acceptance mismatch: {dataset_dir}")
     identity_keys = (
-        "schema_version", "source_type", "broker_server", "broker_company", "account_login",
-        "symbol", "timeframe", "requested_from_utc", "requested_to_utc", "actual_first_bar_utc",
+        "schema_version", "source_type", "market_data_source_type",
+        "execution_account_login", "market_data_account_login", "execution_universe_source",
+        "execution_universe_sha256", "market_data_account_server",
+        "market_data_account_company", "market_data_account_currency", "symbol", "timeframe",
+        "requested_from_utc", "requested_to_utc", "actual_first_bar_utc",
         "actual_last_bar_utc", "bars_sha256", "symbol_point", "symbol_digits",
-        "expected_interval_seconds",
+        "symbol_compatibility_verified", "execution_symbol_tick_size",
+        "market_data_symbol_trade_tick_size", "expected_interval_seconds",
     )
+    for key in (
+        "execution_account_login",
+        "market_data_account_login",
+        "execution_universe_source",
+        "execution_universe_sha256",
+        "market_data_account_server",
+    ):
+        if not manifest.get(key):
+            raise HistoricalDataError("DATASET_ACCOUNT_IDENTITY_MISSING", f"manifest is missing {key}")
+    source_proof = manifest.get("source_proof")
+    if not isinstance(source_proof, dict) or (
+        source_proof.get("market_data_account_login") != manifest.get("market_data_account_login")
+        or source_proof.get("market_data_account_server") != manifest.get("market_data_account_server")
+        or source_proof.get("source_type") != SOURCE_TYPE
+        or source_proof.get("authenticated_market_data_account_verified") is not True
+        or source_proof.get("read_only_operations") != list(READ_ONLY_MT5_OPERATIONS)
+    ):
+        raise HistoricalDataError(
+            "DATASET_SOURCE_PROOF_MISMATCH",
+            f"market-data source proof does not match manifest: {dataset_dir}",
+        )
+    compatibility = manifest.get("symbol_compatibility")
+    if not isinstance(compatibility, dict) or (
+        compatibility.get("execution_symbol_in_universe") is not True
+        or compatibility.get("exact_symbol_identity_verified") is not True
+        or compatibility.get("execution_symbol") != manifest.get("symbol")
+        or compatibility.get("market_data_symbol") != manifest.get("symbol")
+        or manifest.get("symbol_compatibility_verified") is not True
+    ):
+        raise HistoricalDataError(
+            "DATASET_SYMBOL_COMPATIBILITY_INVALID",
+            f"cross-account symbol compatibility is invalid: {dataset_dir}",
+        )
     identity = {key: manifest.get(key) for key in identity_keys}
     digest = hashlib.sha256()
     digest.update(_DATASET_HASH_DOMAIN)
@@ -712,6 +871,38 @@ def verify_inventory(payload: Mapping[str, object]) -> None:
     supplied = payload.get("inventory_sha256")
     if not isinstance(supplied, str) or supplied != inventory_hash(payload):
         raise HistoricalDataError("INVENTORY_HASH_MISMATCH", "historical inventory hash mismatch")
+    execution_account = str(payload.get("execution_account_login") or "").strip()
+    market_data_account = str(payload.get("market_data_account_login") or "").strip()
+    universe_source = str(payload.get("execution_universe_source") or "").strip()
+    if not execution_account or not market_data_account:
+        raise HistoricalDataError(
+            "INVENTORY_ACCOUNT_IDENTITY_MISSING",
+            "historical inventory must bind execution and market-data account identities",
+        )
+    expected_source = f"mt5_risk_symbols_utc_{execution_account}.csv"
+    if Path(universe_source).name != expected_source:
+        raise HistoricalDataError(
+            "INVENTORY_EXECUTION_UNIVERSE_MISMATCH",
+            f"execution universe must be {expected_source}, got {universe_source!r}",
+        )
+    if payload.get("market_data_source_type") != SOURCE_TYPE:
+        raise HistoricalDataError(
+            "INVENTORY_MARKET_DATA_SOURCE_INVALID",
+            "historical inventory market-data source type is invalid",
+        )
+    source_proof = payload.get("source_proof")
+    if not isinstance(source_proof, dict) or (
+        source_proof.get("market_data_account_login") != market_data_account
+        or source_proof.get("market_data_account_server")
+        != payload.get("market_data_account_server")
+        or source_proof.get("source_type") != SOURCE_TYPE
+        or source_proof.get("authenticated_market_data_account_verified") is not True
+        or source_proof.get("read_only_operations") != list(READ_ONLY_MT5_OPERATIONS)
+    ):
+        raise HistoricalDataError(
+            "INVENTORY_SOURCE_PROOF_MISMATCH",
+            "historical inventory market-data source proof is invalid",
+        )
     entries = payload.get("entries")
     if not isinstance(entries, list):
         raise HistoricalDataError("INVENTORY_ENTRIES_INVALID", "historical inventory entries must be a list")
@@ -723,6 +914,26 @@ def verify_inventory(payload: Mapping[str, object]) -> None:
         if symbol in symbols:
             raise HistoricalDataError("INVENTORY_SYMBOL_DUPLICATE", f"duplicate inventory symbol: {symbol}")
         symbols.add(symbol)
+
+
+def verify_inventory_account_identities(
+    payload: Mapping[str, object],
+    *,
+    execution_account_login: str,
+    market_data_account_login: str,
+) -> None:
+    expected_execution = str(execution_account_login).strip()
+    expected_market_data = str(market_data_account_login).strip()
+    if payload.get("execution_account_login") != expected_execution:
+        raise HistoricalDataError(
+            "INVENTORY_EXECUTION_ACCOUNT_MISMATCH",
+            f"inventory execution account does not match {expected_execution!r}",
+        )
+    if payload.get("market_data_account_login") != expected_market_data:
+        raise HistoricalDataError(
+            "INVENTORY_MARKET_DATA_ACCOUNT_MISMATCH",
+            f"inventory market-data account does not match {expected_market_data!r}",
+        )
 
 
 def load_inventory(path: Path) -> dict[str, object]:
@@ -772,9 +983,25 @@ def collector_code_sha256() -> str:
     return sha256_bytes(Path(__file__).read_bytes())
 
 
-def source_proof_result(proof: Mapping[str, object]) -> dict[str, object]:
+def source_proof_result(
+    proof: Mapping[str, object],
+    *,
+    execution_account_login: str,
+    execution_universe_source: str,
+) -> dict[str, object]:
+    market_data_account_login = str(proof.get("market_data_account_login") or "")
     return {
         "status": "SOURCE_VERIFIED",
+        "execution_account_login": str(execution_account_login),
+        "market_data_account_login": market_data_account_login,
+        "execution_universe_source": execution_universe_source,
+        "market_data_source_type": proof.get("source_type"),
+        "cross_account_provenance": {
+            "execution_account_login": str(execution_account_login),
+            "market_data_account_login": market_data_account_login,
+            "accounts_claimed_equivalent": False,
+            "price_feeds_claimed_byte_identical": False,
+        },
         "source_proof": dict(proof),
         "orders_sent": 0,
         "orders_canceled": 0,
@@ -788,6 +1015,7 @@ __all__ = [
     "COLLECTOR_VERSION",
     "DATASET_SCHEMA_VERSION",
     "INVENTORY_SCHEMA_VERSION",
+    "READ_ONLY_MT5_OPERATIONS",
     "BrokerSymbolV1",
     "HistoricalBarV1",
     "HistoricalDataError",
@@ -807,5 +1035,7 @@ __all__ = [
     "validate_historical_bars",
     "verify_dataset",
     "verify_inventory",
+    "verify_inventory_account_identities",
+    "verify_cross_account_symbol_compatibility",
     "write_inventory_artifacts",
 ]

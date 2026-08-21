@@ -343,6 +343,11 @@ def create_replay(
         "schema_version": REPLAY_SCHEMA_VERSION,
         "dataset_id": dataset_manifest["dataset_id"],
         "dataset_sha256": dataset_manifest["dataset_sha256"],
+        "execution_account_login": dataset_manifest["execution_account_login"],
+        "market_data_account_login": dataset_manifest["market_data_account_login"],
+        "execution_universe_source": dataset_manifest["execution_universe_source"],
+        "market_data_source_type": dataset_manifest["market_data_source_type"],
+        "market_data_account_server": dataset_manifest["market_data_account_server"],
         "symbol": dataset_manifest["symbol"],
         "timeframe": dataset_manifest["timeframe"],
         "policy_schema_version": policy["schema_version"],
@@ -438,7 +443,9 @@ def verify_replay(replay_dir: Path) -> dict[str, object]:
     if manifest.get("outcomes_sha256") != sha256_bytes(outcomes_bytes):
         raise HistoricalDataError("REPLAY_OUTCOMES_HASH_MISMATCH", f"outcome hash mismatch: {replay_dir}")
     identity_keys = (
-        "schema_version", "dataset_id", "dataset_sha256", "symbol", "timeframe",
+        "schema_version", "dataset_id", "dataset_sha256", "execution_account_login",
+        "market_data_account_login", "execution_universe_source", "market_data_source_type",
+        "market_data_account_server", "symbol", "timeframe",
         "policy_schema_version", "policy_sha256", "shadow_max_bars", "shadow_cost_r",
         "research_minimum_completed_outcomes", "code_provenance", "candidates_sha256",
         "outcomes_sha256",
@@ -517,6 +524,8 @@ def build_research_readiness_inventory(
     for source_entry in historical["entries"]:
         entry = {
             "symbol": source_entry["symbol"],
+            "execution_account_login": historical["execution_account_login"],
+            "market_data_account_login": historical["market_data_account_login"],
             "asset_class": source_entry["asset_class"],
             "broker_trade_mode": source_entry["broker_trade_mode"],
             "risk_model_supported": source_entry["risk_model_supported"],
@@ -564,6 +573,11 @@ def build_research_readiness_inventory(
     payload: dict[str, object] = {
         "schema_version": READINESS_SCHEMA_VERSION,
         "captured_at_utc": _utc_text(captured_at),
+        "execution_account_login": historical["execution_account_login"],
+        "market_data_account_login": historical["market_data_account_login"],
+        "execution_universe_source": historical["execution_universe_source"],
+        "market_data_source_type": historical["market_data_source_type"],
+        "market_data_account_server": historical["market_data_account_server"],
         "historical_inventory_sha256": historical["inventory_sha256"],
         "policy": dict(policy),
         "historical_inventory_path": str(historical_inventory_path),
@@ -584,6 +598,9 @@ def build_research_readiness_inventory(
 
 def load_verified_research_readiness(
     path: Path,
+    *,
+    execution_account_login: str | None = None,
+    market_data_account_login: str | None = None,
 ) -> tuple[dict[str, int], dict[str, VerifiedHistoricalResearchEvidenceV1]]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -602,6 +619,32 @@ def load_verified_research_readiness(
             "READINESS_HISTORICAL_INVENTORY_MISMATCH",
             "readiness inventory does not match its historical inventory",
         )
+    if execution_account_login is not None and payload.get("execution_account_login") != str(
+        execution_account_login
+    ).strip():
+        raise HistoricalDataError(
+            "READINESS_EXECUTION_ACCOUNT_MISMATCH",
+            "readiness inventory belongs to a different execution account",
+        )
+    if market_data_account_login is not None and payload.get("market_data_account_login") != str(
+        market_data_account_login
+    ).strip():
+        raise HistoricalDataError(
+            "READINESS_MARKET_DATA_ACCOUNT_MISMATCH",
+            "readiness inventory belongs to a different market-data account",
+        )
+    for field in (
+        "execution_account_login",
+        "market_data_account_login",
+        "execution_universe_source",
+        "market_data_source_type",
+        "market_data_account_server",
+    ):
+        if payload.get(field) != historical_inventory.get(field):
+            raise HistoricalDataError(
+                "READINESS_ACCOUNT_PROVENANCE_MISMATCH",
+                f"readiness {field} does not match its historical inventory",
+            )
     policy = payload.get("policy")
     if not isinstance(policy, dict):
         raise HistoricalDataError("READINESS_POLICY_MISSING", str(path))
@@ -630,8 +673,16 @@ def load_verified_research_readiness(
             replay_manifest = verify_replay(Path(replay_dir))
             if (
                 dataset_manifest.get("dataset_sha256") != dataset_sha
+                or dataset_manifest.get("execution_account_login")
+                != payload.get("execution_account_login")
+                or dataset_manifest.get("market_data_account_login")
+                != payload.get("market_data_account_login")
                 or replay_manifest.get("replay_sha256") != replay_sha
                 or replay_manifest.get("dataset_sha256") != dataset_sha
+                or replay_manifest.get("execution_account_login")
+                != payload.get("execution_account_login")
+                or replay_manifest.get("market_data_account_login")
+                != payload.get("market_data_account_login")
                 or replay_manifest.get("completed_outcome_count") != entry.get("completed_outcome_count")
                 or replay_manifest.get("research_minimum_completed_outcomes") != entry.get("research_minimum")
                 or replay_manifest.get("research_ready") is not entry.get("research_ready")

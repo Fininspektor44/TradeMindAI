@@ -21,6 +21,7 @@ import pytest
 
 from trademind.ser8_historical_data import (
     DATASET_SCHEMA_VERSION,
+    READ_ONLY_MT5_OPERATIONS,
     HistoricalBarV1,
     HistoricalDataError,
     MetaTrader5HistorySource,
@@ -32,6 +33,7 @@ from trademind.ser8_historical_data import (
     load_inventory,
     publish_dataset,
     validate_historical_bars,
+    verify_cross_account_symbol_compatibility,
     verify_dataset,
     write_inventory_artifacts,
 )
@@ -53,6 +55,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 inventory_cli = importlib.import_module("build_ser8_historical_data_inventory")
 
 ACCOUNT = "67206924"
+MARKET_DATA_ACCOUNT = "37365712"
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
 POLICY_PATH = REPO_ROOT / "config" / "research" / "ser8_historical_research_policy_v1.json"
 
@@ -121,12 +124,27 @@ def _proof() -> dict[str, object]:
     return {
         "schema_version": "ser8-mt5-history-source-proof-v1",
         "source_type": "MT5_PYTHON_COPY_RATES_RANGE",
-        "account_login": ACCOUNT,
-        "account_server": "Broker-Demo",
-        "account_company": "Broker",
+        "market_data_account_login": MARKET_DATA_ACCOUNT,
+        "market_data_account_server": "Broker-ECN",
+        "market_data_account_company": "Broker",
+        "market_data_account_currency": "USD",
         "terminal_company": "Broker",
-        "authenticated_account_verified": True,
+        "authenticated_market_data_account_verified": True,
         "utc_contract": "UTC",
+        "read_only_operations": list(READ_ONLY_MT5_OPERATIONS),
+    }
+
+
+def _inventory_identity() -> dict[str, object]:
+    return {
+        "execution_account_login": ACCOUNT,
+        "market_data_account_login": MARKET_DATA_ACCOUNT,
+        "execution_universe_source": f"mt5_risk_symbols_utc_{ACCOUNT}.csv",
+        "market_data_source_type": "MT5_PYTHON_COPY_RATES_RANGE",
+        "market_data_account_server": "Broker-ECN",
+        "market_data_account_company": "Broker",
+        "market_data_account_currency": "USD",
+        "source_proof": _proof(),
     }
 
 
@@ -151,8 +169,17 @@ def _manifest(
     return build_dataset_manifest(
         bars=bars,
         source_proof=_proof(),
-        symbol_metadata={"name": active.symbol, "point": 0.00001, "digits": 5, "visible": True},
+        symbol_metadata={
+            "name": active.symbol,
+            "point": 0.00001,
+            "digits": 5,
+            "visible": True,
+            "trade_tick_size": 0.00001,
+        },
         broker_symbol=active,
+        execution_account_login=ACCOUNT,
+        execution_universe_source=f"mt5_risk_symbols_utc_{ACCOUNT}.csv",
+        execution_universe_sha256=sha256_bytes(b"execution universe"),
         timeframe="M5",
         requested_from_utc=NOW - timedelta(days=10),
         requested_to_utc=NOW,
@@ -164,15 +191,24 @@ def _manifest(
 
 class _FakeSource:
     bars_by_symbol: dict[str, tuple[HistoricalBarV1, ...]] = {}
+    initialization: dict[str, object] = {}
 
-    def __init__(self, **_: object) -> None:
+    def __init__(self, **kwargs: object) -> None:
         self.closed = False
+        type(self).initialization = kwargs
 
     def source_proof(self) -> dict[str, object]:
         return _proof()
 
     def symbol_metadata(self, symbol: str) -> dict[str, object]:
-        return {"name": symbol, "point": 0.00001, "digits": 5, "visible": True}
+        return {
+            "name": symbol,
+            "point": 0.00001,
+            "digits": 5,
+            "visible": True,
+            "trade_tick_size": 0.00001,
+            "trade_mode_name": "FULL",
+        }
 
     def copy_rates(self, symbol: str, *_: object) -> tuple[HistoricalBarV1, ...]:
         return self.bars_by_symbol.get(symbol, ())
@@ -198,7 +234,8 @@ def _run_collection(
     exit_code = inventory_cli.main(
         [
             "--mode", "collect",
-            "--account", ACCOUNT,
+            "--execution-account", ACCOUNT,
+            "--market-data-account", MARKET_DATA_ACCOUNT,
             "--mt5-export-dir", str(common),
             "--from-utc", "2026-08-01T00:00:00Z",
             "--to-utc", "2026-08-21T00:00:00Z",
@@ -222,6 +259,56 @@ def test_full_universe_is_loaded_from_broker_export_not_handwritten(tmp_path: Pa
     assert "FX_MAJORS" not in source
 
 
+def test_explicit_execution_and_market_data_accounts_may_differ(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    common = tmp_path / "Common Files" / "TradeMindAI"
+    _write_universe(
+        common / f"mt5_risk_symbols_utc_{ACCOUNT}.csv",
+        [_symbol_row("EURUSD")],
+    )
+    monkeypatch.setattr(inventory_cli, "MetaTrader5HistorySource", _FakeSource)
+    exit_code = inventory_cli.main(
+        [
+            "--mode",
+            "verify-source",
+            "--execution-account",
+            ACCOUNT,
+            "--market-data-account",
+            MARKET_DATA_ACCOUNT,
+            "--mt5-export-dir",
+            str(common),
+        ]
+    )
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["execution_account_login"] == ACCOUNT
+    assert payload["market_data_account_login"] == MARKET_DATA_ACCOUNT
+    assert payload["execution_universe_source"] == f"mt5_risk_symbols_utc_{ACCOUNT}.csv"
+    assert _FakeSource.initialization["market_data_account_login"] == MARKET_DATA_ACCOUNT
+
+
+def test_execution_universe_wrong_account_fails_closed(tmp_path: Path) -> None:
+    wrong_row = _symbol_row("EURUSD")
+    wrong_row["account_login"] = MARKET_DATA_ACCOUNT
+    path = _write_universe(
+        tmp_path / f"mt5_risk_symbols_utc_{ACCOUNT}.csv",
+        [wrong_row],
+    )
+    with pytest.raises(HistoricalDataError) as caught:
+        load_broker_universe(path, account_login=ACCOUNT)
+    assert caught.value.code == "BROKER_UNIVERSE_ACCOUNT_MISMATCH"
+
+
+def test_ambiguous_historical_account_cli_is_rejected() -> None:
+    with pytest.raises(SystemExit):
+        inventory_cli.build_arg_parser().parse_args(
+            ["--mode", "verify-source", "--account", ACCOUNT]
+        )
+
+
 def test_missing_history_is_unavailable_and_never_fabricated(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -238,6 +325,30 @@ def test_missing_history_is_unavailable_and_never_fabricated(
     assert by_symbol["GBPUSD"]["status"] == "BROKER_HISTORY_UNAVAILABLE"
     assert by_symbol["GBPUSD"]["row_count"] == 0
     assert compatibility.read_text() == "symbol,rows\nEURUSD,120\n"
+
+
+def test_inventory_binds_both_accounts_and_excludes_market_data_only_symbol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, inventory_path, _ = _run_collection(
+        tmp_path,
+        monkeypatch,
+        symbol_rows=[_symbol_row("EURUSD")],
+        bars_by_symbol={
+            "EURUSD": _bars(120),
+            "USDJPY": _bars(120, symbol="USDJPY"),
+        },
+    )
+    capsys.readouterr()
+    assert code == 0
+    payload = load_inventory(inventory_path)
+    assert payload["execution_account_login"] == ACCOUNT
+    assert payload["market_data_account_login"] == MARKET_DATA_ACCOUNT
+    assert payload["execution_universe_source"] == f"mt5_risk_symbols_utc_{ACCOUNT}.csv"
+    assert payload["market_data_source_type"] == "MT5_PYTHON_COPY_RATES_RANGE"
+    assert [entry["symbol"] for entry in payload["entries"]] == ["EURUSD"]
 
 
 def test_one_row_never_becomes_research_ready(
@@ -347,8 +458,11 @@ def test_manifest_contains_required_quality_and_no_gap_repair() -> None:
     bars = (_bars(1)[0], replace(_bars(1)[0], time_utc=_bars(1)[0].time_utc + timedelta(minutes=15)))
     manifest, bars_bytes = _manifest(bars)
     required = {
-        "schema_version", "dataset_id", "dataset_sha256", "source_type", "broker_server",
-        "account_login", "symbol", "timeframe", "requested_from_utc", "requested_to_utc",
+        "schema_version", "dataset_id", "dataset_sha256", "source_type",
+        "execution_account_login", "market_data_account_login", "execution_universe_source",
+        "market_data_source_type", "market_data_account_server", "symbol", "timeframe",
+        "cross_account_provenance", "symbol_compatibility",
+        "requested_from_utc", "requested_to_utc",
         "actual_first_bar_utc", "actual_last_bar_utc", "row_count", "unique_timestamp_count",
         "duplicate_timestamp_count", "monotonic_timestamp_pass", "ohlc_integrity_pass",
         "numeric_integrity_pass", "gap_count", "largest_gap_seconds", "expected_interval_seconds",
@@ -357,11 +471,40 @@ def test_manifest_contains_required_quality_and_no_gap_repair() -> None:
         "collector_version",
     }
     assert required <= set(manifest)
+    assert manifest["execution_account_login"] == ACCOUNT
+    assert manifest["market_data_account_login"] == MARKET_DATA_ACCOUNT
+    assert manifest["execution_universe_source"] == f"mt5_risk_symbols_utc_{ACCOUNT}.csv"
+    assert manifest["market_data_account_server"] == "Broker-ECN"
+    assert manifest["cross_account_provenance"]["accounts_claimed_equivalent"] is False
+    assert manifest["cross_account_provenance"]["price_feeds_claimed_byte_identical"] is False
+    assert manifest["symbol_compatibility"]["exact_symbol_identity_verified"] is True
     assert manifest["gap_count"] == 1
     assert manifest["unexplained_gap_count"] == 1
     assert manifest["gap_repair_performed"] is False
     assert manifest["synthetic_bars_added"] == 0
     assert len(canonical_bars_csv(bars).splitlines()) == len(bars_bytes.splitlines()) == 3
+
+
+def test_cross_account_exact_symbol_and_trade_tick_size_mismatches_fail_closed() -> None:
+    with pytest.raises(HistoricalDataError) as symbol_error:
+        verify_cross_account_symbol_compatibility(
+            broker_symbol=_broker("EURUSD"),
+            market_data_symbol_metadata={
+                "name": "EURUSD.r",
+                "trade_tick_size": 0.00001,
+            },
+        )
+    assert symbol_error.value.code == "BROKER_SYMBOL_IDENTITY_MISMATCH"
+
+    with pytest.raises(HistoricalDataError) as semantics_error:
+        verify_cross_account_symbol_compatibility(
+            broker_symbol=_broker("EURUSD"),
+            market_data_symbol_metadata={
+                "name": "EURUSD",
+                "trade_tick_size": 0.0001,
+            },
+        )
+    assert semantics_error.value.code == "BROKER_SYMBOL_SEMANTICS_MISMATCH"
 
 
 def test_unsupported_and_disabled_symbols_stay_gated(
@@ -392,13 +535,26 @@ def test_mt5_source_verifies_terminal_account_symbol_and_utc() -> None:
             return SimpleNamespace(connected=True, company="Broker", name="Terminal", path="C:/MT5", trade_allowed=True)
 
         def account_info(self) -> SimpleNamespace:
-            return SimpleNamespace(login=int(ACCOUNT), server="Broker-Demo", company="Broker", currency="USD")
+            return SimpleNamespace(
+                login=int(MARKET_DATA_ACCOUNT),
+                server="Broker-ECN",
+                company="Broker",
+                currency="USD",
+            )
 
         def version(self) -> tuple[int, int, str]:
             return (5, 5000, "21 Aug 2026")
 
         def symbol_info(self, symbol: str) -> SimpleNamespace:
-            return SimpleNamespace(name=symbol, visible=True, select=True, trade_mode=4, digits=5, point=0.00001)
+            return SimpleNamespace(
+                name=symbol,
+                visible=True,
+                select=True,
+                trade_mode=4,
+                digits=5,
+                point=0.00001,
+                trade_tick_size=0.00001,
+            )
 
         def copy_rates_range(self, *_: object) -> list[dict[str, object]]:
             bar = _bars(1)[0]
@@ -414,9 +570,19 @@ def test_mt5_source_verifies_terminal_account_symbol_and_utc() -> None:
         def shutdown(self) -> None:
             pass
 
-    source = MetaTrader5HistorySource(account_login=ACCOUNT, module=FakeMT5())
+    source = MetaTrader5HistorySource(
+        market_data_account_login=MARKET_DATA_ACCOUNT,
+        module=FakeMT5(),
+    )
     proof = source.initialize()
-    assert proof["authenticated_account_verified"] is True
+    assert proof["authenticated_market_data_account_verified"] is True
+    assert proof["market_data_account_login"] == MARKET_DATA_ACCOUNT
+    assert proof["market_data_account_server"] == "Broker-ECN"
+    assert "execution_account_login" not in proof
+    assert "account_login" not in proof
+    assert proof["terminal_name"] == "Terminal"
+    assert proof["terminal_path"] == "C:/MT5"
+    assert proof["read_only_operations"] == list(READ_ONLY_MT5_OPERATIONS)
     bars = source.copy_rates("EURUSD", "M5", NOW - timedelta(days=1), NOW)
     assert bars[0].symbol == "EURUSD"
     assert bars[0].time_utc.utcoffset() == timedelta(0)
@@ -430,7 +596,10 @@ def test_mt5_source_fails_on_wrong_account() -> None:
         shutdown=lambda: None,
     )
     with pytest.raises(HistoricalDataError) as caught:
-        MetaTrader5HistorySource(account_login=ACCOUNT, module=module).initialize()
+        MetaTrader5HistorySource(
+            market_data_account_login=MARKET_DATA_ACCOUNT,
+            module=module,
+        ).initialize()
     assert caught.value.code == "MT5_ACCOUNT_MISMATCH"
 
 
@@ -505,6 +674,7 @@ def test_replay_is_content_addressed_idempotent_and_never_touches_live_runtime(
         inventory_path=inventory_path,
         compatibility_path=compatibility,
         payload={
+            **_inventory_identity(),
             "schema_version": "ser8-historical-data-inventory-v1",
             "captured_at_utc": NOW.isoformat(),
             "total_broker_symbols": 1,
@@ -551,6 +721,7 @@ def test_discovery_consumes_hash_verified_replay_inventory(tmp_path: Path) -> No
         inventory_path=historical_inventory,
         compatibility_path=tmp_path / "historical" / "historical_rows.csv",
         payload={
+            **_inventory_identity(),
             "schema_version": "ser8-historical-data-inventory-v1",
             "captured_at_utc": NOW.isoformat(),
             "total_broker_symbols": 1,
@@ -695,5 +866,9 @@ def test_windows_runbook_uses_real_paths_and_stepwise_commands() -> None:
     assert "proof-symbol-limit 1" in text
     assert "--mode verify-inventory" in text
     assert "--historical-inventory" in text
+    assert text.count("--execution-account 67206924") == 6
+    assert text.count("--market-data-account 37365712") == 6
+    assert "--mode verify-source --account" not in text
+    assert "do not run them yet" in text
     assert ".\\data\\mt5" not in text
     assert "Stop and" in text

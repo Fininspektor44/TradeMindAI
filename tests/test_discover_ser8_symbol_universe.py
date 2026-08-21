@@ -50,7 +50,7 @@ def _write_symbols_csv(path: Path, symbols: list[str]) -> None:
 def test_cli_prints_required_inventory_fields(tmp_path: Path, capsys) -> None:
     mt5_dir = tmp_path / "mt5"
     _write_symbols_csv(mt5_dir / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv", ["EURUSD", "GBPUSD"])
-    exit_code = cli_module.main(["--mt5-export-dir", str(mt5_dir), "--account", _ACCOUNT, "--data-root", str(tmp_path / "data")])
+    exit_code = cli_module.main(["--mt5-export-dir", str(mt5_dir), "--execution-account", _ACCOUNT, "--data-root", str(tmp_path / "data")])
     assert exit_code == 0
     out = capsys.readouterr().out
     assert "TOTAL BROKER SYMBOLS: 2" in out
@@ -68,7 +68,7 @@ def test_cli_legacy_historical_rows_are_availability_only(tmp_path: Path, capsys
     hist_csv.write_text("symbol,rows\nEURUSD,5000\n", encoding="utf-8")
 
     exit_code = cli_module.main([
-        "--mt5-export-dir", str(mt5_dir), "--account", _ACCOUNT, "--data-root", str(tmp_path / "data"),
+        "--mt5-export-dir", str(mt5_dir), "--execution-account", _ACCOUNT, "--data-root", str(tmp_path / "data"),
         "--historical-data-csv", str(hist_csv),
     ])
     assert exit_code == 0
@@ -79,7 +79,7 @@ def test_cli_legacy_historical_rows_are_availability_only(tmp_path: Path, capsys
 
 def test_cli_missing_symbols_csv_fails_closed(tmp_path: Path) -> None:
     exit_code = cli_module.main([
-        "--mt5-export-dir", str(tmp_path / "nonexistent"), "--account", _ACCOUNT, "--data-root", str(tmp_path / "data"),
+        "--mt5-export-dir", str(tmp_path / "nonexistent"), "--execution-account", _ACCOUNT, "--data-root", str(tmp_path / "data"),
     ])
     assert exit_code == 2
 
@@ -88,7 +88,7 @@ def test_cli_json_output_is_valid(tmp_path: Path, capsys) -> None:
     mt5_dir = tmp_path / "mt5"
     _write_symbols_csv(mt5_dir / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv", ["EURUSD"])
     exit_code = cli_module.main([
-        "--mt5-export-dir", str(mt5_dir), "--account", _ACCOUNT, "--data-root", str(tmp_path / "data"), "--json",
+        "--mt5-export-dir", str(mt5_dir), "--execution-account", _ACCOUNT, "--data-root", str(tmp_path / "data"), "--json",
     ])
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
@@ -100,7 +100,7 @@ def test_cli_persist_requires_db(tmp_path: Path) -> None:
     mt5_dir = tmp_path / "mt5"
     _write_symbols_csv(mt5_dir / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv", ["EURUSD"])
     exit_code = cli_module.main([
-        "--mt5-export-dir", str(mt5_dir), "--account", _ACCOUNT, "--data-root", str(tmp_path / "data"), "--persist",
+        "--mt5-export-dir", str(mt5_dir), "--execution-account", _ACCOUNT, "--data-root", str(tmp_path / "data"), "--persist",
     ])
     assert exit_code == 2
 
@@ -110,7 +110,7 @@ def test_cli_persist_writes_universe_table(tmp_path: Path) -> None:
     _write_symbols_csv(mt5_dir / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv", ["EURUSD", "GBPUSD"])
     db_path = tmp_path / "registry.db"
     exit_code = cli_module.main([
-        "--mt5-export-dir", str(mt5_dir), "--account", _ACCOUNT, "--data-root", str(tmp_path / "data"),
+        "--mt5-export-dir", str(mt5_dir), "--execution-account", _ACCOUNT, "--data-root", str(tmp_path / "data"),
         "--db", str(db_path), "--persist",
     ])
     assert exit_code == 0
