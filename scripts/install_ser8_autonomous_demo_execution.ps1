@@ -16,6 +16,13 @@ param(
     [Parameter(Mandatory=$false)]
     [string]$HypothesisId = "rpi-v1:sha256:205b5260711f7578a59cef2feea59550b777b3df0956ffd192076b37c4e5866d:0",
 
+    # SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1: see
+    # run_ser8_autonomous_demo_execution.ps1's own comment on this exact
+    # same parameter. Empty by default -- the proven single-hypothesis
+    # deployment above ($HypothesisId) is completely unaffected.
+    [Parameter(Mandatory=$false)]
+    [string[]]$HypothesisIds = @(),
+
     [Parameter(Mandatory=$false)]
     [string]$Account = "67206924",
 
@@ -93,6 +100,15 @@ $taskArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `
 # baked in as a dangling empty value.
 if ($HoldoutPrimaryMetric) {
     $taskArguments += " -HoldoutPrimaryMetric `"$HoldoutPrimaryMetric`""
+}
+# -HypothesisIds is forwarded ONLY when the operator genuinely configured
+# a multi-hypothesis deployment -- never a dangling empty array argument.
+# The wrapper script's own dispatch (HypothesisIds.Count -gt 0) decides
+# which mode to use; -HypothesisId above is harmlessly ignored by the
+# wrapper whenever -HypothesisIds is non-empty.
+if ($HypothesisIds.Count -gt 0) {
+    $hypothesisIdsArgument = ($HypothesisIds | ForEach-Object { "`"$_`"" }) -join " "
+    $taskArguments += " -HypothesisIds $hypothesisIdsArgument"
 }
 if ($DryRun) {
     $taskArguments += " -DryRun"

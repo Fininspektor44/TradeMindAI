@@ -10,6 +10,16 @@ param(
     [Parameter(Mandatory=$false)]
     [string]$HypothesisId = "rpi-v1:sha256:205b5260711f7578a59cef2feea59550b777b3df0956ffd192076b37c4e5866d:0",
 
+    # SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1: an explicitly
+    # configured SET of ACCEPTED hypotheses for the generalized, symbol-
+    # agnostic multi-hypothesis router. Empty by default -- the proven
+    # single-hypothesis path above ($HypothesisId) remains completely
+    # unaffected and is used whenever this stays empty. Mutually
+    # exclusive with $HypothesisId, exactly like the Python CLI's own
+    # --hypothesis-id / --hypothesis-ids.
+    [Parameter(Mandatory=$false)]
+    [string[]]$HypothesisIds = @(),
+
     [Parameter(Mandatory=$false)]
     [string]$Account = "67206924",
 
@@ -66,24 +76,54 @@ if (-not (Test-Path $python)) {
 $script = Join-Path $PSScriptRoot "run_ser8_autonomous_demo_execution.py"
 
 try {
+    $usingMultiHypothesis = $HypothesisIds.Count -gt 0
     $started = Get-Date
-    "[$($started.ToString('o'))] START account=$Account hypothesis_id=$HypothesisId db=$DatabasePath runtime_root=$RuntimeRoot dry_run=$($DryRun.IsPresent)" |
-        Add-Content -Path $logPath -Encoding UTF8
+    if ($usingMultiHypothesis) {
+        "[$($started.ToString('o'))] START account=$Account hypothesis_ids=$($HypothesisIds -join ',') db=$DatabasePath runtime_root=$RuntimeRoot dry_run=$($DryRun.IsPresent)" |
+            Add-Content -Path $logPath -Encoding UTF8
+    }
+    else {
+        "[$($started.ToString('o'))] START account=$Account hypothesis_id=$HypothesisId db=$DatabasePath runtime_root=$RuntimeRoot dry_run=$($DryRun.IsPresent)" |
+            Add-Content -Path $logPath -Encoding UTF8
+    }
 
-    $arguments = @(
-        $script,
-        "--db", $DatabasePath,
-        "--hypothesis-id", $HypothesisId,
-        "--account", $Account,
-        "--demo-account-allowlist"
-    ) + $DemoAccountAllowlist + @(
-        "--runtime-root", $RuntimeRoot,
-        "--mt5-export-dir", $Mt5ExportDir,
-        "--sealed-holdout-path", $SealedHoldoutPath,
-        "--risk-profile", $RiskProfile,
-        "--common-files-dir", $CommonFilesDir,
-        "--once"
-    )
+    # Exactly one of --hypothesis-id / --hypothesis-ids is ever forwarded
+    # -- never both, matching the Python CLI's own exactly-one-of
+    # validation. The single-hypothesis branch below is byte-identical
+    # to this wrapper's own original, proven argument list.
+    if ($usingMultiHypothesis) {
+        $arguments = @(
+            $script,
+            "--db", $DatabasePath,
+            "--hypothesis-ids"
+        ) + $HypothesisIds + @(
+            "--account", $Account,
+            "--demo-account-allowlist"
+        ) + $DemoAccountAllowlist + @(
+            "--runtime-root", $RuntimeRoot,
+            "--mt5-export-dir", $Mt5ExportDir,
+            "--sealed-holdout-path", $SealedHoldoutPath,
+            "--risk-profile", $RiskProfile,
+            "--common-files-dir", $CommonFilesDir,
+            "--once"
+        )
+    }
+    else {
+        $arguments = @(
+            $script,
+            "--db", $DatabasePath,
+            "--hypothesis-id", $HypothesisId,
+            "--account", $Account,
+            "--demo-account-allowlist"
+        ) + $DemoAccountAllowlist + @(
+            "--runtime-root", $RuntimeRoot,
+            "--mt5-export-dir", $Mt5ExportDir,
+            "--sealed-holdout-path", $SealedHoldoutPath,
+            "--risk-profile", $RiskProfile,
+            "--common-files-dir", $CommonFilesDir,
+            "--once"
+        )
+    }
     # CONFIRMED REAL WINDOWS FAILURE (SER8 AUTONOMOUS WINDOWS HOLDOUT
     # METRIC ARGUMENT FIX V1): PowerShell silently DROPS an empty-string
     # array element when splatting @arguments into a NATIVE executable

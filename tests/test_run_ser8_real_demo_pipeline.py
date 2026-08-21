@@ -106,7 +106,18 @@ def _code_provenance() -> CodeProvenance:
     )
 
 
-def _candidate_v2(symbol: str = _SYMBOL) -> CandidateContentV2:
+def _candidate_v2(symbol: str = _SYMBOL, *, horizon: int = 3) -> CandidateContentV2:
+    """``horizon`` is a purely additive, backward-compatible parameter
+    (SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1) -- every existing
+    caller keeps the original horizon=3. It does NOT participate in
+    HypothesisTradeableScopeV1's own identity (symbol/timeframe/
+    setup_family/allowed_action_scope come from symbol/timeframe/
+    feature/action_scope only -- see hypothesis_tradeable_scope.py's own
+    setup_family=definition.feature mapping), so varying it alone lets a
+    test build TWO independently-content-hashed candidates/hypotheses
+    that still resolve to the IDENTICAL tradeable scope -- the genuinely
+    ambiguous configuration tests/test_ser8_autonomous_demo_execution_
+    multi_hypothesis.py's own ambiguous-scope test needs."""
     return CandidateContentV2(
         candidate_definition=CandidateDefinitionV2(
             source_kind="signal_journal",
@@ -114,7 +125,7 @@ def _candidate_v2(symbol: str = _SYMBOL) -> CandidateContentV2:
             symbol=symbol,
             timeframe="M5",
             feature="spread_pressure",
-            horizon=3,
+            horizon=horizon,
             action_scope="BUY_SELL_DIRECTIONAL",
             evaluation_method_version="signal-statistics-v2",
         ),
@@ -179,8 +190,29 @@ class _Chain:
     data_root: Path
 
 
-def _full_real_chain(tmp_path: Path) -> _Chain:
+def _full_real_chain(
+    tmp_path: Path, *, symbol: str = _SYMBOL, horizon: int = 3, work_dir: Path | None = None,
+    db_path: Path | None = None, artifact_root: Path | None = None,
+) -> _Chain:
+    """``symbol``/``work_dir``/``db_path``/``artifact_root`` are purely
+    additive, backward-compatible parameters (SER8 FULL SYMBOL UNIVERSE +
+    RESEARCH RANKING V1): every existing caller (which supplies none of
+    them) gets EXACTLY the original behavior -- ``work_dir`` defaults to
+    ``tmp_path``, ``db_path`` defaults to ``work_dir / "registry.db"``,
+    and ``artifact_root`` defaults to ``work_dir / "artifacts"``,
+    unchanged. A caller building MULTIPLE independently-ACCEPTED
+    hypotheses for DIFFERENT symbols that a SINGLE autonomous worker
+    process must observe together (e.g.
+    tests/test_ser8_autonomous_demo_execution.py's own multi-hypothesis
+    router tests) passes a distinct ``work_dir`` per symbol (so per-
+    symbol dataset/holdout scratch files never collide) together with the
+    SAME ``db_path`` AND the SAME ``artifact_root`` across calls -- the
+    real worker only ever has one ``--db`` and one ``--artifact-root``,
+    so every hypothesis it must verify has to live in that one shared
+    registry and one shared content-addressed artifact store."""
     os.environ[_KEY_ENV] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="  # 32 zero bytes, valid base64
+    work_dir = work_dir or tmp_path
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     # ResearchProposalIntakeControl requires ResearchExecutionControl and
     # HypothesisRegistry to share one database file (see
@@ -191,17 +223,17 @@ def _full_real_chain(tmp_path: Path) -> _Chain:
     # remain independently configurable for the real research pipeline
     # object graph (ControlPlane/ArtifactStore are separate concerns from
     # the proposal-intake chain this fixture also has to exercise).
-    db_path = tmp_path / "registry.db"
+    db_path = db_path or (work_dir / "registry.db")
     orchestrator_db_path = db_path
-    artifact_root = tmp_path / "artifacts"
-    data_root = tmp_path / "data"
+    artifact_root = artifact_root or (work_dir / "artifacts")
+    data_root = work_dir / "data"
 
     store = ArtifactStore(artifact_root)
     control = ControlPlane(orchestrator_db_path)
     budget = _manager(orchestrator_db_path)
 
     report = build_report_v2(
-        (_candidate_v2(),),
+        (_candidate_v2(symbol=symbol, horizon=horizon),),
         source_snapshot_hash_ref=_SOURCE_HASH,
         source_schema_version="1.1",
         code_provenance=_code_provenance(),
@@ -232,7 +264,7 @@ def _full_real_chain(tmp_path: Path) -> _Chain:
 
     from trademind.discovery.manifest import DatasetArtifact as DatasetArtifactV1
 
-    dataset_file = tmp_path / "spec_dataset.csv"
+    dataset_file = work_dir / "spec_dataset.csv"
     dataset_file.write_text("time,symbol,close\n1,XAUUSD,2000.0\n", encoding="utf-8")
     v1_dataset = DatasetArtifactV1.from_path(dataset_file)
     spec = spec_control.create_specification(
@@ -255,7 +287,7 @@ def _full_real_chain(tmp_path: Path) -> _Chain:
 
     rows = _timestamps()
     plan = chronological_split(rows)
-    research_source_csv = tmp_path / "full_source.csv"
+    research_source_csv = work_dir / "full_source.csv"
     research_source_csv.write_bytes(_csv_bytes(rows))
 
     discovery_rows = rows[: plan.discovery_count]
@@ -307,8 +339,8 @@ def _full_real_chain(tmp_path: Path) -> _Chain:
     finally:
         db.close()
 
-    sealed_holdout_path = tmp_path / "final.holdout.json"
-    plaintext_path = tmp_path / "final-plaintext.csv"
+    sealed_holdout_path = work_dir / "final.holdout.json"
+    plaintext_path = work_dir / "final-plaintext.csv"
     plaintext_path.write_text(f"time,{_METRIC}\n2026-01-03T00:00:00+00:00,5.0\n2026-01-03T06:00:00+00:00,7.0\n", encoding="utf-8")
     evaluator = pipeline_module._DeterministicAggregateHoldoutEvaluator(primary_metric=_METRIC, parameters={})
     sealer.seal_file(

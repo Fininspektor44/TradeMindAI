@@ -216,3 +216,50 @@ def test_both_scripts_braces_and_parens_balanced() -> None:
         text = path.read_text(encoding="utf-8")
         assert text.count("{") == text.count("}"), path
         assert text.count("(") == text.count(")"), path
+
+
+# ---------------------------------------------------------------------------
+# SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1: -HypothesisIds is
+# purely additive, never a dangling empty native argument, and never
+# clashes with the proven single-hypothesis $HypothesisId default.
+# ---------------------------------------------------------------------------
+
+
+def test_both_scripts_declare_hypothesis_ids_parameter_defaulting_empty() -> None:
+    for path in (INSTALL_SCRIPT, WRAPPER_SCRIPT):
+        text = path.read_text(encoding="utf-8")
+        assert "[string[]]$HypothesisIds = @()," in text
+
+
+def test_wrapper_dispatches_to_hypothesis_ids_only_when_non_empty() -> None:
+    text = WRAPPER_SCRIPT.read_text(encoding="utf-8")
+    assert "$usingMultiHypothesis = $HypothesisIds.Count -gt 0" in text
+    assert 'if ($usingMultiHypothesis) {' in text
+    assert '"--hypothesis-ids"' in text
+    # The single-hypothesis $arguments block (the else branch) still
+    # forwards --hypothesis-id exactly as before -- never dropped.
+    assert '"--hypothesis-id", $HypothesisId,' in text
+
+
+def test_wrapper_never_forwards_both_hypothesis_flags_in_one_arguments_block() -> None:
+    text = WRAPPER_SCRIPT.read_text(encoding="utf-8")
+    start = text.index("$arguments = @(")
+    start = text.rindex("if ($usingMultiHypothesis) {", 0, start)
+    end = text.index("if ($DryRun) {", start)
+    dispatch_block = text[start:end]
+    multi_branch, _, single_branch = dispatch_block.partition("else {")
+    assert "--hypothesis-ids" in multi_branch and "--hypothesis-id" not in multi_branch.replace("--hypothesis-ids", "")
+    assert "--hypothesis-id" in single_branch and "--hypothesis-ids" not in single_branch
+
+
+def test_installer_only_forwards_hypothesis_ids_when_non_empty() -> None:
+    text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert "if ($HypothesisIds.Count -gt 0) {" in text
+    guard_block = text[text.index("if ($HypothesisIds.Count -gt 0) {"):text.index("if ($DryRun) {")]
+    assert "-HypothesisIds $hypothesisIdsArgument" in guard_block
+    # -HypothesisId (singular) is still unconditionally baked into the
+    # base task arguments -- the wrapper's own dispatch decides which one
+    # actually wins, matching the Python CLI's exactly-one-of validation.
+    base_block = text[text.index('$taskArguments = "'):text.index("if ($HoldoutPrimaryMetric)")]
+    assert "-HypothesisId `\"$HypothesisId`\"" in base_block
+    assert "-HypothesisIds" not in base_block

@@ -467,11 +467,34 @@ def _capture_outcomes_report_only(
         return 0
 
 
-def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> CycleSummary:
-    now = now or datetime.now(timezone.utc)
+class _PreparedCycleInputs:
+    """The ACCOUNT-level state one cycle needs, built exactly ONCE
+    regardless of how many hypotheses that cycle processes -- the live
+    MT5 export discovery, the deals CSV path, and the research pipeline
+    object graph (registry/artifacts/final_verdict). Never hypothesis-
+    specific; see :func:`_run_cycle_for_hypothesis` for the part that is."""
+
+    __slots__ = ("pipeline", "inputs", "deals_csv")
+
+    def __init__(self, *, pipeline: object, inputs: object, deals_csv: Path) -> None:
+        self.pipeline = pipeline
+        self.inputs = inputs
+        self.deals_csv = deals_csv
+
+
+def _prepare_cycle_inputs(args: argparse.Namespace) -> _PreparedCycleInputs:
+    """Extracted verbatim from this worker's own original single-
+    hypothesis ``run_one_cycle`` body (SER8 FULL SYMBOL UNIVERSE +
+    RESEARCH RANKING V1) -- a pure refactor, not a behavior change:
+    :func:`run_one_cycle` calls this and then :func:`_run_cycle_for_hypothesis`
+    in sequence, producing byte-identical results to the original
+    monolithic function for the EXACT SAME inputs. This split exists so
+    :func:`run_one_cycle_for_hypotheses` can build this shared state ONCE
+    per cycle and reuse it across every configured hypothesis, rather
+    than re-discovering the live MT5 exports / rebuilding the research
+    pipeline object graph once per hypothesis."""
     repo_root = REPO_ROOT
     data_root = Path(args.data_root).expanduser() if args.data_root else repo_root / "data"
-    summary = CycleSummary(account=args.account)
 
     inputs = pipeline_module.discover_inputs(
         data_root=data_root,
@@ -501,16 +524,82 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
         holdout_primary_metric=args.holdout_primary_metric or "",
         holdout_parameters={},
     )
+    return _PreparedCycleInputs(pipeline=pipeline, inputs=inputs, deals_csv=deals_csv)
+
+
+def _action_scopes_overlap(a: str, b: str) -> bool:
+    """True if a single live candidate action could ever match BOTH
+    scopes -- i.e. genuine ambiguity is possible. Mirrors
+    ``verify_live_candidate_matches_scope``'s own action-consistency rule
+    exactly (BOTH matches any action; otherwise an exact match is
+    required): if either scope is ``BOTH``, any action either could ever
+    see would match both; otherwise they only overlap if they are the
+    exact same single action. Two hypotheses on the same (symbol,
+    timeframe, setup_family) with DISJOINT single actions (one BUY-only,
+    one SELL-only) are correctly NOT ambiguous -- a real candidate can
+    only ever carry one action, so it can only ever match one of them."""
+    return a == "BOTH" or b == "BOTH" or a == b
+
+
+def _group_ambiguous_hypotheses(scopes: dict[str, object]) -> set[str]:
+    """Pure grouping logic, deliberately factored out of
+    :func:`run_one_cycle_for_hypotheses` so it is directly unit-testable
+    against hand-built scope objects, independent of the full research
+    lifecycle. ``scopes`` maps hypothesis_id -> its already-verified
+    ``HypothesisTradeableScopeV1`` (only genuinely resolvable/ACCEPTED
+    hypotheses -- see :func:`_resolve_scope_for_ambiguity_check`).
+    Returns the set of hypothesis_ids that are TRULY ambiguous with at
+    least one other hypothesis in ``scopes``: same (symbol, timeframe,
+    setup_family) AND an overlapping ``allowed_action_scope`` (see
+    :func:`_action_scopes_overlap`) -- never naive tuple-equality alone."""
+    resolvable = list(scopes.items())
+    ambiguous_hypothesis_ids: set[str] = set()
+    for i, (hyp_a, scope_a) in enumerate(resolvable):
+        for hyp_b, scope_b in resolvable[i + 1 :]:
+            if (
+                scope_a.symbol == scope_b.symbol
+                and scope_a.timeframe == scope_b.timeframe
+                and scope_a.setup_family == scope_b.setup_family
+                and _action_scopes_overlap(scope_a.allowed_action_scope, scope_b.allowed_action_scope)
+            ):
+                ambiguous_hypothesis_ids.add(hyp_a)
+                ambiguous_hypothesis_ids.add(hyp_b)
+    return ambiguous_hypothesis_ids
+
+
+def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> CycleSummary:
+    now = now or datetime.now(timezone.utc)
+    prepared = _prepare_cycle_inputs(args)
+    return _run_cycle_for_hypothesis(
+        args, args.hypothesis_id, pipeline=prepared.pipeline, inputs=prepared.inputs,
+        deals_csv=prepared.deals_csv, now=now,
+    )
+
+
+def _run_cycle_for_hypothesis(
+    args: argparse.Namespace, hypothesis_id: str, *, pipeline: object, inputs: object, deals_csv: Path,
+    now: datetime,
+) -> CycleSummary:
+    """The ONE-hypothesis execution body -- extracted verbatim from this
+    worker's own original ``run_one_cycle`` (everything after the shared
+    account-level setup :func:`_prepare_cycle_inputs` now owns). Every
+    reference to ``args.hypothesis_id`` was replaced with the explicit
+    ``hypothesis_id`` parameter; nothing else changed. Both
+    :func:`run_one_cycle` (single-hypothesis, regression-critical,
+    100% behavior-preserved) and :func:`run_one_cycle_for_hypotheses`
+    (the new, generalized, multi-symbol path) call this SAME function --
+    there is exactly one place this logic lives."""
+    summary = CycleSummary(account=args.account)
 
     # This worker NEVER advances the research lifecycle -- the hypothesis
     # must already be ACCEPTED (a prior, separate, human-reviewed action)
     # before autonomous execution runs. present_eligible_artifact fails
     # closed for anything else.
     eligibility = present_eligible_artifact(
-        args.hypothesis_id, registry=pipeline.registry, final_verdict=pipeline.final_verdict
+        hypothesis_id, registry=pipeline.registry, final_verdict=pipeline.final_verdict
     )
     scope = bind_hypothesis_tradeable_scope(
-        args.hypothesis_id, registry=pipeline.registry, artifact_store=pipeline.artifacts
+        hypothesis_id, registry=pipeline.registry, artifact_store=pipeline.artifacts
     )
 
     candidates = pipeline_module.load_candidates(inputs.candidates_path)
@@ -636,7 +725,7 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
         summary.candidate_status = "ELIGIBLE_ALLOW"
         summary.cycle_status = "DRY_RUN_WOULD_EXECUTE"
         preview = pipeline_module.Preview(
-            hypothesis_id=args.hypothesis_id, candidate_signal_id=candidate.signal_id,
+            hypothesis_id=hypothesis_id, candidate_signal_id=candidate.signal_id,
             symbol=candidate.symbol, action=candidate.plan.action, risk_decision_state=result.decision.state,
             authorization_id="(dry-run: not authorized)", claim_id="(dry-run: not claimed)",
             demo_account_id=args.account,
@@ -724,6 +813,147 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
     return summary
 
 
+def _resolve_scope_for_ambiguity_check(
+    hypothesis_id: str, *, pipeline: object,
+) -> tuple[object | None, CycleSummary | None]:
+    """The SAME two fail-closed checks :func:`_run_cycle_for_hypothesis`
+    itself performs first -- ACCEPTED eligibility, then scope binding --
+    run here ONLY so :func:`run_one_cycle_for_hypotheses` can determine
+    (symbol, timeframe, setup_family, allowed_action_scope) for every
+    CONFIGURED hypothesis before deciding which ones are genuinely
+    ambiguous. Returns ``(scope, None)`` on success or ``(None, summary)``
+    with a fully-populated fail-closed :class:`CycleSummary` on any
+    failure -- a hypothesis that is not yet ACCEPTED, or whose scope
+    cannot be verified, is reported on its own line and excluded from
+    ambiguity grouping (it could never legitimately match a live
+    candidate anyway), never silently skipped and never crashes the
+    whole multi-hypothesis cycle."""
+    summary = CycleSummary(account="-")
+    try:
+        present_eligible_artifact(hypothesis_id, registry=pipeline.registry, final_verdict=pipeline.final_verdict)
+    except ResearchEligibilityError as exc:
+        summary.cycle_status = "FAIL_CLOSED_NOT_ACCEPTED"
+        summary.risk_block_reason = str(exc)
+        return None, summary
+    try:
+        scope = bind_hypothesis_tradeable_scope(hypothesis_id, registry=pipeline.registry, artifact_store=pipeline.artifacts)
+    except HypothesisTradeableScopeError as exc:
+        summary.cycle_status = "FAIL_CLOSED_SCOPE_UNAVAILABLE"
+        summary.risk_block_reason = str(exc)
+        return None, summary
+    return scope, None
+
+
+def run_one_cycle_for_hypotheses(
+    args: argparse.Namespace, hypothesis_ids: Sequence[str], *, now: datetime | None = None,
+) -> dict[str, CycleSummary]:
+    """SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1's generalized,
+    symbol-agnostic execution router: ONE cycle spanning an explicitly
+    configured SET of ACCEPTED hypotheses, still ONE execution worker
+    process per account (never one per symbol, never one Scheduled Task
+    per symbol -- this function is just an alternate entrypoint into the
+    SAME worker binary :func:`main` already is).
+
+    For every fresh candidate this cycle observes across every configured
+    hypothesis:
+      * 0 matching hypotheses -- that hypothesis's own
+        :func:`_run_cycle_for_hypothesis` call reports its own
+        ``NO_ELIGIBLE_CANDIDATE`` (unchanged, existing behavior) for
+        itself; zero sends.
+      * exactly 1 matching hypothesis -- routed through the SAME,
+        unmodified, already-proven :func:`_run_cycle_for_hypothesis`
+        Risk -> authorize -> claim -> execute chain, independently of
+        every other configured hypothesis.
+      * more than 1 hypothesis whose (symbol, timeframe, setup_family)
+        match AND whose ``allowed_action_scope`` values genuinely overlap
+        (see :func:`_action_scopes_overlap`) -- BOTH/every such
+        hypothesis is reported ``FAIL_CLOSED_AMBIGUOUS_SCOPE``, zero
+        sends, and neither one is ever routed to
+        :func:`_run_cycle_for_hypothesis` this cycle. This is TRUE
+        ambiguity detection, not naive tuple-equality: two hypotheses on
+        the identical symbol/timeframe/setup_family with DISJOINT single
+        action scopes (one BUY-only, one SELL-only) can never both match
+        the SAME live candidate, so they are correctly NOT flagged.
+
+    ACCOUNT-GLOBAL RISK is preserved for free: every non-ambiguous
+    hypothesis still calls the SAME, unmodified
+    ``evaluate_ser8_research_risk_gate`` (inside
+    :func:`_run_cycle_for_hypothesis`), which always reads the account's
+    REAL, current, shared MT5 positions/account snapshot -- reflecting
+    every position open on the account regardless of which hypothesis
+    opened it -- so a position one hypothesis's execution opens is
+    already visible to every other hypothesis's risk evaluation later in
+    the SAME cycle (and every subsequent cycle), without any change to
+    ``risk_manager.py`` itself. This function processes hypotheses in the
+    order given, sequentially, within one cycle -- never concurrently --
+    so a risk-relevant position opened for hypothesis A earlier in this
+    same cycle is already reflected for hypothesis B's evaluation later
+    in it, exactly as it would be across two separate cycles.
+
+    Returns one :class:`CycleSummary` per hypothesis_id in
+    ``hypothesis_ids`` (same order not guaranteed; look up by key), never
+    fewer, never more, and never raises for an individual hypothesis's
+    own failure -- every failure mode is reported as that hypothesis's
+    own ``cycle_status``."""
+    now = now or datetime.now(timezone.utc)
+    prepared = _prepare_cycle_inputs(args)
+
+    scopes: dict[str, object] = {}
+    summaries: dict[str, CycleSummary] = {}
+    for hypothesis_id in hypothesis_ids:
+        scope, failed_summary = _resolve_scope_for_ambiguity_check(hypothesis_id, pipeline=prepared.pipeline)
+        if failed_summary is not None:
+            failed_summary.account = args.account
+            summaries[hypothesis_id] = failed_summary
+        else:
+            scopes[hypothesis_id] = scope
+
+    # TRUE ambiguity detection -- see _action_scopes_overlap's own
+    # docstring. Only hypotheses that both resolved a real scope above
+    # participate; a not-yet-ACCEPTED or scope-unresolvable hypothesis is
+    # already reported and excluded (it could never match a live
+    # candidate anyway).
+    ambiguous_hypothesis_ids = _group_ambiguous_hypotheses(scopes)
+
+    for hypothesis_id in ambiguous_hypothesis_ids:
+        summary = CycleSummary(account=args.account)
+        summary.candidate_status = "AMBIGUOUS_SCOPE"
+        summary.cycle_status = "FAIL_CLOSED_AMBIGUOUS_SCOPE"
+        scope = scopes[hypothesis_id]
+        summary.risk_block_reason = (
+            f"hypothesis {hypothesis_id!r} (symbol={scope.symbol}, timeframe={scope.timeframe}, "
+            f"setup_family={scope.setup_family}, allowed_action_scope={scope.allowed_action_scope}) shares "
+            "an overlapping tradeable scope with at least one other configured hypothesis; zero sends until "
+            "the operator resolves the overlap (widen neither scope; narrow or retire one)"
+        )
+        summaries[hypothesis_id] = summary
+
+    for hypothesis_id in hypothesis_ids:
+        if hypothesis_id in summaries:
+            continue
+        # A single hypothesis's own failure (e.g. its research state
+        # changed to non-ACCEPTED, or a risk-gate input became invalid,
+        # between the ambiguity pre-check above and this call -- normally
+        # impossible within one synchronous cycle, but never assumed)
+        # must never abort every OTHER configured hypothesis's
+        # processing in the SAME cycle -- "stale candidate on symbol A
+        # does not block fresh candidate B" applies to failures, not only
+        # to stale candidates.
+        try:
+            summaries[hypothesis_id] = _run_cycle_for_hypothesis(
+                args, hypothesis_id, pipeline=prepared.pipeline, inputs=prepared.inputs,
+                deals_csv=prepared.deals_csv, now=now,
+            )
+        except (
+            ResearchEligibilityError, HypothesisTradeableScopeError, SER8ResearchRiskGateError,
+        ) as exc:
+            summary = CycleSummary(account=args.account)
+            summary.cycle_status = "FAIL_CLOSED_HYPOTHESIS_ERROR"
+            summary.risk_block_reason = str(exc)
+            summaries[hypothesis_id] = summary
+    return summaries
+
+
 def _cycle_exit_code(cycle_status: str) -> int:
     if cycle_status in (
         "NO_ELIGIBLE_CANDIDATE", "RISK_BLOCK", "ALREADY_PROCESSED", "EXECUTION_COMPLETE",
@@ -747,13 +977,51 @@ def run_one_cycle_and_print(args: argparse.Namespace, *, now: datetime | None = 
     return summary
 
 
+def run_one_cycle_for_hypotheses_and_print(
+    args: argparse.Namespace, hypothesis_ids: Sequence[str], *, now: datetime | None = None,
+) -> dict[str, CycleSummary]:
+    """Multi-hypothesis mirror of :func:`run_one_cycle_and_print` -- one
+    printed line per configured hypothesis, prefixed with its own
+    hypothesis_id so an operator watching the log can tell which symbol
+    each line concerns. Unlike the single-hypothesis print helper, a
+    ``PipelineGapError`` here can only originate from
+    :func:`_prepare_cycle_inputs` (the shared account-level MT5/registry
+    discovery this whole cycle depends on) -- a genuine per-hypothesis
+    failure is already converted to a FAIL_CLOSED summary inside
+    :func:`run_one_cycle_for_hypotheses` itself and never raises here."""
+    try:
+        summaries = run_one_cycle_for_hypotheses(args, hypothesis_ids, now=now)
+    except pipeline_module.PipelineGapError as exc:
+        print(str(exc), file=sys.stderr)
+        raise
+    for hypothesis_id in hypothesis_ids:
+        summary = summaries[hypothesis_id]
+        print(("DRY-RUN " if args.dry_run else "") + f"hypothesis_id={hypothesis_id} " + summary.line())
+    return summaries
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--db", type=Path, required=True, help="HypothesisRegistry SQLite path")
     parser.add_argument("--orchestrator-db", type=Path, default=None)
     parser.add_argument("--artifact-root", type=Path, default=None)
-    parser.add_argument("--hypothesis-id", required=True)
+    parser.add_argument(
+        "--hypothesis-id", default=None,
+        help=(
+            "Single-hypothesis mode (unchanged, regression-critical). Exactly one of "
+            "--hypothesis-id / --hypothesis-ids is required; main() fails closed with exit code 2 "
+            "otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--hypothesis-ids", nargs="+", default=None,
+        help=(
+            "SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1's generalized, symbol-agnostic multi-"
+            "hypothesis mode -- one execution worker, an explicitly configured SET of ACCEPTED "
+            "hypotheses. Mutually exclusive with --hypothesis-id."
+        ),
+    )
     parser.add_argument("--account", required=True, help="MT5 demo login/account id. Never defaults.")
     parser.add_argument(
         "--demo-account-allowlist", nargs="+", required=True,
@@ -796,6 +1064,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("--poll-interval-seconds must be positive", file=sys.stderr)
         return 2
 
+    # Exactly one of --hypothesis-id / --hypothesis-ids: neither
+    # supplied, or both supplied, fails closed at startup rather than
+    # guessing which mode the operator meant.
+    if bool(args.hypothesis_id) == bool(args.hypothesis_ids):
+        print(
+            "refusing to start: exactly one of --hypothesis-id (single-hypothesis mode) or "
+            "--hypothesis-ids (multi-hypothesis mode) is required",
+            file=sys.stderr,
+        )
+        return 2
+    multi_mode = args.hypothesis_ids is not None
+    hypothesis_ids = tuple(args.hypothesis_ids) if multi_mode else ()
+
     # Account fail-closed: the worker must NEVER silently default to a
     # live account, and must fail closed at startup -- every cycle,
     # including a NO_ELIGIBLE_CANDIDATE one -- if --account is not
@@ -813,29 +1094,53 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         with _LockFile(lock_path):
+            if not multi_mode:
+                if args.once:
+                    try:
+                        summary = run_one_cycle_and_print(args)
+                    except (
+                        pipeline_module.PipelineGapError, ResearchEligibilityError, HypothesisTradeableScopeError,
+                        SER8ResearchRiskGateError, SER8DemoTradeOutcomeError,
+                    ) as exc:
+                        print(f"cycle failed closed: {exc}", file=sys.stderr)
+                        return 2
+                    return _cycle_exit_code(summary.cycle_status)
+
+                print(
+                    f"SER8 autonomous demo execution starting -- account={args.account} "
+                    f"hypothesis_id={args.hypothesis_id} poll_interval_seconds={args.poll_interval_seconds} "
+                    f"dry_run={args.dry_run}"
+                )
+                while True:
+                    try:
+                        run_one_cycle_and_print(args)
+                    except (
+                        pipeline_module.PipelineGapError, ResearchEligibilityError, HypothesisTradeableScopeError,
+                        SER8ResearchRiskGateError, SER8DemoTradeOutcomeError,
+                    ) as exc:
+                        print(f"cycle failed closed: {exc}", file=sys.stderr)
+                    time.sleep(args.poll_interval_seconds)
+
+            # SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1: generalized,
+            # symbol-agnostic multi-hypothesis mode -- still ONE execution
+            # worker process, ONE lock file, ONE account, ONE loop.
             if args.once:
                 try:
-                    summary = run_one_cycle_and_print(args)
-                except (
-                    pipeline_module.PipelineGapError, ResearchEligibilityError, HypothesisTradeableScopeError,
-                    SER8ResearchRiskGateError, SER8DemoTradeOutcomeError,
-                ) as exc:
+                    summaries = run_one_cycle_for_hypotheses_and_print(args, hypothesis_ids)
+                except pipeline_module.PipelineGapError as exc:
                     print(f"cycle failed closed: {exc}", file=sys.stderr)
                     return 2
-                return _cycle_exit_code(summary.cycle_status)
+                return max((_cycle_exit_code(s.cycle_status) for s in summaries.values()), default=0)
 
             print(
                 f"SER8 autonomous demo execution starting -- account={args.account} "
-                f"hypothesis_id={args.hypothesis_id} poll_interval_seconds={args.poll_interval_seconds} "
+                f"hypothesis_ids={list(hypothesis_ids)!r} poll_interval_seconds={args.poll_interval_seconds} "
                 f"dry_run={args.dry_run}"
             )
             while True:
                 try:
-                    run_one_cycle_and_print(args)
-                except (
-                    pipeline_module.PipelineGapError, ResearchEligibilityError, HypothesisTradeableScopeError,
-                    SER8ResearchRiskGateError, SER8DemoTradeOutcomeError,
-                ) as exc:
+                    run_one_cycle_for_hypotheses_and_print(args, hypothesis_ids)
+                except pipeline_module.PipelineGapError as exc:
                     print(f"cycle failed closed: {exc}", file=sys.stderr)
                 time.sleep(args.poll_interval_seconds)
     except _AlreadyRunningError as exc:
