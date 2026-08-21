@@ -61,7 +61,7 @@ def test_cli_prints_required_inventory_fields(tmp_path: Path, capsys) -> None:
     assert "RESEARCH QUEUE" in out
 
 
-def test_cli_with_historical_data_marks_research_ready(tmp_path: Path, capsys) -> None:
+def test_cli_legacy_historical_rows_are_availability_only(tmp_path: Path, capsys) -> None:
     mt5_dir = tmp_path / "mt5"
     _write_symbols_csv(mt5_dir / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv", ["EURUSD"])
     hist_csv = tmp_path / "historical.csv"
@@ -74,7 +74,7 @@ def test_cli_with_historical_data_marks_research_ready(tmp_path: Path, capsys) -
     assert exit_code == 0
     out = capsys.readouterr().out
     assert "RESEARCH-DATA AVAILABLE: 1" in out
-    assert "RESEARCH-READY: 1" in out
+    assert "RESEARCH-READY: 0" in out
 
 
 def test_cli_missing_symbols_csv_fails_closed(tmp_path: Path) -> None:

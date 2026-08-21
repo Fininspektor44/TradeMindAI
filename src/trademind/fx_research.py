@@ -445,13 +445,22 @@ def build_fx_observations(
     volume_rows: list[dict[str, str]],
     *,
     server_utc_offset_hours: int = 0,
+    symbols: tuple[str, ...] | None = None,
+    include_forward_outcomes: bool = True,
 ) -> list[dict[str, str]]:
-    """Build deterministic, research-only observations from canonical volume
-    bars, for the live observation symbol universe (FX majors plus the
-    frozen prospective candidates; see ``LIVE_OBSERVATION_SYMBOLS``)."""
+    """Build deterministic, research-only observations from canonical bars.
+
+    The default symbol scope and forward-outcome behavior are unchanged for
+    the production live runtime. Historical replay must pass an explicit
+    broker-derived symbol tuple and disables the legacy observation-level
+    forward labels so candidate construction cannot receive future fields.
+    """
+    selected_symbols = tuple(
+        dict.fromkeys(symbol.strip().upper() for symbol in (symbols or LIVE_OBSERVATION_SYMBOLS))
+    )
     by_symbol: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in volume_rows:
-        if row.get("symbol", "").upper() in LIVE_OBSERVATION_SYMBOLS:
+        if row.get("symbol", "").upper() in selected_symbols:
             by_symbol[row["symbol"].upper()].append(row)
 
     signal_engine = SignalEngine()
@@ -459,7 +468,7 @@ def build_fx_observations(
     minimum = max(signal_engine.minimum_candles, structure_engine.minimum_candles)
     output: list[dict[str, str]] = []
 
-    for symbol in LIVE_OBSERVATION_SYMBOLS:
+    for symbol in selected_symbols:
         rows = sorted(by_symbol.get(symbol, []), key=lambda item: _integer(item, "time"))
         candles = [_candle(row, server_utc_offset_hours) for row in rows]
         for index in range(minimum - 1, len(rows)):
@@ -550,7 +559,8 @@ def build_fx_observations(
             )
             observation.update(_structure_fields(structure))
             observation["labels"] = "|".join(sorted(_research_labels(observation)))
-            _apply_forward_outcomes(observation, candles, index)
+            if include_forward_outcomes:
+                _apply_forward_outcomes(observation, candles, index)
             output.append(observation)
 
     output.sort(key=lambda row: (row["signal_time"], row["symbol"]))

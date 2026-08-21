@@ -1,0 +1,18 @@
+{
+  "schema_version": "ser8-historical-research-policy-v1",
+  "collector_version": "1.0.0",
+  "initial_timeframe": "M5",
+  "expected_interval_seconds": 300,
+  "minimum_rows_for_replay_attempt": 103,
+  "minimum_rows_basis": "MarketStructureEngine minimum 31 bars plus live shadow max_bars 72",
+  "research_minimum_completed_outcomes": 300,
+  "research_minimum_basis": "fx_research.validate_fx_observations research_minimum default",
+  "shadow_max_bars": 72,
+  "shadow_cost_r": 0.04,
+  "research_asset_classes": [
+    "FX"
+  ],
+  "research_trade_modes": [
+    "FULL"
+  ]
+}

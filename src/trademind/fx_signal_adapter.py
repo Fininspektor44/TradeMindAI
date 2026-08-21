@@ -309,7 +309,8 @@ def _market_features(
     action: str,
     geometry: Mapping[str, float],
 ) -> dict[str, dict[str, Any]]:
-    return {
+    historical_rates_only = _text(row, "tick_copy_status").upper() == "MT5_HISTORICAL_RATES_ONLY"
+    features = {
         "structure": {
             "internal_bias": _text(row, "internal_bias"),
             "internal_break": _text(row, "internal_break"),
@@ -337,8 +338,10 @@ def _market_features(
             "bar_tick_volume": _number(row, "bar_tick_volume") or 0.0,
             "rvol_20": _number(row, "rvol_20", "volume_ratio_20") or 0.0,
             "volume_percentile_100": _number(row, "volume_percentile_100") or 0.0,
-            "direction_imbalance": _number(row, "direction_imbalance") or 0.0,
-            "delta_proxy": _number(row, "delta_proxy") or 0.0,
+            "direction_imbalance": (
+                None if historical_rates_only else _number(row, "direction_imbalance") or 0.0
+            ),
+            "delta_proxy": None if historical_rates_only else _number(row, "delta_proxy") or 0.0,
             "tick_rate_ratio_20": _number(row, "tick_rate_ratio_20") or 0.0,
         },
         "momentum": {
@@ -355,7 +358,9 @@ def _market_features(
             "spread_cost": _number(row, "spread_cost") or 0.0,
             "spread_cost_atr": _number(row, "spread_cost_atr") or 0.0,
             "spread_ratio_20": _number(row, "spread_ratio_20") or 0.0,
-            "spread_expansion_points": _number(row, "spread_expansion_points") or 0.0,
+            "spread_expansion_points": (
+                None if historical_rates_only else _number(row, "spread_expansion_points") or 0.0
+            ),
         },
         "confirmation": {
             "fvg": _text(row, "fvg_direction"),
@@ -375,6 +380,19 @@ def _market_features(
             "observation_id": _text(row, "observation_id"),
         },
     }
+    if historical_rates_only:
+        features["custom"].update(
+            {
+                "source_capability": "MT5_HISTORICAL_RATES_ONLY",
+                "unavailable_broker_features": [
+                    "bid_up", "bid_down", "ask_up", "ask_down", "mid_up", "mid_down",
+                    "direction_imbalance", "delta_proxy", "spread_min_points",
+                    "spread_max_points", "spread_last_points", "spread_expansion_points",
+                ],
+                "unavailable_factor_contribution": 0.0,
+            }
+        )
+    return features
 
 
 def _setup_family(row: Mapping[str, Any], action: str, geometry: Mapping[str, float]) -> str:
@@ -391,7 +409,11 @@ def _setup_family(row: Mapping[str, Any], action: str, geometry: Mapping[str, fl
     return "MULTIFACTOR_MARKET_SETUP"
 
 
-def build_candidate(row: Mapping[str, Any]) -> SignalCandidate:
+def build_candidate(
+    row: Mapping[str, Any],
+    *,
+    provenance: tuple[str, ...] | None = None,
+) -> SignalCandidate:
     action = _text(row, "action").upper()
     if action not in VALID_ACTIONS:
         raise ValueError("observation action is not BUY/SELL")
@@ -419,7 +441,7 @@ def build_candidate(row: Mapping[str, Any]) -> SignalCandidate:
         market_features=features,
         factor_scores=scores,
         factor_reasons=reasons,
-        provenance=(
+        provenance=provenance or (
             "FX_RESEARCH_V1_4_2",
             "SMC_STRUCTURE_ENGINE",
             "TICK_VOLUME_COLLECTOR",

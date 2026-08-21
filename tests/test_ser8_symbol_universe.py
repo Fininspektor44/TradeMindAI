@@ -37,6 +37,7 @@ from trademind.ser8_symbol_universe import (
     SER8SymbolUniverseControl,
     SER8SymbolUniverseError,
     SymbolUniverseEntryV1,
+    VerifiedHistoricalResearchEvidenceV1,
     aggregate_forward_demo_performance,
     apply_research_lifecycle_state,
     classify_asset_class,
@@ -122,7 +123,7 @@ def test_classify_rejects_same_currency_both_sides() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_single_symbol_discovered_and_research_ready(tmp_path: Path) -> None:
+def test_historical_rows_alone_never_make_symbol_research_ready(tmp_path: Path) -> None:
     csv_path = _write_symbols_csv(tmp_path / "symbols.csv", [_symbol_row("EURUSD")])
     entries = discover_symbol_universe(
         symbols_csv=csv_path, historical_rows_by_symbol={"EURUSD": 5000}, now=_NOW,
@@ -134,9 +135,9 @@ def test_single_symbol_discovered_and_research_ready(tmp_path: Path) -> None:
     assert entry.risk_model_supported is True
     assert entry.data_available is True
     assert entry.historical_rows == 5000
-    assert entry.research_status == RESEARCH_STATUS_RESEARCH_READY
+    assert entry.research_status == RESEARCH_STATUS_DATA_INSUFFICIENT
     assert entry.execution_status == EXECUTION_STATUS_NOT_EXECUTABLE
-    assert entry.rejection_reason is None
+    assert "replay evidence" in entry.rejection_reason
     assert entry.schema_version == SCHEMA_VERSION
     assert entry.entry_hash.startswith("sha256:")
 
@@ -150,7 +151,29 @@ def test_ten_symbols_discovered(tmp_path: Path) -> None:
     )
     assert {e.symbol for e in entries} == set(fx_symbols)
     assert all(e.asset_class == ASSET_CLASS_FX for e in entries)
-    assert all(e.research_status == RESEARCH_STATUS_RESEARCH_READY for e in entries)
+    assert all(e.research_status == RESEARCH_STATUS_DATA_INSUFFICIENT for e in entries)
+
+
+def test_verified_replay_evidence_can_make_symbol_research_ready(tmp_path: Path) -> None:
+    csv_path = _write_symbols_csv(tmp_path / "symbols.csv", [_symbol_row("EURUSD")])
+    evidence = VerifiedHistoricalResearchEvidenceV1(
+        dataset_sha256="a" * 64,
+        replay_sha256="b" * 64,
+        historical_rows=5000,
+        completed_outcomes=300,
+        research_minimum=300,
+        research_ready=True,
+        readiness_reason="verified replay outcomes meet the authoritative research minimum",
+    )
+    entry = discover_symbol_universe(
+        symbols_csv=csv_path,
+        verified_research_by_symbol={"EURUSD": evidence},
+        now=_NOW,
+    )[0]
+    assert entry.data_available is True
+    assert entry.historical_rows == 5000
+    assert entry.research_status == RESEARCH_STATUS_RESEARCH_READY
+    assert entry.rejection_reason is None
 
 
 def test_large_symbol_universe(tmp_path: Path) -> None:

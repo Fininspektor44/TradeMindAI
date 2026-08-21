@@ -26,11 +26,11 @@ INPUTS (all optional except ``--mt5-export-dir``/``--account``):
     works from this alone.
   * ``--runtime-root``/``--candidates``: the live candidate journal(s) --
     determines LIVE-RUNTIME SUPPORTED and signal-frequency ranking input.
-  * ``--historical-data-csv``: an optional CSV with columns
-    ``symbol,rows`` giving a REAL historical dataset row count per symbol
-    (e.g. exported from a research source inventory) -- this script never
-    fabricates a row count for a symbol not present here; such a symbol
-    is conservatively reported DATA_INSUFFICIENT.
+  * ``--historical-inventory``: the authoritative hash-verified historical
+    replay readiness inventory. This is the only historical input that can
+    advance a symbol to RESEARCH_READY.
+  * ``--historical-data-csv``: a backward-compatible ``symbol,rows`` CSV.
+    It proves availability only and can never grant RESEARCH_READY.
   * ``--correlations``: defaults to the real, checked-in
     ``config/mt5/correlation_groups_v1.json``.
   * ``--db``/``--hypothesis-map``/``--demo-active``: when supplied,
@@ -60,6 +60,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from trademind.discovery.hypothesis_registry import HypothesisRegistry  # noqa: E402
+from trademind.ser8_historical_replay import load_verified_research_readiness  # noqa: E402
 from trademind.ser8_symbol_universe import (  # noqa: E402
     EXECUTION_STATUS_DEMO_ACTIVE,
     RESEARCH_STATUS_ACCEPTED,
@@ -146,7 +147,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-root", type=Path, default=None, help="Live candidate runtime root (default: data/live_signal_runtime_v1)")
     parser.add_argument("--candidates", type=Path, nargs="*", default=(), help="Additional candidate journal path(s) to scan")
     parser.add_argument("--data-root", type=Path, default=None)
-    parser.add_argument("--historical-data-csv", type=Path, default=None, help="Optional symbol,rows CSV of real historical dataset sizes")
+    historical = parser.add_mutually_exclusive_group()
+    historical.add_argument(
+        "--historical-inventory", type=Path, default=None,
+        help="Hash-verified deterministic replay readiness inventory",
+    )
+    historical.add_argument(
+        "--historical-data-csv", type=Path, default=None,
+        help="Legacy symbol,rows availability only; cannot grant RESEARCH_READY",
+    )
     parser.add_argument("--correlations", type=Path, default=None, help="Default: config/mt5/correlation_groups_v1.json")
     parser.add_argument("--minimum-live-signal-sample", type=int, default=1)
     parser.add_argument("--db", type=Path, default=None, help="HypothesisRegistry SQLite path -- enables research-lifecycle overlay")
@@ -169,12 +178,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidates_paths = [runtime_root / "candidates.jsonl"] + [Path(p).expanduser() for p in args.candidates]
     correlations_path = Path(args.correlations).expanduser() if args.correlations else repo_root / "config" / "mt5" / "correlation_groups_v1.json"
     correlation_config = _read_correlation_config(correlations_path)
-    historical_rows = _read_historical_rows_csv(Path(args.historical_data_csv).expanduser()) if args.historical_data_csv else {}
+    verified_research = {}
+    if args.historical_inventory:
+        try:
+            historical_rows, verified_research = load_verified_research_readiness(
+                Path(args.historical_inventory).expanduser().resolve()
+            )
+        except Exception as exc:  # noqa: BLE001 -- one fail-closed operator error.
+            print(f"historical readiness inventory failed verification: {exc}", file=sys.stderr)
+            return 2
+    else:
+        historical_rows = (
+            _read_historical_rows_csv(Path(args.historical_data_csv).expanduser())
+            if args.historical_data_csv
+            else {}
+        )
 
     try:
         entries = discover_symbol_universe(
             symbols_csv=symbols_csv, candidates_paths=candidates_paths, correlation_config=correlation_config,
             historical_rows_by_symbol=historical_rows, minimum_live_signal_sample=args.minimum_live_signal_sample,
+            verified_research_by_symbol=verified_research,
         )
     except Exception as exc:  # noqa: BLE001 -- reported once, cleanly, never a raw traceback for a real operator run.
         print(f"discovery failed: {exc}", file=sys.stderr)

@@ -241,6 +241,41 @@ class SymbolUniverseEntryV1:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedHistoricalResearchEvidenceV1:
+    """Verified historical dataset + replay boundary consumed by discovery.
+
+    Row counts alone intentionally cannot construct this record. The
+    historical replay inventory verifier supplies the content identities and
+    proves that every outcome is bound to a genuine replay candidate.
+    """
+
+    dataset_sha256: str
+    replay_sha256: str
+    historical_rows: int
+    completed_outcomes: int
+    research_minimum: int
+    research_ready: bool
+    readiness_reason: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("dataset_sha256", self.dataset_sha256),
+            ("replay_sha256", self.replay_sha256),
+        ):
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise SER8SymbolUniverseError(f"{name} must be 64 lowercase hex characters")
+        if min(self.historical_rows, self.completed_outcomes, self.research_minimum) < 0:
+            raise SER8SymbolUniverseError("historical replay counts cannot be negative")
+        if self.research_minimum < 1:
+            raise SER8SymbolUniverseError("research_minimum must be positive")
+        if self.completed_outcomes > self.historical_rows:
+            raise SER8SymbolUniverseError("completed replay outcomes cannot exceed historical rows")
+        if self.research_ready and self.completed_outcomes < self.research_minimum:
+            raise SER8SymbolUniverseError("research_ready evidence is below the research minimum")
+        _nonempty_str(self.readiness_reason, field_name="readiness_reason")
+
+
 def _entry_from_payload(payload: dict[str, object]) -> SymbolUniverseEntryV1:
     return SymbolUniverseEntryV1(
         schema_version=payload["schema_version"], symbol=payload["symbol"], asset_class=payload["asset_class"],
@@ -265,7 +300,7 @@ def _read_symbols_csv(path: Path) -> list[dict[str, str]]:
     return [dict(row) for row in reader]
 
 
-def _row_is_risk_model_supported(row: Mapping[str, str]) -> tuple[bool, str]:
+def risk_model_support_for_symbol_row(row: Mapping[str, str]) -> tuple[bool, str]:
     """Mirrors trademind.mt5_risk_adapter._build_instrument's own
     structural validity criteria exactly (never re-invented, never
     weakened) -- returns (supported, reason_if_not)."""
@@ -289,6 +324,11 @@ def _row_is_risk_model_supported(row: Mapping[str, str]) -> tuple[bool, str]:
     if not tick_value_ok:
         return False, "no positive tick_value/tick_value_profit/tick_value_loss"
     return True, ""
+
+
+# Backward-compatible private name retained for callers/tests from the
+# original universe layer. New infrastructure uses the public function above.
+_row_is_risk_model_supported = risk_model_support_for_symbol_row
 
 
 def _is_positive(value: object) -> bool:
@@ -347,6 +387,7 @@ def discover_symbol_universe(
     candidates_paths: Sequence[Path] = (),
     correlation_config: Mapping[str, object] | None = None,
     historical_rows_by_symbol: Mapping[str, int] | None = None,
+    verified_research_by_symbol: Mapping[str, "VerifiedHistoricalResearchEvidenceV1"] | None = None,
     minimum_live_signal_sample: int = DEFAULT_MINIMUM_LIVE_SIGNAL_SAMPLE,
     now: datetime | None = None,
 ) -> tuple[SymbolUniverseEntryV1, ...]:
@@ -359,17 +400,17 @@ def discover_symbol_universe(
     risk-model validity, live-runtime signal presence, historical data
     sufficiency IF supplied) -- never assumed, never fabricated.
 
-    ``historical_rows_by_symbol``, when supplied, must come from a REAL
-    dataset inventory (e.g. a research source CSV's own row counts) --
-    this function never invents a row count for a symbol it was not
-    told about; such a symbol's ``historical_rows`` stays ``None`` and it
-    is conservatively treated as ``DATA_INSUFFICIENT`` rather than
-    ``RESEARCH_READY``."""
+    ``historical_rows_by_symbol`` is compatibility/availability evidence
+    only. It can never make a symbol RESEARCH_READY. Advancement to
+    RESEARCH_READY additionally requires a verified, content-addressed
+    replay record in ``verified_research_by_symbol`` whose genuine completed
+    outcomes meet the authoritative downstream research minimum."""
     captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     rows = _read_symbols_csv(symbols_csv)
     live_signal_counts = scan_live_signal_symbols(candidates_paths)
     correlation_mapping = correlation_config or {}
     historical = historical_rows_by_symbol or {}
+    verified_research = verified_research_by_symbol or {}
 
     entries: list[SymbolUniverseEntryV1] = []
     seen_symbols: set[str] = set()
@@ -384,7 +425,20 @@ def discover_symbol_universe(
         asset_class = classify_asset_class(symbol)
         live_sample_count = live_signal_counts.get(symbol, 0)
         live_runtime_supported = live_sample_count >= minimum_live_signal_sample
-        rows_available = historical.get(symbol)
+        replay_evidence = verified_research.get(symbol)
+        compatibility_rows = historical.get(symbol)
+        if (
+            replay_evidence is not None
+            and compatibility_rows is not None
+            and compatibility_rows != replay_evidence.historical_rows
+        ):
+            raise SER8SymbolUniverseError(
+                f"historical row evidence conflicts for {symbol}: "
+                f"{compatibility_rows} != {replay_evidence.historical_rows}"
+            )
+        rows_available = (
+            replay_evidence.historical_rows if replay_evidence is not None else compatibility_rows
+        )
         data_available = rows_available is not None and rows_available > 0
 
         rejection_reason: str | None = None
@@ -400,6 +454,15 @@ def discover_symbol_universe(
         elif not data_available:
             research_status = RESEARCH_STATUS_DATA_INSUFFICIENT
             rejection_reason = "no historical dataset row count supplied for this symbol"
+        elif replay_evidence is None:
+            research_status = RESEARCH_STATUS_DATA_INSUFFICIENT
+            rejection_reason = (
+                "historical rows prove market-data availability only; verified deterministic "
+                "candidate/outcome replay evidence is required"
+            )
+        elif not replay_evidence.research_ready:
+            research_status = RESEARCH_STATUS_DATA_INSUFFICIENT
+            rejection_reason = replay_evidence.readiness_reason
         else:
             # Fully vetted: valid risk-model instrument metadata, a
             # proven-safe asset class, AND sufficient historical data --
@@ -670,10 +733,12 @@ __all__ = [
     "SER8SymbolUniverseControl",
     "SER8SymbolUniverseError",
     "SymbolUniverseEntryV1",
+    "VerifiedHistoricalResearchEvidenceV1",
     "aggregate_forward_demo_performance",
     "apply_research_lifecycle_state",
     "classify_asset_class",
     "discover_symbol_universe",
     "rank_research_readiness",
+    "risk_model_support_for_symbol_row",
     "scan_live_signal_symbols",
 ]
