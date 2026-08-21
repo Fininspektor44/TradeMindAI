@@ -140,13 +140,15 @@ def test_magic_filtering_unchanged_in_both_exports() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_process_pending_request_unchanged() -> None:
+def test_process_pending_request_preserves_execution_and_adds_bounded_expiry_clock() -> None:
     source = _source()
     body = _function_body(source, "ProcessPendingRequest")
     assert "trade.Buy(" in body and "trade.Sell(" in body
     assert "trade.BuyLimit(" in body and "trade.SellLimit(" in body
     assert "trade.BuyStop(" in body and "trade.SellStop(" in body
-    assert "TimeCurrent()" not in body  # this fix never touches order execution's own clock use (it has none).
+    assert "TimeTradeServer()" in body
+    assert "expiration<=server_now" in body
+    assert "ORDER_TIME_SPECIFIED" in body
 
 
 def test_no_trading_call_added_to_either_history_export() -> None:

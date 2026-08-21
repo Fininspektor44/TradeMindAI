@@ -110,6 +110,7 @@ from trademind.ser8_mt5_demo_order_send import (
     SER8DemoOrderReconciliationRequiredError,
     SER8DemoOrderRejectedError,
     SER8DemoOrderResumeWindowExpiredError,
+    SER8PendingTTLExpiredError,
     SER8DemoOrderSendControl,
     SER8DemoOrderSendError,
     SER8DemoOrderTransportError,
@@ -1808,44 +1809,14 @@ def test_demo_login_and_magic_checks_preserved_per_leg(tmp_path: Path) -> None:
 _POSITIONS_SNAPSHOT_FIX_BASE_SHA = "7e134376813844500793f267c0f1a58b8e18c35a"
 
 
-def test_mql5_executor_change_stays_scoped_to_positions_snapshot_writer() -> None:
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(
-        [
-            "git", "diff", "--unified=0", _POSITIONS_SNAPSHOT_FIX_BASE_SHA,
-            "--", "mt5/TradeMind_Demo_Order_Executor_v1.mq5",
-        ],
-        cwd=repo_root, capture_output=True, text=True, check=False,
+def test_mql5_executor_pending_orders_have_no_gtc_fallback() -> None:
+    source = (Path(__file__).resolve().parents[1] / "mt5" / "TradeMind_Demo_Order_Executor_v1.mq5").read_text(
+        encoding="utf-8"
     )
-    if result.returncode != 0:
-        pytest.skip(f"base commit {_POSITIONS_SNAPSHOT_FIX_BASE_SHA} not reachable in this checkout")
-    diff_text = result.stdout
-    hunk_headers = [line for line in diff_text.splitlines() if line.startswith("@@")]
-    assert hunk_headers, "expected this task to have changed the executor file"
-    # Only actual changed (+/-) CODE lines count -- explanatory comments
-    # (added or pre-existing) legitimately NAME sibling functions like
-    # ReadAndConsumeRequest/FileMove for cross-reference without touching
-    # them; a comment mentioning a name is not a change to that function.
-    changed_lines = [
-        line for line in diff_text.splitlines() if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
-    ]
-    changed_code_lines = [line for line in changed_lines if not line.lstrip("+- ").startswith("//")]
-    for forbidden_function in (
-        "ProcessPendingRequest", "WriteResult(", "WriteMalformedResult",
-        "ReadAndConsumeRequest", "ExportSymbolSnapshot", "OnInit()", "OnTimer()", "OnDeinit",
-    ):
-        for line in changed_code_lines:
-            assert forbidden_function not in line, (
-                f"unexpected code change touching {forbidden_function} in line {line!r} -- "
-                "this fix must stay scoped to the positions-snapshot writer only"
-            )
-    # AppendAccountSnapshot's own BODY (its FileWrite calls / account
-    # fields) must not appear as a changed (+/-) CODE line -- only context.
-    for line in changed_code_lines:
-        assert "AccountInfoDouble" not in line
-        assert "ACCOUNT_BALANCE" not in line
+    assert "ORDER_TIME_SPECIFIED,expiration" in source
+    assert "SYMBOL_EXPIRATION_SPECIFIED" in source
+    assert "expiration<=server_now" in source
+    assert "ORDER_TIME_GTC,0,comment" not in source
 
 
 def test_mql5_executor_file_still_has_the_untouched_prior_task_guarantees() -> None:
@@ -3577,3 +3548,153 @@ def test_resume_plan_never_calls_metatrader5_or_reimplements_a_second_sizing_pat
     assert not (imported & {"MetaTrader5"})
     for forbidden in ("SizedOrder(", "RiskDecision(", "evaluate_risk("):
         assert forbidden not in source
+
+
+# ---------------------------------------------------------------------------
+# SER8 PENDING ORDER LIFECYCLE + RISK CONTAINMENT V1
+# ---------------------------------------------------------------------------
+
+
+def _stop_candidate(*, created_at=None, action="BUY", symbol=SYMBOL):
+    candidate = _candidate(created_at=created_at, action=action, symbol=symbol)
+    stop_entry = EntryOrder(2002.0 if action == "BUY" else 1998.0, 1.0, "breakout", "STOP")
+    return __import__("dataclasses").replace(
+        candidate, plan=__import__("dataclasses").replace(candidate.plan, entries=(stop_entry,))
+    )
+
+
+@pytest.mark.parametrize("candidate_factory", [_multi_leg_candidate, _stop_candidate])
+def test_new_pending_plan_legs_have_finite_integrity_bound_expiry(tmp_path: Path, candidate_factory) -> None:
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=candidate_factory)
+    demo = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    plan = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo)
+    pending = [leg for leg in plan.legs if leg.order_type != "MARKET"]
+    assert pending
+    signal_deadline = candidate.created_at + timedelta(seconds=900)
+    assert all(datetime.fromisoformat(leg.expires_at) <= signal_deadline for leg in pending)
+    assert all(leg.risk_money is not None for leg in pending)
+
+    request = build_demo_order_leg_request(
+        claim, decision, candidate, decision.orders[-1], demo_authorization=demo, total_legs=len(plan.legs)
+    )
+    assert request.expires_at == pending[-1].expires_at
+    assert request.to_csv_row()["expires_at_epoch"] != "0"
+    tampered = __import__("dataclasses").replace(
+        request, expires_at=(datetime.fromisoformat(request.expires_at) + timedelta(seconds=1)).isoformat()
+    )
+    assert tampered.request_hash != request.request_hash
+    assert tampered.request_hash != request.to_payload()["request_hash"]
+
+
+def test_market_request_has_no_expiry_and_wire_value_is_zero(tmp_path: Path) -> None:
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    demo = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    request = build_demo_order_request(claim, decision, candidate, demo_authorization=demo)
+    assert request.order_type == "MARKET"
+    assert request.expires_at is None
+    assert request.to_csv_row()["expires_at_epoch"] == "0"
+
+
+def test_expired_pending_request_writes_no_bridge_file(tmp_path: Path) -> None:
+    request = DemoOrderRequestV1(
+        schema_version=SCHEMA_VERSION, parent_claim_id="claim", entry_index=1, claim_id="claim",
+        authorization_id="auth", demo_account_id=LOGIN, symbol=SYMBOL, action="BUY", order_type="LIMIT",
+        volume=0.01, price=1998.0, sl=1990.0, tp=2020.0, magic=DEMO_EXECUTOR_MAGIC_NUMBER,
+        comment="SER8:claim", expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+    )
+    transport = FileBridgeDemoOrderTransport(
+        common_files_dir=tmp_path, login=LOGIN, poll_interval_seconds=0.01, timeout_seconds=0.02
+    )
+    with pytest.raises(SER8PendingTTLExpiredError, match="PENDING_TTL_EXPIRED"):
+        transport.send(request)
+    assert not (tmp_path / f"ser8_demo_order_request_{LOGIN}.csv").exists()
+
+
+def test_pending_reservation_uses_original_risk_and_releases_on_broker_terminal(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    control = SER8DemoOrderSendControl(
+        registry=context.registry,
+        transport=FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "FILLED", 2: "PENDING", 3: "PENDING"})),
+    )
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    reservations = control.pending_risk_reservations(LOGIN)
+    assert {item.leg_id for item in reservations} == {f"{claim.claim_id}#2", f"{claim.claim_id}#3"}
+    assert sum(item.risk_money for item in reservations) == pytest.approx(
+        decision.orders[1].risk_money + decision.orders[2].risk_money
+    )
+    assert sum(item.margin_required or 0 for item in reservations) == pytest.approx(
+        (decision.orders[1].margin_required or 0) + (decision.orders[2].margin_required or 0)
+    )
+
+    control.reconcile_pending_leg(f"{claim.claim_id}#2", terminal_order_state="EXPIRED", now=NOW)
+    after_expiry = control.pending_risk_reservations(LOGIN)
+    assert {item.leg_id for item in after_expiry} == {f"{claim.claim_id}#3"}
+
+    pending_receipt = control.get_leg_receipt(f"{claim.claim_id}#3")
+    request = control.get_leg_request(f"{claim.claim_id}#3")
+    control.reconcile_pending_leg(
+        f"{claim.claim_id}#3",
+        evidence=DemoOrderTransportResult(
+            claim_id=request.claim_id, demo_account_id=LOGIN, symbol=SYMBOL, retcode=10009,
+            retcode_description="filled", order_ticket=pending_receipt.order_ticket, deal_ticket="9002",
+            position_ticket="9003", filled_volume=request.volume, filled_price=request.price,
+        ),
+        now=NOW,
+    )
+    assert control.pending_risk_reservations(LOGIN) == ()
+    # The FILLED leg remains active until durable close/outcome truth exists.
+    assert control.list_active_execution_plans(LOGIN, symbol=SYMBOL)
+
+
+def test_unknown_leg_retains_original_conservative_reservation(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    transport = FakeDemoOrderTransport(result_factory=lambda _request: (_ for _ in ()).throw(TimeoutError()))
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=transport)
+    with pytest.raises(SER8DemoOrderReconciliationRequiredError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    reservations = control.pending_risk_reservations(LOGIN)
+    assert len(reservations) == 1
+    assert reservations[0].leg_id == f"{claim.claim_id}#1"
+    assert reservations[0].risk_money == pytest.approx(decision.orders[0].risk_money)
+
+
+def test_tampered_persisted_pending_expiry_fails_plan_integrity(tmp_path: Path) -> None:
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_multi_leg_candidate)
+    demo = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    plan = build_demo_order_execution_plan(claim, decision, candidate, demo_authorization=demo)
+    control = SER8DemoOrderSendControl(registry=context.registry, transport=FakeDemoOrderTransport())
+    control._persist_plan(plan, created_at=NOW.isoformat())
+    with control._connect() as db:
+        payload = json.loads(db.execute(
+            "SELECT payload_json FROM ser8_mt5_demo_order_plans WHERE plan_id=?", (plan.plan_id,)
+        ).fetchone()[0])
+        payload["legs"][1]["expires_at"] = (NOW + timedelta(days=1)).isoformat()
+        db.execute(
+            "UPDATE ser8_mt5_demo_order_plans SET payload_json=? WHERE plan_id=?",
+            (json.dumps(payload, sort_keys=True), plan.plan_id),
+        )
+    with pytest.raises(SER8DemoOrderSendError, match="plan_hash integrity"):
+        control.get_plan(plan.plan_id)
+
+
+def test_terminal_pending_only_plan_is_inactive_and_other_symbol_is_never_inherently_blocked(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_stop_candidate)
+    control = SER8DemoOrderSendControl(
+        registry=context.registry,
+        transport=FakeDemoOrderTransport(result_factory=_leg_result_factory({1: "PENDING"})),
+    )
+    with pytest.raises(SER8DemoOrderPendingError):
+        control.send(claim, decision, candidate, allowlist=_allowlist(LOGIN), now=NOW)
+    assert control.list_active_execution_plans(LOGIN, symbol=SYMBOL)
+    assert control.list_active_execution_plans(LOGIN, symbol="USDJPY") == ()
+
+    control.reconcile_pending_leg(claim.claim_id, terminal_order_state="CANCELLED", now=NOW)
+    assert control.list_active_execution_plans(LOGIN, symbol=SYMBOL) == ()
+    assert control.pending_risk_reservations(LOGIN) == ()

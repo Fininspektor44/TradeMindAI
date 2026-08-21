@@ -195,7 +195,8 @@ bool ExportSymbolSnapshot()
       handle,
       "time_msc","account_login","server","currency","symbol","digits","trade_mode","bid","ask",
       "tick_size","tick_value","tick_value_profit","tick_value_loss","volume_min","volume_max","volume_step",
-      "contract_size","margin_initial","margin_maintenance","margin_buy_per_volume","margin_sell_per_volume","leverage"
+      "contract_size","margin_initial","margin_maintenance","margin_buy_per_volume","margin_sell_per_volume","leverage",
+      "expiration_mode_flags"
    );
 
    long captured_msc=UtcNowMsc();
@@ -245,7 +246,8 @@ bool ExportSymbolSnapshot()
          DoubleToString(SymbolInfoDouble(symbol,SYMBOL_MARGIN_MAINTENANCE),8),
          DoubleToString(buy_margin,8),
          DoubleToString(sell_margin,8),
-         AccountInfoInteger(ACCOUNT_LEVERAGE)
+         AccountInfoInteger(ACCOUNT_LEVERAGE),
+         SymbolInfoInteger(symbol,SYMBOL_EXPIRATION_MODE)
       );
       written++;
    }

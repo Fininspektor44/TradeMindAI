@@ -31,7 +31,7 @@ the identical, narrow structural checks documented above.
 
 ASSET-CLASS CLASSIFICATION is deliberately best-effort and clearly
 labeled as such: MT5's own read-only symbol export (as of the unified
-executor v1.5) does not currently carry a broker-provided asset-class/
+executor v1.6) does not currently carry a broker-provided asset-class/
 path field, so :func:`classify_asset_class` falls back to a narrow,
 documented, extensible naming-convention heuristic (ISO-4217-style
 6-letter currency pairs -> FX; a small set of well-known metal root

@@ -74,7 +74,13 @@ from trademind.discovery.research_eligibility_boundary import (
 )
 from trademind.hypothesis_live_candidate_matching import verify_live_candidate_matches_scope
 from trademind.mt5_risk_adapter import adapt_mt5_exports
-from trademind.risk_manager import RiskDecision, RiskProfile, evaluate_risk
+from trademind.risk_manager import (
+    PendingRiskReservation,
+    PortfolioSnapshot,
+    RiskDecision,
+    RiskProfile,
+    evaluate_risk,
+)
 from trademind.signal_intelligence import SignalCandidate
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
 
@@ -214,6 +220,7 @@ class SER8ResearchRiskGateResult:
 
     evidence: SER8ResearchRiskGateEvidenceV1
     decision: RiskDecision
+    portfolio: PortfolioSnapshot
 
 
 def _snapshot_hash(*, account, instrument, portfolio) -> str:
@@ -243,6 +250,7 @@ def evaluate_ser8_research_risk_gate(
     profile: RiskProfile | None = None,
     correlations: Path | None = None,
     requested_risk_pct: float | None = None,
+    pending_reservations: tuple[PendingRiskReservation, ...] = (),
     maximum_mt5_age_seconds: float = 120.0,
     now: datetime | None = None,
 ) -> SER8ResearchRiskGateResult:
@@ -323,6 +331,18 @@ def evaluate_ser8_research_risk_gate(
             f"requested login {login} does not match MT5 snapshot {bundle.account.account_id}"
         )
 
+    # Broker-active pending legs consume their ORIGINAL planned risk and
+    # known margin before this decision is evaluated.  The live positions
+    # snapshot remains the sole source for FILLED risk, so PENDING->FILLED
+    # cannot be counted twice.
+    portfolio = PortfolioSnapshot(
+        positions=bundle.portfolio.positions,
+        open_trades=bundle.portfolio.open_trades,
+        reserved_risk_money=sum(item.risk_money for item in pending_reservations),
+        reserved_margin=sum(item.margin_required or 0.0 for item in pending_reservations),
+        pending_reservations=tuple(pending_reservations),
+    )
+
     # 7, 10: candidate freshness and the existing RiskProfile (unchanged)
     # are both enforced entirely inside evaluate_risk, unchanged.
     decision = evaluate_risk(
@@ -331,7 +351,7 @@ def evaluate_ser8_research_risk_gate(
         account=bundle.account,
         instrument=bundle.instrument,
         profile=rules,
-        portfolio=bundle.portfolio,
+        portfolio=portfolio,
         requested_risk_pct=requested_risk_pct,
         now=captured_at,
     )
@@ -347,7 +367,7 @@ def evaluate_ser8_research_risk_gate(
         live_candidate_timeframe=candidate.timeframe,
         live_candidate_action=candidate.plan.action,
         market_account_snapshot_hash=_snapshot_hash(
-            account=bundle.account, instrument=bundle.instrument, portfolio=bundle.portfolio
+            account=bundle.account, instrument=bundle.instrument, portfolio=portfolio
         ),
         account_id=bundle.account.account_id,
         risk_profile_hash=_profile_hash(rules),
@@ -356,7 +376,7 @@ def evaluate_ser8_research_risk_gate(
         risk_decision_state=decision.state,
         evaluated_at=captured_at.isoformat(),
     )
-    return SER8ResearchRiskGateResult(evidence=evidence, decision=decision)
+    return SER8ResearchRiskGateResult(evidence=evidence, decision=decision, portfolio=portfolio)
 
 
 __all__ = [

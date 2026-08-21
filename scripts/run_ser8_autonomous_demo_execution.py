@@ -228,6 +228,11 @@ from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
     SER8DemoOrderSendError,
     build_demo_order_execution_plan,
 )
+from trademind.ser8_mt5_execution_reconciliation import (  # noqa: E402
+    ReconciliationEvidenceError,
+    inventory_active_pending_orders,
+    load_order_history,
+)
 from trademind.ser8_research_risk_gate import (  # noqa: E402
     SER8ResearchRiskGateError,
     evaluate_ser8_research_risk_gate,
@@ -299,10 +304,16 @@ class CycleSummary:
         self.legs_existing = 0
         self.pending = 0
         self.filled = 0
+        self.expired = 0
+        self.canceled = 0
         self.terminal_failures = 0
         self.unknown_legs = 0
         self.unattempted_legs = 0
         self.resume_until = "-"
+        self.pending_expires_at = "-"
+        self.active_symbol_plan = "NO"
+        self.pending_reserved_risk_money = 0.0
+        self.pending_reserved_margin = 0.0
         self.outcomes_ingested = 0
         self.broker_sends_this_cycle = 0
         self.cycle_status = "NO_ACTION"
@@ -315,9 +326,13 @@ class CycleSummary:
             f"risk_state={self.risk_state} risk_block_reason={self.risk_block_reason} "
             f"authorization_id={self.authorization_id} claim_id={self.claim_id} "
             f"execution_plan_id={self.execution_plan_id} resume_until={self.resume_until} "
+            f"active_symbol_plan={self.active_symbol_plan} pending_expires_at={self.pending_expires_at} "
             f"legs_total={self.legs_total} legs_newly_submitted={self.legs_newly_submitted} "
             f"legs_existing={self.legs_existing} pending={self.pending} filled={self.filled} "
+            f"expired={self.expired} canceled={self.canceled} unknown={self.unknown_legs} "
             f"terminal_failures={self.terminal_failures} unattempted_legs={self.unattempted_legs} "
+            f"pending_reserved_risk_money={self.pending_reserved_risk_money:.8f} "
+            f"pending_reserved_margin={self.pending_reserved_margin:.8f} "
             f"outcomes_ingested={self.outcomes_ingested} broker_sends_this_cycle={self.broker_sends_this_cycle} "
             f"cycle_status={self.cycle_status}"
         )
@@ -341,6 +356,8 @@ def _observe_claim_legs(
     summary.filled = 0
     summary.pending = 0
     summary.terminal_failures = 0
+    summary.expired = 0
+    summary.canceled = 0
     summary.unknown_legs = 0
     for leg_id in leg_ids:
         receipt = send_control.get_leg_receipt(leg_id)
@@ -352,6 +369,10 @@ def _observe_claim_legs(
             summary.pending += 1
         elif receipt.result_state == "UNKNOWN":
             summary.unknown_legs += 1
+        elif receipt.result_state == "EXPIRED":
+            summary.expired += 1
+        elif receipt.result_state == "CANCELLED":
+            summary.canceled += 1
         else:
             summary.terminal_failures += 1
     summary.unattempted_legs = total_legs - len(leg_ids)
@@ -401,7 +422,15 @@ def _execute_and_observe(
         summary.cycle_status = "FAIL_CLOSED_SEND_DENIED"
         summary.risk_block_reason = str(exc)
     post_leg_ids = set(real_send_control.list_leg_ids_for_claim(claim.claim_id))
-    summary.broker_sends_this_cycle = len(post_leg_ids - pre_leg_ids)
+    new_leg_ids = post_leg_ids - pre_leg_ids
+    summary.broker_sends_this_cycle = sum(
+        1
+        for leg_id in new_leg_ids
+        if (
+            (receipt := real_send_control.get_leg_receipt(leg_id)) is None
+            or receipt.broker_send_performed is not False
+        )
+    )
     _observe_claim_legs(real_send_control, claim.claim_id, summary, total_legs=total_legs)
     summary.legs_newly_submitted = summary.broker_sends_this_cycle
 
@@ -474,12 +503,13 @@ class _PreparedCycleInputs:
     object graph (registry/artifacts/final_verdict). Never hypothesis-
     specific; see :func:`_run_cycle_for_hypothesis` for the part that is."""
 
-    __slots__ = ("pipeline", "inputs", "deals_csv")
+    __slots__ = ("pipeline", "inputs", "deals_csv", "orders_csv")
 
-    def __init__(self, *, pipeline: object, inputs: object, deals_csv: Path) -> None:
+    def __init__(self, *, pipeline: object, inputs: object, deals_csv: Path, orders_csv: Path) -> None:
         self.pipeline = pipeline
         self.inputs = inputs
         self.deals_csv = deals_csv
+        self.orders_csv = orders_csv
 
 
 def _prepare_cycle_inputs(args: argparse.Namespace) -> _PreparedCycleInputs:
@@ -508,6 +538,7 @@ def _prepare_cycle_inputs(args: argparse.Namespace) -> _PreparedCycleInputs:
         repo_root=repo_root,
     )
     deals_csv = Path(args.mt5_export_dir).expanduser() / f"mt5_risk_deals_utc_{args.account}.csv"
+    orders_csv = Path(args.mt5_export_dir).expanduser() / f"mt5_risk_orders_utc_{args.account}.csv"
 
     orchestrator_db = (
         Path(args.orchestrator_db).expanduser() if args.orchestrator_db else inputs.data_root / "ser8_orchestrator.db"
@@ -524,7 +555,7 @@ def _prepare_cycle_inputs(args: argparse.Namespace) -> _PreparedCycleInputs:
         holdout_primary_metric=args.holdout_primary_metric or "",
         holdout_parameters={},
     )
-    return _PreparedCycleInputs(pipeline=pipeline, inputs=inputs, deals_csv=deals_csv)
+    return _PreparedCycleInputs(pipeline=pipeline, inputs=inputs, deals_csv=deals_csv, orders_csv=orders_csv)
 
 
 def _action_scopes_overlap(a: str, b: str) -> bool:
@@ -572,12 +603,13 @@ def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> C
     prepared = _prepare_cycle_inputs(args)
     return _run_cycle_for_hypothesis(
         args, args.hypothesis_id, pipeline=prepared.pipeline, inputs=prepared.inputs,
-        deals_csv=prepared.deals_csv, now=now,
+        deals_csv=prepared.deals_csv, orders_csv=prepared.orders_csv, now=now,
     )
 
 
 def _run_cycle_for_hypothesis(
     args: argparse.Namespace, hypothesis_id: str, *, pipeline: object, inputs: object, deals_csv: Path,
+    orders_csv: Path,
     now: datetime,
 ) -> CycleSummary:
     """The ONE-hypothesis execution body -- extracted verbatim from this
@@ -620,6 +652,24 @@ def _run_cycle_for_hypothesis(
     claim_control = SER8ExecutionAuthorizationClaimControl(registry=pipeline.registry)
     outcome_control = SER8DemoTradeOutcomeControl(registry=pipeline.registry)
 
+    unmapped_active = ()
+    if orders_csv.is_file():
+        try:
+            pending_inventory = inventory_active_pending_orders(
+                send_control,
+                account=args.account,
+                order_history=load_order_history(orders_csv),
+                now=now,
+            )
+            unmapped_active = tuple(
+                item for item in pending_inventory if item.status == "UNMAPPED_ACTIVE_PENDING_ORDER"
+            )
+        except (ReconciliationEvidenceError, SER8DemoOrderSendError) as exc:
+            summary.candidate_status = "BROKER_PENDING_EVIDENCE_INVALID"
+            summary.cycle_status = "UNMAPPED_ACTIVE_PENDING_ORDER"
+            summary.risk_block_reason = str(exc)
+            return summary
+
     # ONE-SHOT ANCHOR: a candidate with an already-persisted execution
     # plan is NEVER re-evaluated, re-authorized, or re-claimed -- see this
     # script's own module docstring for the full restart-safety
@@ -644,6 +694,32 @@ def _run_cycle_for_hypothesis(
         summary.execution_plan_id = plan.plan_id
         summary.authorization_id = plan.authorization_id
         summary.resume_until = plan.resume_until or "-"
+        summary.pending_expires_at = ",".join(
+            leg.expires_at for leg in plan.legs if leg.expires_at is not None
+        ) or "-"
+        try:
+            summary.active_symbol_plan = (
+                "YES"
+                if any(
+                    item.plan_id == plan.plan_id
+                    for item in send_control.list_active_execution_plans(args.account, symbol=plan.symbol)
+                )
+                else "NO"
+            )
+        except SER8DemoOrderSendError as exc:
+            summary.candidate_status = "PLAN_INTEGRITY_FAILED"
+            summary.cycle_status = "FAIL_CLOSED_PLAN_INTEGRITY"
+            summary.risk_block_reason = str(exc)
+            return summary
+        try:
+            observed_reservations = send_control.pending_risk_reservations(args.account)
+        except SER8DemoOrderSendError as exc:
+            summary.candidate_status = "BLOCKED"
+            summary.cycle_status = "FAIL_CLOSED_PENDING_RISK"
+            summary.risk_block_reason = str(exc)
+            return summary
+        summary.pending_reserved_risk_money = sum(item.risk_money for item in observed_reservations)
+        summary.pending_reserved_margin = sum(item.margin_required or 0.0 for item in observed_reservations)
         leg_ids = send_control.list_leg_ids_for_claim(plan.claim_id)
         receipts = {leg_id: send_control.get_leg_receipt(leg_id) for leg_id in leg_ids}
         fully_attempted = len(leg_ids) == len(plan.legs) and all(r is not None for r in receipts.values())
@@ -652,10 +728,11 @@ def _run_cycle_for_hypothesis(
             summary.candidate_status = "ALREADY_PROCESSED"
             summary.cycle_status = "ALREADY_PROCESSED"
             _observe_claim_legs(send_control, plan.claim_id, summary, total_legs=len(plan.legs))
-            summary.outcomes_ingested = _capture_outcomes_report_only(
-                outcome_control=outcome_control, send_control=send_control,
-                authorization_control=authorization_control, account=args.account, deals_csv=deals_csv, now=now,
-            )
+            if not args.dry_run:
+                summary.outcomes_ingested = _capture_outcomes_report_only(
+                    outcome_control=outcome_control, send_control=send_control,
+                    authorization_control=authorization_control, account=args.account, deals_csv=deals_csv, now=now,
+                )
             return summary
 
         # Some legs are genuinely unattempted -- resumable through
@@ -666,6 +743,10 @@ def _run_cycle_for_hypothesis(
         # this state WITHOUT ever reaching it.
         summary.candidate_status = "RESUMABLE"
         _observe_claim_legs(send_control, plan.claim_id, summary, total_legs=len(plan.legs))
+        if unmapped_active:
+            summary.cycle_status = "UNMAPPED_ACTIVE_PENDING_ORDER"
+            summary.risk_block_reason = ",".join(item.order_ticket for item in unmapped_active)
+            return summary
         if args.dry_run:
             summary.cycle_status = "DRY_RUN_WOULD_RESUME"
             return summary
@@ -697,6 +778,55 @@ def _run_cycle_for_hypothesis(
         )
         return summary
 
+    # Close truth is ingested before deciding whether an older symbol plan
+    # is still active.  No close evidence means the FILLED leg remains
+    # active and conservatively blocks another independent basket.
+    if not args.dry_run:
+        summary.outcomes_ingested = _capture_outcomes_report_only(
+            outcome_control=outcome_control,
+            send_control=send_control,
+            authorization_control=authorization_control,
+            account=args.account,
+            deals_csv=deals_csv,
+            now=now,
+        )
+
+    if unmapped_active:
+        summary.candidate_status = "BLOCKED"
+        summary.cycle_status = "UNMAPPED_ACTIVE_PENDING_ORDER"
+        summary.risk_block_reason = ",".join(item.order_ticket for item in unmapped_active)
+        return summary
+
+    try:
+        active_symbol_plans = send_control.list_active_execution_plans(
+            args.account, symbol=candidate.symbol
+        )
+    except SER8DemoOrderSendError as exc:
+        summary.candidate_status = "PLAN_INTEGRITY_FAILED"
+        summary.cycle_status = "FAIL_CLOSED_PLAN_INTEGRITY"
+        summary.risk_block_reason = str(exc)
+        return summary
+    if active_symbol_plans:
+        summary.candidate_status = "BLOCKED"
+        summary.active_symbol_plan = "YES"
+        summary.execution_plan_id = active_symbol_plans[0].plan_id
+        summary.cycle_status = "ACTIVE_SYMBOL_EXECUTION_PLAN"
+        summary.risk_block_reason = (
+            f"account={args.account} symbol={candidate.symbol} already has active plan "
+            f"{active_symbol_plans[0].plan_id}"
+        )
+        return summary
+
+    try:
+        pending_reservations = send_control.pending_risk_reservations(args.account)
+    except SER8DemoOrderSendError as exc:
+        summary.candidate_status = "BLOCKED"
+        summary.cycle_status = "FAIL_CLOSED_PENDING_RISK"
+        summary.risk_block_reason = str(exc)
+        return summary
+    summary.pending_reserved_risk_money = sum(item.risk_money for item in pending_reservations)
+    summary.pending_reserved_margin = sum(item.margin_required or 0.0 for item in pending_reservations)
+
     profile: RiskProfile | None = None
     if inputs.risk_profile_path.is_file():
         profile = profile_from_dict(json.loads(inputs.risk_profile_path.read_text(encoding="utf-8")))
@@ -706,6 +836,7 @@ def _run_cycle_for_hypothesis(
         registry=pipeline.registry, final_verdict=pipeline.final_verdict, login=args.account,
         account_csv=inputs.account_csv, positions_csv=inputs.positions_csv, symbols_csv=inputs.symbols_csv,
         profile=profile, correlations=inputs.correlations_path, requested_risk_pct=args.requested_risk_pct,
+        pending_reservations=pending_reservations,
         now=now,
     )
     summary.risk_state = result.decision.state
@@ -787,9 +918,13 @@ def _run_cycle_for_hypothesis(
     # plan unresumable if a later crash left legs unattempted.
     planned = build_demo_order_execution_plan(
         claim, result.decision, candidate, demo_authorization=demo_authorization, authorization=authorization,
+        now=now,
     )
     summary.execution_plan_id = planned.plan_id
     summary.resume_until = planned.resume_until or "-"
+    summary.pending_expires_at = ",".join(
+        leg.expires_at for leg in planned.legs if leg.expires_at is not None
+    ) or "-"
 
     common_files_dir = Path(args.common_files_dir).expanduser()
     real_transport = FileBridgeDemoOrderTransport(
@@ -942,7 +1077,7 @@ def run_one_cycle_for_hypotheses(
         try:
             summaries[hypothesis_id] = _run_cycle_for_hypothesis(
                 args, hypothesis_id, pipeline=prepared.pipeline, inputs=prepared.inputs,
-                deals_csv=prepared.deals_csv, now=now,
+                deals_csv=prepared.deals_csv, orders_csv=prepared.orders_csv, now=now,
             )
         except (
             ResearchEligibilityError, HypothesisTradeableScopeError, SER8ResearchRiskGateError,

@@ -8,6 +8,7 @@ import pytest
 from trademind.risk_manager import (
     AccountSnapshot,
     InstrumentSpec,
+    PendingRiskReservation,
     PortfolioSnapshot,
     PositionRisk,
     RiskProfile,
@@ -393,3 +394,58 @@ def test_decision_id_is_stable_for_identical_inputs() -> None:
 
     assert first.decision_id == second.decision_id
     assert first.decision_id.startswith(f"RM-{first.signal_id}-")
+
+
+def test_pending_reservation_is_account_symbol_correlation_margin_and_concurrency_risk() -> None:
+    pending = PendingRiskReservation(
+        leg_id="leg-eurusd",
+        symbol="EURUSD",
+        correlation_group="USD_SHORT",
+        risk_money=120.0,
+        margin_required=400.0,
+    )
+    portfolio = PortfolioSnapshot(
+        reserved_risk_money=120.0,
+        reserved_margin=400.0,
+        pending_reservations=(pending,),
+    )
+    decision = _decision(portfolio=portfolio)
+    assert decision.existing_portfolio_risk_money == pytest.approx(120.0)
+    assert decision.symbol_risk_after_money == pytest.approx(165.0)
+    assert decision.correlation_risk_after_money == pytest.approx(165.0)
+    assert decision.margin_required == pytest.approx(499.0)
+    assert portfolio.effective_open_trades == 1
+
+
+def test_cross_symbol_pending_risk_remains_global_without_becoming_a_symbol_lock() -> None:
+    pending = PendingRiskReservation(
+        leg_id="leg-eurusd",
+        symbol="EURUSD",
+        correlation_group="USD_SHORT",
+        risk_money=260.0,
+        margin_required=40.0,
+    )
+    portfolio = PortfolioSnapshot(
+        reserved_risk_money=260.0,
+        reserved_margin=40.0,
+        pending_reservations=(pending,),
+    )
+    gbp_candidate = _candidate(symbol="GBPUSD")
+    gbp_instrument = _instrument(symbol="GBPUSD", correlation_group="GBP_RISK")
+    decision = _decision(candidate=gbp_candidate, instrument=gbp_instrument, portfolio=portfolio)
+    assert decision.symbol_risk_after_money == pytest.approx(decision.actual_risk_money)
+    assert decision.correlation_risk_after_money == pytest.approx(decision.actual_risk_money)
+    assert decision.portfolio_risk_after_money == pytest.approx(260.0 + decision.actual_risk_money)
+    assert "PORTFOLIO_RISK_LIMIT" in _codes(decision)
+
+
+def test_unknown_pending_margin_fails_closed_when_margin_is_required() -> None:
+    pending = PendingRiskReservation(
+        leg_id="leg-eurusd", symbol="EURUSD", correlation_group="USD_SHORT",
+        risk_money=20.0, margin_required=None,
+    )
+    portfolio = PortfolioSnapshot(
+        reserved_risk_money=20.0, reserved_margin=0.0, pending_reservations=(pending,)
+    )
+    decision = _decision(portfolio=portfolio)
+    assert "MARGIN_MODEL_MISSING" in _codes(decision)

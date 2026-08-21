@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.5"
-#property description "TradeMind SER8 Demo Order Executor v1.5"
+#property version   "1.6"
+#property description "TradeMind SER8 Demo Order Executor v1.6"
 #property description "EXECUTOR ONLY. Reads at most one pending SER8 order"
 #property description "request per timer tick, independently verifies the"
 #property description "account/login and request identity, sends exactly"
@@ -62,6 +62,13 @@
 #property description "other column, row, or export changed; still no"
 #property description "OrderSend/CTrade call anywhere in either export"
 #property description "function."
+#property description "v1.6 eliminates unlimited pending orders. LIMIT/STOP"
+#property description "requests must carry an immutable future expiration;"
+#property description "the symbol must advertise SPECIFIED expiration and"
+#property description "CTrade submits ORDER_TIME_SPECIFIED. There is no GTC"
+#property description "fallback. Order/symbol exports now expose expiration"
+#property description "mode, expiration timestamp, and order comment for"
+#property description "deterministic legacy inventory and fail-closed audit."
 
 #include <Trade\Trade.mqh>
 
@@ -131,7 +138,8 @@ void WriteResult(
    string deal_ticket,
    string position_ticket,
    string filled_volume,
-   string filled_price)
+   string filled_price,
+   bool broker_send_performed)
 {
    int handle=FileOpen(
       ResultFilename(),
@@ -145,18 +153,18 @@ void WriteResult(
    FileWrite(
       handle,
       "claim_id","demo_account_id","symbol","retcode","retcode_description",
-      "order_ticket","deal_ticket","position_ticket","filled_volume","filled_price");
+      "order_ticket","deal_ticket","position_ticket","filled_volume","filled_price","broker_send_performed");
    FileWrite(
       handle,
       claim_id,demo_account_id,symbol,IntegerToString(retcode),retcode_description,
-      order_ticket,deal_ticket,position_ticket,filled_volume,filled_price);
+      order_ticket,deal_ticket,position_ticket,filled_volume,filled_price,(broker_send_performed ? 1 : 0));
    FileClose(handle);
 }
 
 void WriteMalformedResult(string claim_id,string demo_account_id,string symbol)
 {
    WriteResult(claim_id,demo_account_id,symbol,SER8_RETCODE_MALFORMED_REQUEST,
-      "REJECTED_BY_EXECUTOR",  "", "", "", "", "");
+      "REJECTED_BY_EXECUTOR",  "", "", "", "", "",false);
 }
 
 //--- Reads and immediately consumes (renames) any pending request file.
@@ -174,6 +182,7 @@ bool ReadAndConsumeRequest(
    double &tp,
    int    &magic,
    string &comment,
+   long   &expires_at_epoch,
    string &request_hash)
 {
    string filename=RequestFilename();
@@ -187,8 +196,8 @@ bool ReadAndConsumeRequest(
       return false;
    }
 
-   // Skip the 13-column header row.
-   for(int i=0;i<13 && !FileIsEnding(handle);i++)
+   // Skip the 14-column header row.
+   for(int i=0;i<14 && !FileIsEnding(handle);i++)
       FileReadString(handle);
 
    bool ok=true;
@@ -208,6 +217,7 @@ bool ReadAndConsumeRequest(
       tp               = StringToDouble(FileReadString(handle));
       magic            = (int)StringToInteger(FileReadString(handle));
       comment          = FileReadString(handle);
+      expires_at_epoch = (long)StringToInteger(FileReadString(handle));
       request_hash     = FileReadString(handle);
    }
    FileClose(handle);
@@ -233,10 +243,11 @@ void ProcessPendingRequest()
    string claim_id,authorization_id,demo_account_id,symbol,action,order_type,comment,request_hash;
    double volume,price,sl,tp;
    int magic;
+   long expires_at_epoch;
 
    if(!ReadAndConsumeRequest(
          claim_id,authorization_id,demo_account_id,symbol,action,order_type,
-         volume,price,sl,tp,magic,comment,request_hash))
+         volume,price,sl,tp,magic,comment,expires_at_epoch,request_hash))
       return;
 
    // Independent identity verification -- SER8 already checked this on
@@ -279,6 +290,38 @@ void ProcessPendingRequest()
       return;
    }
 
+   datetime expiration=0;
+   if(order_type=="MARKET")
+   {
+      if(expires_at_epoch!=0)
+      {
+         WriteMalformedResult(claim_id,demo_account_id,symbol);
+         Print("TradeMind demo executor: MARKET request carried a pending expiration; rejected.");
+         return;
+      }
+   }
+   else if(order_type=="LIMIT" || order_type=="STOP")
+   {
+      long expiration_modes=SymbolInfoInteger(symbol,SYMBOL_EXPIRATION_MODE);
+      if((expiration_modes & SYMBOL_EXPIRATION_SPECIFIED)==0)
+      {
+         WriteMalformedResult(claim_id,demo_account_id,symbol);
+         Print("TradeMind demo executor: PENDING_EXPIRATION_UNSUPPORTED for ",symbol,
+               "; ORDER_TIME_GTC fallback is forbidden.");
+         return;
+      }
+      datetime server_now=TimeTradeServer();
+      if(server_now<=0)
+         server_now=TimeCurrent();
+      expiration=(datetime)expires_at_epoch;
+      if(price<=0 || expires_at_epoch<=0 || expiration<=server_now)
+      {
+         WriteMalformedResult(claim_id,demo_account_id,symbol);
+         Print("TradeMind demo executor: PENDING_TTL_EXPIRED or invalid pending price/expiration; rejected.");
+         return;
+      }
+   }
+
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpDeviationPoints);
 
@@ -293,16 +336,16 @@ void ProcessPendingRequest()
    else if(order_type=="LIMIT")
    {
       if(action=="BUY")
-         sent=trade.BuyLimit(volume,price,symbol,sl,tp,ORDER_TIME_GTC,0,comment);
+         sent=trade.BuyLimit(volume,price,symbol,sl,tp,ORDER_TIME_SPECIFIED,expiration,comment);
       else
-         sent=trade.SellLimit(volume,price,symbol,sl,tp,ORDER_TIME_GTC,0,comment);
+         sent=trade.SellLimit(volume,price,symbol,sl,tp,ORDER_TIME_SPECIFIED,expiration,comment);
    }
    else if(order_type=="STOP")
    {
       if(action=="BUY")
-         sent=trade.BuyStop(volume,price,symbol,sl,tp,ORDER_TIME_GTC,0,comment);
+         sent=trade.BuyStop(volume,price,symbol,sl,tp,ORDER_TIME_SPECIFIED,expiration,comment);
       else
-         sent=trade.SellStop(volume,price,symbol,sl,tp,ORDER_TIME_GTC,0,comment);
+         sent=trade.SellStop(volume,price,symbol,sl,tp,ORDER_TIME_SPECIFIED,expiration,comment);
    }
    else
    {
@@ -321,7 +364,7 @@ void ProcessPendingRequest()
    WriteResult(
       claim_id,demo_account_id,symbol,(int)retcode,retcode_description,
       IntegerToString(order_ticket),IntegerToString(deal_ticket),"",
-      DoubleToString(filled_volume,8),DoubleToString(filled_price,8));
+      DoubleToString(filled_volume,8),DoubleToString(filled_price,8),true);
 
    Print("TradeMind demo executor: processed claim ",claim_id,
          " sent=",sent," retcode=",retcode," (",retcode_description,")");
@@ -595,7 +638,8 @@ bool ExportSymbolSnapshot()
       handle,
       "time_msc","account_login","server","currency","symbol","digits","trade_mode","bid","ask",
       "tick_size","tick_value","tick_value_profit","tick_value_loss","volume_min","volume_max","volume_step",
-      "contract_size","margin_initial","margin_maintenance","margin_buy_per_volume","margin_sell_per_volume","leverage"
+      "contract_size","margin_initial","margin_maintenance","margin_buy_per_volume","margin_sell_per_volume","leverage",
+      "expiration_mode_flags"
    );
 
    long captured_msc=UtcNowMsc();
@@ -645,7 +689,8 @@ bool ExportSymbolSnapshot()
          DoubleToString(SymbolInfoDouble(symbol,SYMBOL_MARGIN_MAINTENANCE),8),
          DoubleToString(buy_margin,8),
          DoubleToString(sell_margin,8),
-         AccountInfoInteger(ACCOUNT_LEVERAGE)
+         AccountInfoInteger(ACCOUNT_LEVERAGE),
+         SymbolInfoInteger(symbol,SYMBOL_EXPIRATION_MODE)
       );
       written++;
    }
@@ -690,7 +735,7 @@ bool ExportOrderHistorySnapshot()
    FileWrite(
       handle,
       "time_msc","account_login","order_ticket","symbol","magic","side","order_type","volume",
-      "price","state","time_setup_msc","time_done_msc","position_id"
+      "price","state","time_setup_msc","time_done_msc","position_id","time_type","expiration_time_msc","comment"
    );
 
    long captured_msc=UtcNowMsc();
@@ -729,7 +774,10 @@ bool ExportOrderHistorySnapshot()
          "PLACED",
          (long)OrderGetInteger(ORDER_TIME_SETUP_MSC),
          0,
-         0
+         0,
+         EnumTail(EnumToString((ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME)),"ORDER_TIME_"),
+         (long)OrderGetInteger(ORDER_TIME_EXPIRATION)*1000,
+         OrderGetString(ORDER_COMMENT)
       );
       written++;
    }
@@ -787,7 +835,10 @@ bool ExportOrderHistorySnapshot()
             EnumTail(EnumToString(state),"ORDER_STATE_"),
             (long)HistoryOrderGetInteger(ticket,ORDER_TIME_SETUP_MSC),
             (long)HistoryOrderGetInteger(ticket,ORDER_TIME_DONE_MSC),
-            (long)HistoryOrderGetInteger(ticket,ORDER_POSITION_ID)
+            (long)HistoryOrderGetInteger(ticket,ORDER_POSITION_ID),
+            EnumTail(EnumToString((ENUM_ORDER_TYPE_TIME)HistoryOrderGetInteger(ticket,ORDER_TYPE_TIME)),"ORDER_TIME_"),
+            (long)HistoryOrderGetInteger(ticket,ORDER_TIME_EXPIRATION)*1000,
+            HistoryOrderGetString(ticket,ORDER_COMMENT)
          );
          written++;
       }

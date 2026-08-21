@@ -194,7 +194,7 @@ from pathlib import Path
 from typing import Protocol
 
 from trademind.discovery.hypothesis_registry import HypothesisRegistry
-from trademind.risk_manager import RiskDecision, SizedOrder
+from trademind.risk_manager import PendingRiskReservation, RiskDecision, SizedOrder
 from trademind.ser8_demo_account_safety_gate import (
     DemoAccountAllowlistV1,
     DemoAccountAuthorizationV1,
@@ -248,16 +248,14 @@ VALID_ORDER_TYPES = {"MARKET", "LIMIT", "STOP"}
 _RETCODE_DONE = 10009
 _RETCODE_REQUOTE = 10004
 
-# Unchanged wire schema -- see the module docstring's "AUDITED, UNCHANGED
-# FOUNDATIONS" section for why this stays exactly 13 columns, in this exact
-# order, for every leg's request/result round trip.
 REQUEST_CSV_FIELDS = (
     "claim_id", "authorization_id", "demo_account_id", "symbol", "action",
-    "order_type", "volume", "price", "sl", "tp", "magic", "comment", "request_hash",
+    "order_type", "volume", "price", "sl", "tp", "magic", "comment", "expires_at_epoch", "request_hash",
 )
 RESULT_CSV_FIELDS = (
     "claim_id", "demo_account_id", "symbol", "retcode", "retcode_description",
     "order_ticket", "deal_ticket", "position_ticket", "filled_volume", "filled_price",
+    "broker_send_performed",
 )
 
 # FILLED/REJECTED/REQUOTE/PARTIAL_FILL/MALFORMED/CANCELLED are terminal --
@@ -355,6 +353,14 @@ class SER8DemoOrderResumeWindowExpiredError(SER8DemoOrderSendError):
     human reviews it."""
 
 
+class SER8PendingTTLExpiredError(SER8DemoOrderSendError):
+    """A pending leg's immutable broker expiry has already been reached.
+
+    Raised before the send-attempt guard and before transport invocation,
+    therefore it always means zero broker sends.
+    """
+
+
 def _nonempty_str(value: object, *, field_name: str) -> str:
     if type(value) is not str or not value.strip():
         raise SER8DemoOrderSendError(f"{field_name} must be a non-empty string")
@@ -404,7 +410,7 @@ class DemoOrderRequestV1:
     :func:`leg_identity`) -- byte-identical to ``parent_claim_id`` for a
     single-leg plan. ``parent_claim_id`` and ``entry_index`` are carried on
     this Python object and in the persisted JSON payload for full lineage,
-    but are NOT part of the fixed 13-column wire CSV schema (see
+    but are NOT part of the fixed 14-column wire CSV schema (see
     ``REQUEST_CSV_FIELDS``) -- the executor never needs them; it only ever
     echoes ``claim_id`` back verbatim.
     """
@@ -424,6 +430,7 @@ class DemoOrderRequestV1:
     tp: float
     magic: int
     comment: str
+    expires_at: str | None = None
     request_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -452,6 +459,17 @@ class DemoOrderRequestV1:
             raise SER8DemoOrderSendError("sl and tp must both be positive")
         if type(self.magic) is not int or self.magic <= 0:
             raise SER8DemoOrderSendError("magic must be a positive integer")
+        if self.expires_at is not None:
+            if type(self.expires_at) is not str:
+                raise SER8DemoOrderSendError("expires_at must be an ISO timestamp or None")
+            try:
+                expires_at = datetime.fromisoformat(self.expires_at)
+            except ValueError as exc:
+                raise SER8DemoOrderSendError("expires_at must be an ISO timestamp") from exc
+            if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+                raise SER8DemoOrderSendError("expires_at must be timezone-aware")
+        if self.order_type == "MARKET" and self.expires_at is not None:
+            raise SER8DemoOrderSendError("MARKET requests must not carry pending-order expires_at")
 
         object.__setattr__(
             self,
@@ -461,7 +479,7 @@ class DemoOrderRequestV1:
         canonical_json_bytes(self.to_payload())
 
     def semantic_projection(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "parent_claim_id": self.parent_claim_id,
             "entry_index": self.entry_index,
@@ -478,6 +496,12 @@ class DemoOrderRequestV1:
             "magic": self.magic,
             "comment": self.comment,
         }
+        # Omit only for legacy rows/unchanged MARKET semantics.  New pending
+        # requests always include this field and therefore bind it into the
+        # request hash.
+        if self.expires_at is not None:
+            payload["expires_at"] = self.expires_at
+        return payload
 
     def to_payload(self) -> dict[str, object]:
         payload = self.semantic_projection()
@@ -501,6 +525,10 @@ class DemoOrderRequestV1:
             "tp": repr(self.tp),
             "magic": str(self.magic),
             "comment": self.comment,
+            "expires_at_epoch": (
+                str(int(datetime.fromisoformat(self.expires_at).timestamp()))
+                if self.expires_at is not None else "0"
+            ),
             "request_hash": self.request_hash,
         }
 
@@ -543,6 +571,12 @@ def build_demo_order_leg_request(
         tp=candidate.plan.targets[0],
         magic=DEMO_EXECUTOR_MAGIC_NUMBER,
         comment=comment,
+        expires_at=(
+            (candidate.created_at.astimezone(timezone.utc) + timedelta(
+                seconds=DURABLE_RESUME_SIGNAL_FRESHNESS_CEILING_SECONDS
+            )).isoformat()
+            if sized_order.order_type != "MARKET" else None
+        ),
     )
 
 
@@ -590,6 +624,7 @@ def _request_from_payload(payload: dict[str, object]) -> DemoOrderRequestV1:
         tp=payload["tp"],
         magic=payload["magic"],
         comment=payload["comment"],
+        expires_at=payload.get("expires_at"),
     )
 
 
@@ -610,6 +645,9 @@ class DemoOrderPlanLegV1:
     volume: float
     sl: float
     tp: float
+    risk_money: float | None = None
+    margin_required: float | None = None
+    expires_at: str | None = None
     leg_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -624,6 +662,19 @@ class DemoOrderPlanLegV1:
             raise SER8DemoOrderSendError("allocation must be within (0, 1]")
         if self.sl <= 0 or self.tp <= 0:
             raise SER8DemoOrderSendError("sl and tp must both be positive")
+        if self.risk_money is not None and self.risk_money < 0:
+            raise SER8DemoOrderSendError("risk_money cannot be negative")
+        if self.margin_required is not None and self.margin_required < 0:
+            raise SER8DemoOrderSendError("margin_required cannot be negative")
+        if self.expires_at is not None:
+            try:
+                parsed_expiry = datetime.fromisoformat(self.expires_at)
+            except (TypeError, ValueError) as exc:
+                raise SER8DemoOrderSendError("pending expires_at must be an ISO timestamp") from exc
+            if parsed_expiry.tzinfo is None or parsed_expiry.utcoffset() is None:
+                raise SER8DemoOrderSendError("pending expires_at must be timezone-aware")
+        if self.order_type == "MARKET" and self.expires_at is not None:
+            raise SER8DemoOrderSendError("MARKET plan legs must not carry pending-order expires_at")
 
         object.__setattr__(
             self,
@@ -633,7 +684,7 @@ class DemoOrderPlanLegV1:
         canonical_json_bytes(self.to_payload())
 
     def semantic_projection(self) -> dict[str, object]:
-        return {
+        payload = {
             "entry_index": self.entry_index,
             "leg_id": self.leg_id,
             "order_type": self.order_type,
@@ -644,6 +695,15 @@ class DemoOrderPlanLegV1:
             "sl": self.sl,
             "tp": self.tp,
         }
+        # Conditional keys preserve the historical hash of legacy plans
+        # while binding every new plan's original risk and pending expiry.
+        if self.risk_money is not None:
+            payload["risk_money"] = self.risk_money
+        if self.margin_required is not None:
+            payload["margin_required"] = self.margin_required
+        if self.expires_at is not None:
+            payload["expires_at"] = self.expires_at
+        return payload
 
     def to_payload(self) -> dict[str, object]:
         payload = self.semantic_projection()
@@ -715,6 +775,8 @@ class DemoOrderExecutionPlanV1:
     resume_until: str | None = None
     hypothesis_id: str | None = None
     created_at: str | None = None
+    candidate_created_at: str | None = None
+    correlation_group: str | None = None
     plan_hash: str = field(init=False)
     resume_authority_hash: str | None = field(init=False)
 
@@ -744,7 +806,11 @@ class DemoOrderExecutionPlanV1:
         if tuple(leg.entry_index for leg in self.legs) != tuple(sorted(seen_indices)):
             raise SER8DemoOrderSendError("execution plan legs must be strictly ordered by entry_index")
 
-        for value, field_name in ((self.resume_until, "resume_until"), (self.created_at, "created_at")):
+        for value, field_name in (
+            (self.resume_until, "resume_until"),
+            (self.created_at, "created_at"),
+            (self.candidate_created_at, "candidate_created_at"),
+        ):
             if value is not None:
                 if type(value) is not str:
                     raise SER8DemoOrderSendError(f"{field_name} must be a string or None")
@@ -756,6 +822,8 @@ class DemoOrderExecutionPlanV1:
                     raise SER8DemoOrderSendError(f"{field_name} must be timezone-aware")
         if self.hypothesis_id is not None:
             _nonempty_str(self.hypothesis_id, field_name="hypothesis_id")
+        if self.correlation_group is not None:
+            _nonempty_str(self.correlation_group, field_name="correlation_group")
 
         # requirement 9: durable resume authority is all-or-nothing --
         # never partially inferred.
@@ -785,7 +853,7 @@ class DemoOrderExecutionPlanV1:
         canonical_json_bytes(self.to_payload())
 
     def semantic_projection(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "plan_id": self.plan_id,
             "claim_id": self.claim_id,
@@ -797,6 +865,11 @@ class DemoOrderExecutionPlanV1:
             "action": self.action,
             "legs": [leg.to_payload() for leg in self.legs],
         }
+        if self.candidate_created_at is not None:
+            payload["candidate_created_at"] = self.candidate_created_at
+        if self.correlation_group is not None:
+            payload["correlation_group"] = self.correlation_group
+        return payload
 
     def to_payload(self) -> dict[str, object]:
         payload = self.semantic_projection()
@@ -889,6 +962,10 @@ def build_demo_order_execution_plan(
     (e.g. ``run_ser8_real_demo_pipeline.py``) byte-for-byte unaffected."""
     total_legs = len(decision.orders)
     ordered = sorted(decision.orders, key=lambda order: order.entry_index)
+    pending_expires_at = (
+        candidate.created_at.astimezone(timezone.utc)
+        + timedelta(seconds=DURABLE_RESUME_SIGNAL_FRESHNESS_CEILING_SECONDS)
+    ).isoformat()
     legs = tuple(
         DemoOrderPlanLegV1(
             entry_index=order.entry_index,
@@ -900,6 +977,9 @@ def build_demo_order_execution_plan(
             volume=order.volume,
             sl=candidate.plan.stop_price,
             tp=candidate.plan.targets[0],
+            risk_money=order.risk_money,
+            margin_required=order.margin_required,
+            expires_at=(pending_expires_at if order.order_type != "MARKET" else None),
         )
         for order in ordered
     )
@@ -933,6 +1013,8 @@ def build_demo_order_execution_plan(
         resume_until=resume_until,
         hypothesis_id=hypothesis_id,
         created_at=created_at,
+        candidate_created_at=candidate.created_at.astimezone(timezone.utc).isoformat(),
+        correlation_group=decision.correlation_group,
     )
 
 
@@ -947,6 +1029,9 @@ def _plan_leg_from_payload(payload: dict[str, object]) -> DemoOrderPlanLegV1:
         volume=payload["volume"],
         sl=payload["sl"],
         tp=payload["tp"],
+        risk_money=payload.get("risk_money"),
+        margin_required=payload.get("margin_required"),
+        expires_at=payload.get("expires_at"),
     )
 
 
@@ -987,7 +1072,13 @@ def _plan_from_payload(payload: dict[str, object]) -> DemoOrderExecutionPlanV1:
         resume_until=payload.get("resume_until"),
         hypothesis_id=payload.get("hypothesis_id"),
         created_at=payload.get("created_at"),
+        candidate_created_at=payload.get("candidate_created_at"),
+        correlation_group=payload.get("correlation_group"),
     )
+    if plan.plan_hash != payload.get("plan_hash"):
+        raise SER8DemoOrderSendError(
+            f"persisted execution plan {plan.plan_id} failed its own plan_hash integrity check"
+        )
     if plan.resume_authority_hash != payload.get("resume_authority_hash"):
         raise SER8DemoOrderSendError(
             f"persisted execution plan {plan.plan_id}'s durable resume authority failed its own "
@@ -1014,6 +1105,7 @@ class DemoOrderTransportResult:
     position_ticket: str
     filled_volume: float | None
     filled_price: float | None
+    broker_send_performed: bool | None = None
 
 
 class DemoOrderTransport(Protocol):
@@ -1073,6 +1165,7 @@ class FileBridgeDemoOrderTransport:
         return self.common_files_dir / f"ser8_demo_order_result_{self.login}.csv"
 
     def send(self, request: DemoOrderRequestV1) -> DemoOrderTransportResult:
+        _validate_pending_expiration(request, now=datetime.now(timezone.utc))
         self.common_files_dir.mkdir(parents=True, exist_ok=True)
         request_path = self._request_path()
         temporary = request_path.with_suffix(request_path.suffix + ".tmp")
@@ -1121,6 +1214,10 @@ class FileBridgeDemoOrderTransport:
                 position_ticket=row.get("position_ticket", ""),
                 filled_volume=(float(row["filled_volume"]) if row.get("filled_volume") not in (None, "") else None),
                 filled_price=(float(row["filled_price"]) if row.get("filled_price") not in (None, "") else None),
+                broker_send_performed=(
+                    row.get("broker_send_performed", "").strip().lower() in {"1", "true", "yes"}
+                    if row.get("broker_send_performed", "").strip() else None
+                ),
             )
         except (KeyError, ValueError):
             return None
@@ -1132,6 +1229,22 @@ def _has_ticket(value: str | None) -> bool:
     "0"; neither counts as a real ticket."""
     text = (value or "").strip()
     return text not in ("", "0")
+
+
+def _validate_pending_expiration(request: DemoOrderRequestV1, *, now: datetime) -> None:
+    """Fail closed before file transport for every LIMIT/STOP request."""
+    if request.order_type == "MARKET":
+        return
+    if request.expires_at is None:
+        raise SER8DemoOrderSendError(
+            "PENDING_EXPIRATION_UNSUPPORTED: pending request has no immutable expires_at"
+        )
+    deadline = datetime.fromisoformat(request.expires_at).astimezone(timezone.utc)
+    captured_at = now.astimezone(timezone.utc)
+    if deadline <= captured_at:
+        raise SER8PendingTTLExpiredError(
+            f"PENDING_TTL_EXPIRED: pending request expired at {request.expires_at}; refusing broker send"
+        )
 
 
 def _is_pending_placement(result: DemoOrderTransportResult) -> bool:
@@ -1214,6 +1327,7 @@ class DemoOrderExecutionReceiptV1:
     filled_price: float | None
     result_state: str
     recorded_at: str
+    broker_send_performed: bool | None = None
     receipt_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -1251,7 +1365,7 @@ class DemoOrderExecutionReceiptV1:
         canonical_json_bytes(self.to_payload())
 
     def semantic_projection(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "plan_id": self.plan_id,
             "parent_claim_id": self.parent_claim_id,
@@ -1272,6 +1386,9 @@ class DemoOrderExecutionReceiptV1:
             "filled_price": self.filled_price,
             "result_state": self.result_state,
         }
+        if self.broker_send_performed is not None:
+            payload["broker_send_performed"] = self.broker_send_performed
+        return payload
 
     def to_payload(self) -> dict[str, object]:
         payload = self.semantic_projection()
@@ -1302,6 +1419,7 @@ def _receipt_from_payload(payload: dict[str, object]) -> DemoOrderExecutionRecei
         filled_price=payload["filled_price"],
         result_state=payload["result_state"],
         recorded_at=payload["diagnostics"]["recorded_at"],
+        broker_send_performed=payload.get("broker_send_performed"),
     )
 
 
@@ -1521,6 +1639,7 @@ class SER8DemoOrderSendControl:
         deal_ticket: str = "", position_ticket: str = "",
         requested_volume: float = 0.0, requested_price: float = 0.0,
         filled_volume: float | None = None, filled_price: float | None = None,
+        broker_send_performed: bool | None = None,
     ) -> DemoOrderExecutionReceiptV1:
         receipt = DemoOrderExecutionReceiptV1(
             schema_version=SCHEMA_VERSION,
@@ -1543,6 +1662,7 @@ class SER8DemoOrderSendControl:
             filled_price=filled_price,
             result_state=result_state,
             recorded_at=recorded_at,
+            broker_send_performed=broker_send_performed,
         )
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1684,6 +1804,11 @@ class SER8DemoOrderSendControl:
             requested_price=current.requested_price,
             filled_volume=(transport_result.filled_volume if transport_result is not None else None),
             filled_price=(transport_result.filled_price if transport_result is not None else None),
+            broker_send_performed=(
+                transport_result.broker_send_performed
+                if transport_result is not None and transport_result.broker_send_performed is not None
+                else current.broker_send_performed
+            ),
         )
 
     def recover_misclassified_pending_leg(
@@ -1845,6 +1970,10 @@ class SER8DemoOrderSendControl:
             requested_price=current.requested_price,
             filled_volume=evidence.filled_volume,
             filled_price=evidence.filled_price,
+            broker_send_performed=(
+                evidence.broker_send_performed
+                if evidence.broker_send_performed is not None else current.broker_send_performed
+            ),
         )
         if dry_run:
             # Every validation above already ran unchanged -- only the
@@ -1894,6 +2023,218 @@ class SER8DemoOrderSendControl:
                 continue
             pending.append(row["claim_id"])
         return tuple(pending)
+
+    def list_unknown_leg_ids_for_account(self, demo_account_id: str) -> tuple[str, ...]:
+        """Every UNKNOWN leg for crash recovery; read-only discovery."""
+        return tuple(
+            leg_id
+            for leg_id in self.list_leg_ids_for_account(demo_account_id)
+            if (
+                (receipt := self.get_leg_receipt(leg_id)) is not None
+                and receipt.result_state == "UNKNOWN"
+            )
+        )
+
+    def find_unknown_leg_by_request_identity(
+        self,
+        demo_account_id: str,
+        *,
+        symbol: str,
+        action: str,
+        magic: str,
+        comment: str,
+        volume: float,
+        price: float,
+    ) -> str | None:
+        """Map broker truth after accept/local-persistence crash.
+
+        Ticket cannot be used because that is exactly the field the crash
+        prevented SER8 from recording.  Matching therefore requires the
+        executor-owned comment plus every broker-exported request identity
+        field, and succeeds only when exactly one UNKNOWN leg matches.
+        """
+        matches: list[str] = []
+        for leg_id in self.list_unknown_leg_ids_for_account(demo_account_id):
+            receipt = self.get_leg_receipt(leg_id)
+            request = self.get_leg_request(leg_id)
+            if receipt is None or request is None or _has_ticket(receipt.order_ticket):
+                continue
+            if (
+                request.symbol == symbol
+                and request.action == action
+                and str(request.magic) == magic
+                and request.comment == comment
+                and abs(request.volume - volume) <= 1e-9
+                and abs(request.price - price) <= 1e-9
+            ):
+                matches.append(leg_id)
+        return matches[0] if len(matches) == 1 else None
+
+    def reconcile_unknown_leg(
+        self,
+        leg_id: str,
+        *,
+        evidence: DemoOrderTransportResult | None = None,
+        terminal_order_state: str | None = None,
+        order_ticket: str | None = None,
+        now: datetime | None = None,
+    ) -> DemoOrderExecutionReceiptV1:
+        """Recover UNKNOWN from uniquely matched authoritative broker truth.
+
+        This never calls the transport and never resends.  It is the crash
+        counterpart to :meth:`reconcile_pending_leg` for the narrow window
+        where the broker accepted an order but the local result was not
+        durably finalized.
+        """
+        if (evidence is None) == (terminal_order_state is None):
+            raise SER8DemoOrderSendError(
+                "reconcile_unknown_leg requires exactly one of evidence or terminal_order_state"
+            )
+        if terminal_order_state is not None and terminal_order_state not in {
+            "CANCELLED", "EXPIRED", "REJECTED"
+        }:
+            raise SER8DemoOrderSendError(f"unsupported terminal_order_state: {terminal_order_state!r}")
+        current = self.get_leg_receipt(leg_id)
+        request = self.get_leg_request(leg_id)
+        if current is None or request is None:
+            raise SER8DemoOrderSendError(f"UNKNOWN recovery authority missing for leg {leg_id}")
+        if current.result_state != "UNKNOWN":
+            raise SER8DemoOrderSendError(
+                f"leg {leg_id} is not UNKNOWN (result_state={current.result_state!r})"
+            )
+        captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        if evidence is not None:
+            if evidence.claim_id != leg_id:
+                raise SER8DemoOrderSendError("UNKNOWN recovery evidence claim_id mismatch")
+            new_state = _classify_result(request, evidence)
+            if new_state in {"UNKNOWN", "MALFORMED"}:
+                raise SER8DemoOrderSendError(
+                    f"UNKNOWN recovery evidence remained ambiguous ({new_state})"
+                )
+            recovered_ticket = evidence.order_ticket
+        else:
+            new_state = terminal_order_state
+            recovered_ticket = order_ticket or ""
+            if not _has_ticket(recovered_ticket):
+                raise SER8DemoOrderSendError("terminal UNKNOWN recovery requires the authoritative order_ticket")
+        return self._finalize(
+            claim_id=leg_id, plan_id=current.plan_id, parent_claim_id=current.parent_claim_id,
+            entry_index=current.entry_index, authorization_id=current.authorization_id,
+            demo_gate_hash=current.demo_gate_hash, request_hash=current.request_hash,
+            attempt_id=current.attempt_id, result_state=new_state, recorded_at=captured_at.isoformat(),
+            retcode=(evidence.retcode if evidence is not None else current.retcode),
+            retcode_description=(
+                evidence.retcode_description if evidence is not None else f"{new_state}_BY_UNKNOWN_RECOVERY"
+            ),
+            order_ticket=recovered_ticket,
+            deal_ticket=(evidence.deal_ticket if evidence is not None else ""),
+            position_ticket=(evidence.position_ticket if evidence is not None else ""),
+            requested_volume=request.volume, requested_price=request.price,
+            filled_volume=(evidence.filled_volume if evidence is not None else None),
+            filled_price=(evidence.filled_price if evidence is not None else None),
+            broker_send_performed=True,
+        )
+
+    def list_leg_ids_for_account(self, demo_account_id: str) -> tuple[str, ...]:
+        """All attempted leg identities for one account, in stable order."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT claim_id, request_json FROM ser8_mt5_demo_order_leg_receipts ORDER BY attempted_at, entry_index"
+            ).fetchall()
+        return tuple(
+            row["claim_id"]
+            for row in rows
+            if json.loads(row["request_json"]).get("demo_account_id") == demo_account_id
+        )
+
+    def find_leg_id_by_order_ticket(self, demo_account_id: str, order_ticket: str) -> str | None:
+        """Return a unique authoritative mapping, otherwise fail closed as unmapped."""
+        matches: list[str] = []
+        for leg_id in self.list_leg_ids_for_account(demo_account_id):
+            receipt = self.get_leg_receipt(leg_id)
+            if receipt is not None and receipt.order_ticket == order_ticket:
+                matches.append(leg_id)
+        return matches[0] if len(matches) == 1 else None
+
+    def list_active_execution_plans(
+        self, demo_account_id: str, *, symbol: str | None = None
+    ) -> tuple[DemoOrderExecutionPlanV1, ...]:
+        """Plans owning unattempted/pending/unknown/open-filled work.
+
+        A FILLED leg remains active until its close outcome is durably
+        captured in ``ser8_demo_trade_outcomes``.  Thus a missing broker
+        close is never guessed from elapsed time or an absent position row.
+        """
+        target_symbol = symbol.upper() if symbol else None
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT payload_json FROM ser8_mt5_demo_order_plans ORDER BY created_at"
+            ).fetchall()
+            outcome_table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ser8_demo_trade_outcomes'"
+            ).fetchone() is not None
+            closed_leg_ids = set()
+            if outcome_table:
+                closed_leg_ids = {
+                    row["leg_id"] for row in db.execute("SELECT leg_id FROM ser8_demo_trade_outcomes").fetchall()
+                }
+
+        active: list[DemoOrderExecutionPlanV1] = []
+        for row in rows:
+            plan = _plan_from_payload(json.loads(row["payload_json"]))
+            if plan.demo_account_id != demo_account_id:
+                continue
+            if target_symbol is not None and plan.symbol.upper() != target_symbol:
+                continue
+            plan_active = False
+            for leg in plan.legs:
+                receipt = self.get_leg_receipt(leg.leg_id)
+                if receipt is None or receipt.result_state in {"PENDING", "UNKNOWN"}:
+                    plan_active = True
+                    break
+                if receipt.result_state == "FILLED" and leg.leg_id not in closed_leg_ids:
+                    plan_active = True
+                    break
+            if plan_active:
+                active.append(plan)
+        return tuple(active)
+
+    def pending_risk_reservations(self, demo_account_id: str) -> tuple[PendingRiskReservation, ...]:
+        """Authoritative original risk for every PENDING/UNKNOWN leg.
+
+        UNKNOWN is intentionally treated like a broker-active pending order:
+        until reconciliation proves a terminal outcome its full reservation
+        remains.  FILLED is excluded because the MT5 positions snapshot owns
+        its position risk, preventing double counting during transition.
+        """
+        reservations: list[PendingRiskReservation] = []
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT payload_json FROM ser8_mt5_demo_order_plans ORDER BY created_at"
+            ).fetchall()
+        for row in rows:
+            plan = _plan_from_payload(json.loads(row["payload_json"]))
+            if plan.demo_account_id != demo_account_id:
+                continue
+            for leg in plan.legs:
+                receipt = self.get_leg_receipt(leg.leg_id)
+                if receipt is None or receipt.result_state not in {"PENDING", "UNKNOWN"}:
+                    continue
+                if leg.risk_money is None or plan.correlation_group is None:
+                    raise SER8DemoOrderSendError(
+                        f"PENDING_RISK_AUTHORITY_MISSING: leg {leg.leg_id} has active/unknown broker "
+                        "state but its legacy plan has no immutable original risk authority"
+                    )
+                reservations.append(
+                    PendingRiskReservation(
+                        leg_id=leg.leg_id,
+                        symbol=plan.symbol,
+                        correlation_group=plan.correlation_group,
+                        risk_money=leg.risk_money,
+                        margin_required=leg.margin_required,
+                    )
+                )
+        return tuple(reservations)
 
     def get_leg_receipt(self, leg_id: str) -> DemoOrderExecutionReceiptV1 | None:
         """Public, read-only accessor for a leg's current persisted
@@ -1971,6 +2312,14 @@ class SER8DemoOrderSendControl:
         if row is None:
             return None
         return _plan_from_payload(json.loads(row["payload_json"]))
+
+    def get_plan(self, plan_id: str) -> DemoOrderExecutionPlanV1 | None:
+        """Read one plan by its immutable plan identity."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload_json FROM ser8_mt5_demo_order_plans WHERE plan_id=?", (plan_id,)
+            ).fetchone()
+        return _plan_from_payload(json.loads(row["payload_json"])) if row is not None else None
 
     def _load_plan_for_claim(self, claim_id: str) -> DemoOrderExecutionPlanV1 | None:
         """Private counterpart of :meth:`get_plan_for_candidate`, looked
@@ -2137,6 +2486,7 @@ class SER8DemoOrderSendControl:
                 claim, decision, candidate, sized_order,
                 demo_authorization=demo_authorization, total_legs=len(plan.legs),
             )
+            _validate_pending_expiration(request, now=captured_at)
             attempt_id = _attempt_id(claim.account_id, leg.leg_id)
 
             # 9-11: atomic one-shot send-attempt guard, reserved BEFORE the
@@ -2182,6 +2532,7 @@ class SER8DemoOrderSendControl:
                 position_ticket=transport_result.position_ticket,
                 filled_volume=transport_result.filled_volume,
                 filled_price=transport_result.filled_price,
+                broker_send_performed=transport_result.broker_send_performed,
                 **common_kwargs,
             )
             leg_receipts.append(receipt)
@@ -2392,8 +2743,9 @@ class SER8DemoOrderSendControl:
                 claim_id=leg.leg_id, authorization_id=plan.authorization_id, demo_account_id=plan.demo_account_id,
                 symbol=plan.symbol, action=plan.action, order_type=leg.order_type, volume=leg.volume,
                 price=leg.planned_price, sl=leg.sl, tp=leg.tp, magic=DEMO_EXECUTOR_MAGIC_NUMBER,
-                comment=f"SER8:{leg.leg_id[-20:]}",
+                comment=f"SER8:{leg.leg_id[-20:]}", expires_at=leg.expires_at,
             )
+            _validate_pending_expiration(request, now=captured_at)
             attempt_id = _attempt_id(claim.account_id, leg.leg_id)
 
             self._reserve_leg_attempt(
@@ -2434,6 +2786,7 @@ class SER8DemoOrderSendControl:
                 position_ticket=transport_result.position_ticket,
                 filled_volume=transport_result.filled_volume,
                 filled_price=transport_result.filled_price,
+                broker_send_performed=transport_result.broker_send_performed,
                 **common_kwargs,
             )
             leg_receipts.append(receipt)

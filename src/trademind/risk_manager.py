@@ -231,21 +231,73 @@ class PositionRisk:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingRiskReservation:
+    """Original, immutable risk reserved by one broker-active pending leg.
+
+    ``risk_money`` and ``margin_required`` are copied from the original
+    :class:`SizedOrder`; they are never re-sized from current prices.  A
+    missing margin value remains explicitly unknown so a profile requiring
+    complete margin evidence can fail closed.
+    """
+
+    leg_id: str
+    symbol: str
+    correlation_group: str
+    risk_money: float
+    margin_required: float | None = None
+
+    def __post_init__(self) -> None:
+        leg_id = _text(self.leg_id)
+        symbol = _text(self.symbol).upper()
+        group = _text(self.correlation_group).upper() or symbol
+        if not leg_id or not symbol:
+            raise ValueError("pending reservation leg_id and symbol are required")
+        if self.risk_money < 0:
+            raise ValueError("pending reservation risk_money cannot be negative")
+        if self.margin_required is not None and self.margin_required < 0:
+            raise ValueError("pending reservation margin_required cannot be negative")
+        object.__setattr__(self, "leg_id", leg_id)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "correlation_group", group)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "leg_id": self.leg_id,
+            "symbol": self.symbol,
+            "correlation_group": self.correlation_group,
+            "risk_money": self.risk_money,
+            "margin_required": self.margin_required,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PortfolioSnapshot:
     positions: tuple[PositionRisk, ...] = ()
     open_trades: int = 0
     reserved_risk_money: float = 0.0
     reserved_margin: float = 0.0
+    pending_reservations: tuple[PendingRiskReservation, ...] = ()
 
     def __post_init__(self) -> None:
         if self.open_trades < 0:
             raise ValueError("open_trades cannot be negative")
         if self.reserved_risk_money < 0 or self.reserved_margin < 0:
             raise ValueError("reserved values cannot be negative")
+        if self.pending_reservations:
+            expected_risk = sum(item.risk_money for item in self.pending_reservations)
+            expected_margin = sum(item.margin_required or 0.0 for item in self.pending_reservations)
+            if abs(self.reserved_risk_money - expected_risk) > 1e-8:
+                raise ValueError("reserved_risk_money must equal the pending reservation total")
+            if abs(self.reserved_margin - expected_margin) > 1e-8:
+                raise ValueError("reserved_margin must equal the known pending margin total")
 
     @property
     def risk_complete(self) -> bool:
         return all(item.risk_money is not None for item in self.positions)
+
+    @property
+    def pending_margin_complete(self) -> bool:
+        return all(item.margin_required is not None for item in self.pending_reservations)
 
     @property
     def known_position_risk_money(self) -> float:
@@ -257,23 +309,33 @@ class PortfolioSnapshot:
 
     @property
     def effective_open_trades(self) -> int:
-        return max(self.open_trades, len(self.positions))
+        return max(self.open_trades, len(self.positions)) + len(self.pending_reservations)
 
     def symbol_risk_money(self, symbol: str) -> float:
         target = symbol.upper()
-        return sum(
+        position_risk = sum(
             item.risk_money or 0.0
             for item in self.positions
             if item.symbol == target
         )
+        pending_risk = sum(
+            item.risk_money for item in self.pending_reservations if item.symbol == target
+        )
+        return position_risk + pending_risk
 
     def correlation_risk_money(self, correlation_group: str) -> float:
         target = correlation_group.upper()
-        return sum(
+        position_risk = sum(
             item.risk_money or 0.0
             for item in self.positions
             if item.correlation_group == target
         )
+        pending_risk = sum(
+            item.risk_money
+            for item in self.pending_reservations
+            if item.correlation_group == target
+        )
+        return position_risk + pending_risk
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -282,6 +344,8 @@ class PortfolioSnapshot:
             "effective_open_trades": self.effective_open_trades,
             "reserved_risk_money": self.reserved_risk_money,
             "reserved_margin": self.reserved_margin,
+            "pending_reservations": [item.as_dict() for item in self.pending_reservations],
+            "pending_margin_complete": self.pending_margin_complete,
             "risk_complete": self.risk_complete,
             "total_risk_money": self.total_risk_money,
         }
@@ -509,6 +573,7 @@ class RiskDecision:
     venue: str
     symbol: str
     action: str
+    correlation_group: str
     risk_profile: str
     risk_basis: str
     risk_basis_money: float
@@ -551,6 +616,7 @@ class RiskDecision:
             "venue": self.venue,
             "symbol": self.symbol,
             "action": self.action,
+            "correlation_group": self.correlation_group,
             "risk_profile": self.risk_profile,
             "risk_basis": self.risk_basis,
             "risk_basis_money": self.risk_basis_money,
@@ -948,7 +1014,7 @@ def evaluate_risk(
 
     hard_check(
         "margin_model_available",
-        margin_known or not rules.require_margin_check,
+        (margin_known and positions.pending_margin_complete) or not rules.require_margin_check,
         "MARGIN_MODEL_MISSING",
         "Instrument snapshot cannot calculate required margin.",
     )
@@ -1027,6 +1093,7 @@ def evaluate_risk(
         venue=account.venue,
         symbol=candidate.symbol,
         action=candidate.plan.action,
+        correlation_group=instrument.correlation_group,
         risk_profile=rules.name,
         risk_basis=rules.risk_basis,
         risk_basis_money=basis,
@@ -1087,11 +1154,23 @@ def position_from_dict(payload: Mapping[str, Any]) -> PositionRisk:
 
 def portfolio_from_dict(payload: Mapping[str, Any]) -> PortfolioSnapshot:
     rows = payload.get("positions", [])
+    pending_rows = payload.get("pending_reservations", [])
+    pending = tuple(
+        PendingRiskReservation(
+            leg_id=_text(item.get("leg_id")),
+            symbol=_text(item.get("symbol")),
+            correlation_group=_text(item.get("correlation_group")),
+            risk_money=_number(item.get("risk_money")),
+            margin_required=_optional_number(item.get("margin_required")),
+        )
+        for item in pending_rows
+    )
     return PortfolioSnapshot(
         positions=tuple(position_from_dict(item) for item in rows),
         open_trades=int(payload.get("open_trades", 0)),
         reserved_risk_money=_number(payload.get("reserved_risk_money")),
         reserved_margin=_number(payload.get("reserved_margin")),
+        pending_reservations=pending,
     )
 
 

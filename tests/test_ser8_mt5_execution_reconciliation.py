@@ -39,6 +39,7 @@ from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
 from trademind.ser8_mt5_execution_reconciliation import (  # noqa: E402
     ReconciliationEvidenceError,
     evaluate_pending_leg,
+    inventory_active_pending_orders,
     load_deal_history,
     load_order_history,
     run_reconciliation_cycle,
@@ -611,3 +612,67 @@ def test_reconciliation_module_never_imports_metatrader5_or_constructs_authoriza
         "ExecutionAuthorizationV1(", "ExecutionAuthorizationClaimV1(", "DemoOrderTransport.send",
     ):
         assert forbidden not in source
+
+
+def test_legacy_inventory_maps_known_gtc_and_flags_unmapped_active_order(tmp_path: Path) -> None:
+    control, _ = _control(tmp_path)
+    leg_id = _seed_leg(
+        control, claim_id="EAC-legacy", entry_index=1, total_legs=1,
+        order_ticket="111", order_type="LIMIT", result_state="PENDING",
+    )
+    orders_csv = tmp_path / "orders-extended.csv"
+    extended_header = ORDER_HEADER.rstrip("\n") + ",time_type,expiration_time_msc,comment\n"
+    setup_msc = int((NOW - timedelta(minutes=20)).timestamp() * 1000)
+    orders_csv.write_text(
+        extended_header
+        + f"1,{ACCOUNT},111,EURUSD,{DEMO_EXECUTOR_MAGIC_NUMBER},BUY,BUY_LIMIT,0.01,1.15,PLACED,"
+          f"{setup_msc},0,0,GTC,0,SER8:legacy\n"
+        + f"1,{ACCOUNT},222,EURUSD,{DEMO_EXECUTOR_MAGIC_NUMBER},BUY,BUY_LIMIT,0.02,1.14,PLACED,"
+          f"{setup_msc},0,0,GTC,0,SER8:unknown\n",
+        encoding="utf-8",
+    )
+    inventory = inventory_active_pending_orders(
+        control, account=ACCOUNT, order_history=load_order_history(orders_csv), now=NOW
+    )
+    assert inventory[0].leg_id == leg_id
+    assert inventory[0].status == "MAPPED_LEGACY_GTC"
+    assert inventory[0].age_seconds == pytest.approx(1200.0)
+    assert inventory[1].leg_id is None
+    assert inventory[1].status == "UNMAPPED_ACTIVE_PENDING_ORDER"
+    assert control.transport.calls == []
+
+
+def test_broker_accept_local_receipt_crash_recovers_unknown_once_by_request_identity(tmp_path: Path) -> None:
+    control, _ = _control(tmp_path)
+    leg_id = _seed_leg(
+        control, claim_id="EAC-crash", entry_index=1, total_legs=1,
+        order_ticket="", order_type="LIMIT", result_state="UNKNOWN",
+    )
+    request = control.get_leg_request(leg_id)
+    orders_csv = tmp_path / "orders-crash.csv"
+    deals_csv = tmp_path / "deals-crash.csv"
+    extended_header = ORDER_HEADER.rstrip("\n") + ",time_type,expiration_time_msc,comment\n"
+    orders_csv.write_text(
+        extended_header
+        + f"1,{ACCOUNT},333,EURUSD,{DEMO_EXECUTOR_MAGIC_NUMBER},BUY,BUY_LIMIT,0.01,1.15,PLACED,"
+          f"1,0,0,GTC,0,{request.comment}\n",
+        encoding="utf-8",
+    )
+    _write_deals_csv(deals_csv, [])
+    result = run_reconciliation_cycle(
+        control, account=ACCOUNT, orders_csv=orders_csv, deals_csv=deals_csv, now=NOW
+    )
+    assert result.unknown_legs_seen == 1
+    assert result.unknown_recovered == 1
+    recovered = control.get_leg_receipt(leg_id)
+    assert recovered.result_state == "PENDING"
+    assert recovered.order_ticket == "333"
+    assert recovered.broker_send_performed is True
+    assert control.transport.calls == []
+
+    again = run_reconciliation_cycle(
+        control, account=ACCOUNT, orders_csv=orders_csv, deals_csv=deals_csv, now=NOW + timedelta(seconds=1)
+    )
+    assert again.unknown_legs_seen == 0
+    assert control.get_leg_receipt(leg_id).order_ticket == "333"
+    assert control.transport.calls == []

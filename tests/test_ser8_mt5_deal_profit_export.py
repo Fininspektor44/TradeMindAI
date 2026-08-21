@@ -46,10 +46,10 @@ def _mql5_header_fields(body: str) -> list[str]:
     return re.findall(r'"([^"]+)"', match.group(1))
 
 
-def test_version_bumped_to_1_5() -> None:
+def test_version_includes_or_supersedes_profit_export_v1_5() -> None:
     source = _source()
-    assert '#property version   "1.5"' in source
-    assert "TradeMind SER8 Demo Order Executor v1.5" in source
+    assert '#property version   "1.6"' in source
+    assert "v1.5 adds ONE new read-only column" in source
 
 
 def test_deal_header_gained_profit_as_the_last_column() -> None:

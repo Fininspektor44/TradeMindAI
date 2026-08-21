@@ -239,8 +239,11 @@ def _seed_leg(
             DemoOrderPlanLegV1(
                 entry_index=entry_index, leg_id=leg_id, order_type=order_type, planned_price=price,
                 effective_entry_price=price, allocation=1.0, volume=volume, sl=1.0, tp=1.3,
+                risk_money=10.0, margin_required=5.0,
+                expires_at=((now + timedelta(seconds=900)).isoformat() if order_type != "MARKET" else None),
             ),
         ),
+        candidate_created_at=now.isoformat(), correlation_group=symbol,
     )
     control._persist_plan(plan, created_at=now.isoformat())
     request = DemoOrderRequestV1(
@@ -248,6 +251,7 @@ def _seed_leg(
         authorization_id=plan.authorization_id, demo_account_id=account, symbol=symbol, action=action,
         order_type=order_type, volume=volume, price=price, sl=1.0, tp=1.3, magic=DEMO_EXECUTOR_MAGIC_NUMBER,
         comment=f"SER8:{leg_id[-20:]}",
+        expires_at=((now + timedelta(seconds=900)).isoformat() if order_type != "MARKET" else None),
     )
 
     class _FakeAuth:
@@ -771,6 +775,47 @@ def test_existing_pending_leg_is_observed_not_resent(tmp_path: Path) -> None:
     assert summary.broker_sends_this_cycle == 0
 
 
+def test_active_symbol_plan_blocks_a_new_same_symbol_candidate_with_zero_sends(tmp_path: Path, monkeypatch) -> None:
+    chain = _prepared_chain(tmp_path, signal_id="sig-old-active")
+    registry = HypothesisRegistry(chain.db_path)
+    control = SER8DemoOrderSendControl(registry=registry, transport=FakeDemoOrderTransport())
+    _seed_leg(
+        control, claim_id="sig-old-active", result_state="PENDING",
+        order_ticket="551", deal_ticket="0", position_ticket="0",
+    )
+    _write_candidate_journal_with_action(
+        chain.data_root, signal_id="sig-new-same-symbol", action="BUY",
+        observed_at=datetime.now(timezone.utc),
+    )
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    summary = worker_module.run_one_cycle(_worker_args(chain))
+    assert summary.cycle_status == "ACTIVE_SYMBOL_EXECUTION_PLAN"
+    assert summary.active_symbol_plan == "YES"
+    assert summary.broker_sends_this_cycle == 0
+    assert fake.calls == []
+
+
+def test_unmapped_magic_owned_active_pending_order_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    chain = _prepared_chain(tmp_path, signal_id="sig-unmapped")
+    orders_csv = chain.data_root / "mt5" / f"mt5_risk_orders_utc_{_ACCOUNT}.csv"
+    orders_csv.write_text(
+        "time_msc,account_login,order_ticket,symbol,magic,side,order_type,volume,price,state,"
+        "time_setup_msc,time_done_msc,position_id,time_type,expiration_time_msc,comment\n"
+        f"1,{_ACCOUNT},999001,{_SYMBOL},{DEMO_EXECUTOR_MAGIC_NUMBER},BUY,BUY_LIMIT,0.01,1998.0,"
+        "PLACED,1,0,0,GTC,0,SER8:unmapped\n",
+        encoding="utf-8",
+    )
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+    summary = worker_module.run_one_cycle(_worker_args(chain))
+    assert summary.cycle_status == "UNMAPPED_ACTIVE_PENDING_ORDER"
+    assert "999001" in summary.risk_block_reason
+    assert summary.broker_sends_this_cycle == 0
+    assert fake.calls == []
+
+
 # ---------------------------------------------------------------------------
 # 14/24: existing FILLED execution -- observed; outcome capture ingests
 # BUY/IN + SELL/OUT deal history once close evidence exists.
@@ -835,7 +880,7 @@ def test_existing_filled_leg_observed_and_outcome_captured_on_close_evidence(tmp
 # ---------------------------------------------------------------------------
 
 
-def test_worker_never_imports_or_calls_reconciliation_module() -> None:
+def test_worker_uses_reconciliation_exports_read_only_and_never_reconciles() -> None:
     source = Path(worker_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     imported_modules: set[str] = set()
@@ -845,8 +890,9 @@ def test_worker_never_imports_or_calls_reconciliation_module() -> None:
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 imported_modules.add(alias.name)
-    assert "trademind.ser8_mt5_execution_reconciliation" not in imported_modules
+    assert "trademind.ser8_mt5_execution_reconciliation" in imported_modules
     assert "reconcile_pending_leg" not in source
+    assert "run_reconciliation_cycle" not in source
 
 
 # ---------------------------------------------------------------------------

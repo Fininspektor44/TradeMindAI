@@ -119,6 +119,11 @@ class OrderHistoryRow:
     price: float
     state: str
     position_id: str = ""
+    order_type: str = ""
+    time_setup_msc: int = 0
+    time_type: str = ""
+    expiration_time_msc: int = 0
+    comment: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +174,11 @@ def load_order_history(path: Path) -> dict[str, OrderHistoryRow]:
             price=price,
             state=(row.get("state") or "").strip().upper(),
             position_id=(row.get("position_id") or "").strip(),
+            order_type=(row.get("order_type") or "").strip().upper(),
+            time_setup_msc=int(_to_float(row.get("time_setup_msc")) or 0),
+            time_type=(row.get("time_type") or "").strip().upper(),
+            expiration_time_msc=int(_to_float(row.get("expiration_time_msc")) or 0),
+            comment=(row.get("comment") or "").strip(),
         )
     return by_ticket
 
@@ -351,9 +361,13 @@ class ReconciliationCycleResult:
 
     account: str
     pending_legs_seen: int
+    unknown_legs_seen: int
+    unknown_recovered: int
     pending_still_open: int
     newly_filled: int
     newly_cancelled_or_rejected: int
+    newly_expired: int
+    newly_canceled: int
     ambiguous: int
     broker_sends: int
     cycle_status: str  # OK | AMBIGUOUS_PRESENT | EVIDENCE_ERROR
@@ -362,11 +376,138 @@ class ReconciliationCycleResult:
     def summary_line(self) -> str:
         return (
             f"account={self.account} pending_legs_seen={self.pending_legs_seen} "
+            f"unknown_legs_seen={self.unknown_legs_seen} unknown_recovered={self.unknown_recovered} "
             f"pending_still_open={self.pending_still_open} newly_filled={self.newly_filled} "
             f"newly_cancelled_or_rejected={self.newly_cancelled_or_rejected} "
+            f"newly_expired={self.newly_expired} newly_canceled={self.newly_canceled} "
             f"ambiguous={self.ambiguous} broker_sends={self.broker_sends} "
             f"cycle_status={self.cycle_status}"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyPendingInventoryItem:
+    account: str
+    order_ticket: str
+    symbol: str
+    side: str
+    order_type: str
+    volume: float
+    price: float
+    setup_time: str
+    age_seconds: float | None
+    magic: str
+    execution_plan_id: str | None
+    leg_id: str | None
+    candidate_id: str | None
+    status: str
+    time_type: str
+    expiration_time: str | None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "account": self.account,
+            "order_ticket": self.order_ticket,
+            "symbol": self.symbol,
+            "side": self.side,
+            "order_type": self.order_type,
+            "volume": self.volume,
+            "price": self.price,
+            "setup_time": self.setup_time,
+            "age_seconds": self.age_seconds,
+            "magic": self.magic,
+            "execution_plan_id": self.execution_plan_id,
+            "leg_id": self.leg_id,
+            "candidate_id": self.candidate_id,
+            "status": self.status,
+            "time_type": self.time_type,
+            "expiration_time": self.expiration_time,
+        }
+
+
+def inventory_active_pending_orders(
+    control: SER8DemoOrderSendControl,
+    *,
+    account: str,
+    order_history: dict[str, OrderHistoryRow],
+    now: datetime | None = None,
+) -> tuple[LegacyPendingInventoryItem, ...]:
+    """Deterministic active magic-owned pending inventory; read-only."""
+    captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    inventory: list[LegacyPendingInventoryItem] = []
+    for ticket, row in sorted(
+        order_history.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])
+    ):
+        if row.state not in _STILL_ACTIVE_STATES:
+            continue
+        leg_id = control.find_leg_id_by_order_ticket(account, ticket)
+        if leg_id is None and row.comment:
+            leg_id = control.find_unknown_leg_by_request_identity(
+                account,
+                symbol=row.symbol,
+                action=row.side,
+                magic=row.magic,
+                comment=row.comment,
+                volume=row.volume,
+                price=row.price,
+            )
+        plan_id: str | None = None
+        candidate_id: str | None = None
+        mapped = False
+        legacy = row.time_type in {"", "GTC"} or row.expiration_time_msc <= 0
+        if leg_id is not None:
+            receipt = control.get_leg_receipt(leg_id)
+            request = control.get_leg_request(leg_id)
+            if receipt is not None and request is not None:
+                mapped = (
+                    receipt.result_state in {"PENDING", "UNKNOWN"}
+                    and request.symbol == row.symbol
+                    and request.action == row.side
+                    and str(request.magic) == row.magic
+                )
+                if mapped:
+                    plan_id = receipt.plan_id
+                    plan = control.get_plan(plan_id)
+                    candidate_id = plan.candidate_signal_id if plan is not None else None
+                    legacy = legacy or request.expires_at is None
+        if not mapped:
+            leg_id = None
+            plan_id = None
+            candidate_id = None
+        setup = (
+            datetime.fromtimestamp(row.time_setup_msc / 1000, tz=timezone.utc)
+            if row.time_setup_msc > 0 else None
+        )
+        expiration = (
+            datetime.fromtimestamp(row.expiration_time_msc / 1000, tz=timezone.utc)
+            if row.expiration_time_msc > 0 else None
+        )
+        status = (
+            "MAPPED_LEGACY_GTC" if mapped and legacy else
+            "MAPPED_BOUNDED_PENDING" if mapped else
+            "UNMAPPED_ACTIVE_PENDING_ORDER"
+        )
+        inventory.append(
+            LegacyPendingInventoryItem(
+                account=account,
+                order_ticket=ticket,
+                symbol=row.symbol,
+                side=row.side,
+                order_type=row.order_type,
+                volume=row.volume,
+                price=row.price,
+                setup_time=setup.isoformat() if setup else "",
+                age_seconds=max(0.0, (captured_at - setup).total_seconds()) if setup else None,
+                magic=row.magic,
+                execution_plan_id=plan_id,
+                leg_id=leg_id,
+                candidate_id=candidate_id,
+                status=status,
+                time_type=row.time_type or "UNKNOWN",
+                expiration_time=expiration.isoformat() if expiration else None,
+            )
+        )
+    return tuple(inventory)
 
 
 def run_reconciliation_cycle(
@@ -387,19 +528,116 @@ def run_reconciliation_cycle(
     skipping legs against partial/guessed evidence.
     """
     captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    leg_ids = control.list_pending_leg_ids_for_account(account)
+    initial_pending_leg_ids = control.list_pending_leg_ids_for_account(account)
+    unknown_leg_ids = control.list_unknown_leg_ids_for_account(account)
 
     try:
         order_history = load_order_history(orders_csv)
         deal_history = load_deal_history(deals_csv)
     except ReconciliationEvidenceError as exc:
         return ReconciliationCycleResult(
-            account=account, pending_legs_seen=len(leg_ids), pending_still_open=0, newly_filled=0,
-            newly_cancelled_or_rejected=0, ambiguous=len(leg_ids), broker_sends=0,
+            account=account, pending_legs_seen=len(initial_pending_leg_ids),
+            unknown_legs_seen=len(unknown_leg_ids), unknown_recovered=0,
+            pending_still_open=0, newly_filled=0,
+            newly_cancelled_or_rejected=0, newly_expired=0, newly_canceled=0,
+            ambiguous=len(initial_pending_leg_ids) + len(unknown_leg_ids), broker_sends=0,
             cycle_status=f"EVIDENCE_ERROR: {exc}", outcomes=(),
         )
 
     outcomes: list[LegReconciliationOutcome] = []
+    recovered_unknown = 0
+    unknown_matches: dict[str, list[OrderHistoryRow]] = {leg_id: [] for leg_id in unknown_leg_ids}
+    for row in order_history.values():
+        if not row.comment:
+            continue
+        leg_id = control.find_unknown_leg_by_request_identity(
+            account,
+            symbol=row.symbol,
+            action=row.side,
+            magic=row.magic,
+            comment=row.comment,
+            volume=row.volume,
+            price=row.price,
+        )
+        if leg_id is not None:
+            unknown_matches.setdefault(leg_id, []).append(row)
+
+    for leg_id in unknown_leg_ids:
+        matches = unknown_matches.get(leg_id, [])
+        if len(matches) != 1:
+            outcomes.append(
+                LegReconciliationOutcome(
+                    leg_id,
+                    "AMBIGUOUS",
+                    "UNKNOWN crash recovery requires exactly one broker order matching comment/request identity",
+                )
+            )
+            continue
+        row = matches[0]
+        request = control.get_leg_request(leg_id)
+        if request is None:
+            outcomes.append(LegReconciliationOutcome(leg_id, "AMBIGUOUS", "UNKNOWN request missing"))
+            continue
+        if row.state in _STILL_ACTIVE_STATES:
+            evidence = DemoOrderTransportResult(
+                claim_id=leg_id, demo_account_id=account, symbol=row.symbol, retcode=10009,
+                retcode_description="PENDING (recovered after local receipt crash)",
+                order_ticket=row.order_ticket, deal_ticket="0", position_ticket="0",
+                filled_volume=row.volume, filled_price=0.0, broker_send_performed=True,
+            )
+            if not dry_run:
+                control.reconcile_unknown_leg(leg_id, evidence=evidence, now=captured_at)
+            recovered_unknown += 1
+            outcomes.append(
+                LegReconciliationOutcome(
+                    leg_id, "UNKNOWN_RECOVERED",
+                    "would recover UNKNOWN to PENDING (dry-run)" if dry_run else "recovered UNKNOWN to PENDING",
+                    "PENDING",
+                )
+            )
+        elif row.state in _FILLED_STATES:
+            matching_deals = [
+                deal for deal in deal_history.get(row.order_ticket, [])
+                if deal.symbol == request.symbol and deal.side == request.action
+                and (not deal.magic or deal.magic == str(request.magic))
+            ]
+            if not matching_deals:
+                outcomes.append(
+                    LegReconciliationOutcome(
+                        leg_id, "AMBIGUOUS", "UNKNOWN matched FILLED order but no matching deal exists"
+                    )
+                )
+                continue
+            deal = matching_deals[-1]
+            evidence = DemoOrderTransportResult(
+                claim_id=leg_id, demo_account_id=account, symbol=row.symbol, retcode=10009,
+                retcode_description="FILLED (recovered after local receipt crash)",
+                order_ticket=row.order_ticket, deal_ticket=deal.deal_ticket, position_ticket=deal.position_id,
+                filled_volume=deal.volume, filled_price=deal.price, broker_send_performed=True,
+            )
+            if not dry_run:
+                control.reconcile_unknown_leg(leg_id, evidence=evidence, now=captured_at)
+            recovered_unknown += 1
+            outcomes.append(LegReconciliationOutcome(leg_id, "NEWLY_FILLED", "recovered UNKNOWN to FILLED", "FILLED"))
+        elif row.state in _TERMINAL_NONFILL_STATES:
+            terminal_state = _NONFILL_STATE_TO_LEG_STATE[row.state]
+            if not dry_run:
+                control.reconcile_unknown_leg(
+                    leg_id, terminal_order_state=terminal_state,
+                    order_ticket=row.order_ticket, now=captured_at,
+                )
+            recovered_unknown += 1
+            outcomes.append(
+                LegReconciliationOutcome(
+                    leg_id, "NEWLY_TERMINAL", f"recovered UNKNOWN to {terminal_state}", terminal_state
+                )
+            )
+        else:
+            outcomes.append(
+                LegReconciliationOutcome(leg_id, "AMBIGUOUS", f"unrecognized order-history state {row.state!r}")
+            )
+
+    leg_ids = control.list_pending_leg_ids_for_account(account) if not dry_run else initial_pending_leg_ids
     for leg_id in leg_ids:
         outcomes.append(
             evaluate_pending_leg(
@@ -411,12 +649,21 @@ def run_reconciliation_cycle(
     still_open = sum(1 for o in outcomes if o.status == "STILL_OPEN")
     newly_filled = sum(1 for o in outcomes if o.status == "NEWLY_FILLED")
     newly_terminal = sum(1 for o in outcomes if o.status == "NEWLY_TERMINAL")
+    newly_expired = sum(
+        1 for o in outcomes if o.status == "NEWLY_TERMINAL" and o.new_result_state == "EXPIRED"
+    )
+    newly_canceled = sum(
+        1 for o in outcomes if o.status == "NEWLY_TERMINAL" and o.new_result_state == "CANCELLED"
+    )
     ambiguous = sum(1 for o in outcomes if o.status == "AMBIGUOUS")
     cycle_status = "AMBIGUOUS_PRESENT" if ambiguous else "OK"
 
     return ReconciliationCycleResult(
-        account=account, pending_legs_seen=len(leg_ids), pending_still_open=still_open,
+        account=account, pending_legs_seen=len(leg_ids),
+        unknown_legs_seen=len(unknown_leg_ids), unknown_recovered=recovered_unknown,
+        pending_still_open=still_open,
         newly_filled=newly_filled, newly_cancelled_or_rejected=newly_terminal, ambiguous=ambiguous,
+        newly_expired=newly_expired, newly_canceled=newly_canceled,
         broker_sends=0, cycle_status=cycle_status, outcomes=tuple(outcomes),
     )
 
@@ -426,10 +673,12 @@ __all__ = [
     "ORDER_HISTORY_REQUIRED_FIELDS",
     "DealHistoryRow",
     "LegReconciliationOutcome",
+    "LegacyPendingInventoryItem",
     "OrderHistoryRow",
     "ReconciliationCycleResult",
     "ReconciliationEvidenceError",
     "evaluate_pending_leg",
+    "inventory_active_pending_orders",
     "load_deal_history",
     "load_order_history",
     "run_reconciliation_cycle",
