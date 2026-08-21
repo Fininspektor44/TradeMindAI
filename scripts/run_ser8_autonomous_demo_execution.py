@@ -444,9 +444,10 @@ def _capture_outcomes(
     deals_csv: Path,
     now: datetime,
 ) -> int:
-    """Runs the outcome-capture bridge for every currently-FILLED leg on
-    this account. Returns how many outcomes were NEWLY captured this
-    cycle (already-captured legs are untouched, idempotent no-ops).
+    """Runs the outcome bridge for every position-bearing leg on this
+    account (FILLED or position-bearing PARTIAL_FILL). Returns how many outcomes were NEWLY captured this
+    cycle (already-captured legs are untouched, idempotent no-ops), then
+    durably records every now-complete aggregate execution-plan outcome.
     "Still open, no close evidence yet" is never an error. A
     structurally invalid deals export IS reported (via
     ``SER8DemoTradeOutcomeError``) -- but never here: outcome capture is
@@ -467,6 +468,13 @@ def _capture_outcomes(
         )
         if already is None and outcome is not None:
             newly_captured += 1
+    # This is the final symbol-lock release authority. It can only persist
+    # after every entry leg is terminal and every FILLED leg has its final,
+    # fully-closed broker outcome above. The count intentionally remains
+    # the public per-leg ``outcomes_ingested`` metric for compatibility.
+    outcome_control.capture_completed_plan_outcomes(
+        send_control=send_control, account=account, now=now
+    )
     return newly_captured
 
 
@@ -941,7 +949,7 @@ def _run_cycle_for_hypothesis(
         total_legs=len(result.decision.orders), success_status="EXECUTION_COMPLETE",
     )
 
-    summary.outcomes_ingested = _capture_outcomes_report_only(
+    summary.outcomes_ingested += _capture_outcomes_report_only(
         outcome_control=outcome_control, send_control=real_send_control,
         authorization_control=authorization_control, account=args.account, deals_csv=deals_csv, now=now,
     )

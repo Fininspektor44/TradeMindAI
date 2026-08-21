@@ -1,7 +1,8 @@
 """SER8 Demo Trade Outcome Capture V1: the narrowest authoritative bridge
 from CLOSED broker evidence (the unified executor's own
 ``mt5_risk_deals_utc_<login>.csv`` export) to a durable SER8 outcome
-record for one already-FILLED execution leg. Deliberately STOPS there --
+record for one position-bearing FILLED/PARTIAL_FILL execution leg.
+Deliberately STOPS there --
 this module is NOT the future Analytics Core; it persists exactly the
 fields listed in the SER8 AUTONOMOUS CONTINUOUS DEMO EXECUTION V1 task
 spec's own OUTCOME CAPTURE section and nothing more.
@@ -21,10 +22,10 @@ module, nothing in this codebase ever read that CLOSE deal -- a real,
 proven demo trade's own realized P/L (``EAC-67206924-2e40988a6cd689d6``,
 +39.90 USD) was observed by a human directly in the MT5 terminal, not
 captured anywhere durable. This module adds exactly that narrow, missing
-read: given an already-FILLED leg's own ``position_ticket``, scan the SAME
-deal-history export automatic reconciliation already reads for every
-``DEAL_ENTRY_OUT`` deal on that position, and, if authoritative broker
-evidence for a close exists, persist one outcome record.
+read: given a position-bearing leg's own ``position_ticket``, scan the
+SAME deal-history export automatic reconciliation already reads for every
+``DEAL_ENTRY_OUT`` deal on that position, and persist one outcome record
+only when authoritative exit evidence covers the full filled volume.
 
 SAFETY: this module never imports MetaTrader5, never constructs a
 ``DemoOrderTransport``/calls ``.send()`` on one, never touches SL/TP,
@@ -33,7 +34,8 @@ execution plan -- it only ever READS
 ``SER8DemoOrderSendControl.get_leg_receipt``/``get_leg_request`` and
 ``SER8ExecutionAuthorizationControl.get_authorization`` (both already
 public, read-only, pre-existing accessors) and WRITES to its own new,
-additive table. A position with no ``DEAL_ENTRY_OUT`` evidence yet is
+additive outcome tables. A position with no complete ``DEAL_ENTRY_OUT``
+evidence yet is
 simply still open -- this module never infers a close from a candle,
 from time passing, or from the position's absence in a snapshot; "no
 evidence yet" always means "not captured yet", never a guess.
@@ -53,6 +55,12 @@ from trademind.ser8_execution_authorization import (
     ExecutionAuthorizationV1,
     SER8ExecutionAuthorizationControl,
 )
+from trademind.ser8_execution_plan_outcome import (
+    SCHEMA_VERSION as PLAN_OUTCOME_SCHEMA_VERSION,
+    TERMINAL_ENTRY_STATES,
+    DemoExecutionPlanOutcomeV1,
+    execution_plan_outcome_from_payload,
+)
 from trademind.ser8_mt5_demo_order_send import (
     DEMO_EXECUTOR_MAGIC_NUMBER,
     SER8DemoOrderSendControl,
@@ -70,8 +78,8 @@ DEAL_HISTORY_OUTCOME_FIELDS = (
 
 class SER8DemoTradeOutcomeError(RuntimeError):
     """Raised for a structurally invalid deal-history export, an unknown
-    leg, or a leg that is not (yet) FILLED -- always before anything is
-    persisted."""
+    leg, or a leg that does not own a filled position -- always before
+    anything is persisted."""
 
 
 def _nonempty_str(value: object, *, field_name: str) -> str:
@@ -82,10 +90,10 @@ def _nonempty_str(value: object, *, field_name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class DemoTradeOutcomeV1:
-    """Immutable, auditable CLOSED-trade outcome record for ONE execution
-    leg -- persisted only once authoritative broker evidence of a close
-    (at least one ``DEAL_ENTRY_OUT`` deal on the leg's own
-    ``position_ticket``) exists. Carries no invented/inferred field:
+    """Immutable, auditable CLOSED-trade outcome record for ONE position-
+    bearing execution leg -- persisted only once authoritative broker
+    ``DEAL_ENTRY_OUT`` evidence on the leg's own ``position_ticket``
+    covers its full filled volume. Carries no invented/inferred field:
     ``realized_pl`` is ``None`` whenever the broker evidence itself did
     not supply a parseable ``profit`` value, never computed by this
     module."""
@@ -116,6 +124,8 @@ class DemoTradeOutcomeV1:
     realized_pl: float | None
     terminal_reason: str
     captured_at: str
+    entry_filled_volume: float | None = None
+    closed_volume: float | None = None
     outcome_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -144,6 +154,15 @@ class DemoTradeOutcomeV1:
             raise SER8DemoTradeOutcomeError("side must be BUY or SELL")
         if not self.exit_deal_tickets:
             raise SER8DemoTradeOutcomeError("exit_deal_tickets must contain at least one deal ticket")
+        if (self.entry_filled_volume is None) != (self.closed_volume is None):
+            raise SER8DemoTradeOutcomeError(
+                "entry_filled_volume and closed_volume must be supplied together"
+            )
+        if self.entry_filled_volume is not None:
+            if self.entry_filled_volume <= 0 or self.closed_volume < self.entry_filled_volume - 1e-9:
+                raise SER8DemoTradeOutcomeError(
+                    "closed_volume must cover the positive entry_filled_volume"
+                )
 
         object.__setattr__(
             self, "outcome_hash",
@@ -152,7 +171,7 @@ class DemoTradeOutcomeV1:
         canonical_json_bytes(self.to_payload())
 
     def semantic_projection(self) -> dict[str, object]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "leg_id": self.leg_id,
             "plan_id": self.plan_id,
@@ -179,6 +198,12 @@ class DemoTradeOutcomeV1:
             "realized_pl": self.realized_pl,
             "terminal_reason": self.terminal_reason,
         }
+        # Conditional fields keep legacy outcome hashes reconstructable,
+        # while every new final outcome binds full-close volume proof.
+        if self.entry_filled_volume is not None:
+            payload["entry_filled_volume"] = self.entry_filled_volume
+            payload["closed_volume"] = self.closed_volume
+        return payload
 
     def to_payload(self) -> dict[str, object]:
         payload = self.semantic_projection()
@@ -187,8 +212,9 @@ class DemoTradeOutcomeV1:
         return payload
 
 
-def _outcome_from_payload(payload: dict[str, object]) -> DemoTradeOutcomeV1:
-    return DemoTradeOutcomeV1(
+def demo_trade_outcome_from_payload(payload: dict[str, object]) -> DemoTradeOutcomeV1:
+    """Reconstruct and integrity-check one persisted filled-leg outcome."""
+    outcome = DemoTradeOutcomeV1(
         schema_version=payload["schema_version"],
         leg_id=payload["leg_id"],
         plan_id=payload["plan_id"],
@@ -215,7 +241,14 @@ def _outcome_from_payload(payload: dict[str, object]) -> DemoTradeOutcomeV1:
         realized_pl=payload["realized_pl"],
         terminal_reason=payload["terminal_reason"],
         captured_at=payload["captured_at"],
+        entry_filled_volume=payload.get("entry_filled_volume"),
+        closed_volume=payload.get("closed_volume"),
     )
+    if outcome.outcome_hash != payload.get("outcome_hash"):
+        raise SER8DemoTradeOutcomeError(
+            f"persisted trade outcome for leg {outcome.leg_id} failed its integrity check"
+        )
+    return outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,7 +322,7 @@ def _load_close_deals_for_position(
 
 
 class SER8DemoTradeOutcomeControl:
-    """Owns one new, additive SQLite table in the same database file as
+    """Owns additive SQLite outcome tables in the same database file as
     ``HypothesisRegistry`` (``registry.path``). Never modifies
     ``HypothesisRegistry``'s, ``SER8DemoOrderSendControl``'s, or
     ``SER8ExecutionAuthorizationControl``'s own schema, tables, or
@@ -318,6 +351,15 @@ class SER8DemoTradeOutcomeControl:
                     captured_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ser8_demo_execution_plan_outcomes (
+                    plan_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ser8_demo_execution_plan_outcomes_account_symbol_idx
+                    ON ser8_demo_execution_plan_outcomes(account_id, symbol);
                 """
             )
 
@@ -331,7 +373,18 @@ class SER8DemoTradeOutcomeControl:
             ).fetchone()
         if row is None:
             return None
-        return _outcome_from_payload(json.loads(row["payload_json"]))
+        return demo_trade_outcome_from_payload(json.loads(row["payload_json"]))
+
+    def get_execution_plan_outcome(self, plan_id: str) -> DemoExecutionPlanOutcomeV1 | None:
+        """Return one verified durable aggregate plan outcome, if present."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT payload_json FROM ser8_demo_execution_plan_outcomes WHERE plan_id=?",
+                (plan_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return execution_plan_outcome_from_payload(json.loads(row["payload_json"]))
 
     def capture_outcome_for_leg(
         self,
@@ -343,8 +396,8 @@ class SER8DemoTradeOutcomeControl:
         magic: int = DEMO_EXECUTOR_MAGIC_NUMBER,
         now: datetime | None = None,
     ) -> DemoTradeOutcomeV1 | None:
-        """Idempotently captures the CLOSED outcome for one already-FILLED
-        execution leg, using ONLY:
+        """Idempotently captures the CLOSED outcome for one position-bearing
+        FILLED/PARTIAL_FILL execution leg, using ONLY:
 
           * ``send_control.get_leg_receipt``/``get_leg_request`` -- this
             leg's own already-persisted FILLED receipt/request (never
@@ -366,11 +419,18 @@ class SER8DemoTradeOutcomeControl:
         captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
         existing = self.get_outcome(leg_id)
-        if existing is not None:
+        if existing is not None and existing.entry_filled_volume is not None:
             return existing
 
         receipt = send_control.get_leg_receipt(leg_id)
-        if receipt is None or receipt.result_state != "FILLED":
+        if receipt is None or not (
+            receipt.result_state == "FILLED"
+            or (
+                receipt.result_state == "PARTIAL_FILL"
+                and receipt.filled_volume is not None
+                and receipt.filled_volume > 0
+            )
+        ):
             return None
         if not receipt.position_ticket or receipt.position_ticket == "0":
             return None
@@ -397,6 +457,13 @@ class SER8DemoTradeOutcomeControl:
             return None
 
         total_volume = sum(item.volume for item in close_deals)
+        if receipt.filled_volume is None or receipt.filled_volume <= 0:
+            return None
+        # An OUT deal can be only a partial close.  Do not create a final
+        # outcome until broker evidence covers the whole filled volume;
+        # elapsed time and position-snapshot absence are never substitutes.
+        if total_volume + 1e-9 < receipt.filled_volume:
+            return None
         if total_volume > 0:
             exit_price = sum(item.price * item.volume for item in close_deals) / total_volume
         else:
@@ -436,24 +503,44 @@ class SER8DemoTradeOutcomeControl:
             realized_pl=realized_pl,
             terminal_reason="CLOSED",
             captured_at=captured_at.isoformat(),
+            entry_filled_volume=receipt.filled_volume,
+            closed_volume=total_volume,
         )
 
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
-                db.execute(
-                    """
-                    INSERT INTO ser8_demo_trade_outcomes(
-                        leg_id, hypothesis_id, candidate_signal_id, account_id, captured_at, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(leg_id) DO NOTHING
-                    """,
-                    (
-                        outcome.leg_id, outcome.hypothesis_id, outcome.candidate_signal_id,
-                        outcome.account_id, outcome.captured_at,
-                        canonical_json_bytes(outcome.to_payload()).decode("utf-8"),
-                    ),
-                )
+                payload_json = canonical_json_bytes(outcome.to_payload()).decode("utf-8")
+                if existing is None:
+                    db.execute(
+                        """
+                        INSERT INTO ser8_demo_trade_outcomes(
+                            leg_id, hypothesis_id, candidate_signal_id, account_id,
+                            captured_at, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(leg_id) DO NOTHING
+                        """,
+                        (
+                            outcome.leg_id, outcome.hypothesis_id,
+                            outcome.candidate_signal_id, outcome.account_id,
+                            outcome.captured_at, payload_json,
+                        ),
+                    )
+                else:
+                    legacy_payload_json = canonical_json_bytes(existing.to_payload()).decode("utf-8")
+                    db.execute(
+                        """
+                        UPDATE ser8_demo_trade_outcomes
+                        SET hypothesis_id=?, candidate_signal_id=?, account_id=?,
+                            captured_at=?, payload_json=?
+                        WHERE leg_id=? AND payload_json=?
+                        """,
+                        (
+                            outcome.hypothesis_id, outcome.candidate_signal_id,
+                            outcome.account_id, outcome.captured_at, payload_json,
+                            outcome.leg_id, legacy_payload_json,
+                        ),
+                    )
                 db.commit()
             except Exception:
                 db.rollback()
@@ -465,11 +552,152 @@ class SER8DemoTradeOutcomeControl:
         # own possibly-discarded object.
         return self.get_outcome(leg_id)
 
+    def capture_execution_plan_outcome(
+        self,
+        plan_id: str,
+        *,
+        send_control: SER8DemoOrderSendControl,
+        now: datetime | None = None,
+    ) -> DemoExecutionPlanOutcomeV1 | None:
+        """Persist the final aggregate outcome only when the whole plan is done.
+
+        Every entry leg must have authoritative terminal receipt truth.  A
+        FILLED receipt additionally requires a verified final close outcome,
+        which itself is only captured after full broker-exit volume.  Missing,
+        pending, unknown, partial-close, or corrupt state returns ``None`` or
+        raises before the aggregate row is written, keeping the symbol active.
+        """
+        existing = self.get_execution_plan_outcome(plan_id)
+        if existing is not None:
+            return existing
+
+        plan = send_control.get_plan(plan_id)
+        if plan is None:
+            raise SER8DemoTradeOutcomeError(f"execution plan {plan_id!r} was not found")
+
+        terminal_leg_states: list[tuple[str, str]] = []
+        filled_leg_outcome_hashes: list[tuple[str, str]] = []
+        realized_values: list[float | None] = []
+        for leg in plan.legs:
+            receipt = send_control.get_leg_receipt(leg.leg_id)
+            if receipt is None or receipt.result_state not in TERMINAL_ENTRY_STATES:
+                return None
+            if receipt.plan_id != plan.plan_id:
+                raise SER8DemoTradeOutcomeError(
+                    f"leg {leg.leg_id} receipt belongs to {receipt.plan_id}, not {plan.plan_id}"
+                )
+            terminal_leg_states.append((leg.leg_id, receipt.result_state))
+            position_bearing = receipt.result_state == "FILLED" or (
+                receipt.result_state == "PARTIAL_FILL"
+                and receipt.filled_volume is not None
+                and receipt.filled_volume > 0
+            )
+            if not position_bearing:
+                continue
+
+            outcome = self.get_outcome(leg.leg_id)
+            if outcome is None:
+                return None
+            if (
+                outcome.plan_id != plan.plan_id
+                or outcome.candidate_signal_id != plan.candidate_signal_id
+                or outcome.account_id != plan.demo_account_id
+                or outcome.symbol.upper() != plan.symbol.upper()
+                or outcome.terminal_reason != "CLOSED"
+            ):
+                raise SER8DemoTradeOutcomeError(
+                    f"filled-leg outcome {leg.leg_id} does not match execution plan {plan.plan_id}"
+                )
+            if (
+                outcome.entry_filled_volume is None
+                or outcome.closed_volume is None
+                or outcome.closed_volume < outcome.entry_filled_volume - 1e-9
+            ):
+                return None
+            filled_leg_outcome_hashes.append((leg.leg_id, outcome.outcome_hash))
+            realized_values.append(outcome.realized_pl)
+
+        if not filled_leg_outcome_hashes:
+            aggregate_result = "NO_FILL_TERMINAL"
+            total_realized_pl: float | None = 0.0
+        elif any(value is None for value in realized_values):
+            aggregate_result = "CLOSED_PNL_UNKNOWN"
+            total_realized_pl = None
+        else:
+            total_realized_pl = sum(value for value in realized_values if value is not None)
+            if total_realized_pl > 1e-9:
+                aggregate_result = "CLOSED_PROFIT"
+            elif total_realized_pl < -1e-9:
+                aggregate_result = "CLOSED_LOSS"
+            else:
+                aggregate_result = "CLOSED_FLAT"
+
+        recorded_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        aggregate = DemoExecutionPlanOutcomeV1(
+            schema_version=PLAN_OUTCOME_SCHEMA_VERSION,
+            plan_id=plan.plan_id,
+            plan_hash=plan.plan_hash,
+            candidate_signal_id=plan.candidate_signal_id,
+            account_id=plan.demo_account_id,
+            symbol=plan.symbol,
+            terminal_leg_states=tuple(terminal_leg_states),
+            filled_leg_outcome_hashes=tuple(filled_leg_outcome_hashes),
+            aggregate_result=aggregate_result,
+            total_realized_pl=total_realized_pl,
+            recorded_at=recorded_at,
+        )
+
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute(
+                    """
+                    INSERT INTO ser8_demo_execution_plan_outcomes(
+                        plan_id, account_id, symbol, recorded_at, payload_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(plan_id) DO NOTHING
+                    """,
+                    (
+                        aggregate.plan_id,
+                        aggregate.account_id,
+                        aggregate.symbol,
+                        aggregate.recorded_at,
+                        canonical_json_bytes(aggregate.to_payload()).decode("utf-8"),
+                    ),
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        return self.get_execution_plan_outcome(plan.plan_id)
+
+    def capture_completed_plan_outcomes(
+        self,
+        *,
+        send_control: SER8DemoOrderSendControl,
+        account: str,
+        now: datetime | None = None,
+    ) -> int:
+        """Capture every newly-complete plan outcome for one account."""
+        captured = 0
+        for plan in send_control.list_execution_plans_for_account(account):
+            if self.get_execution_plan_outcome(plan.plan_id) is not None:
+                continue
+            outcome = self.capture_execution_plan_outcome(
+                plan.plan_id, send_control=send_control, now=now
+            )
+            if outcome is not None:
+                captured += 1
+        return captured
+
 
 __all__ = [
     "DEAL_HISTORY_OUTCOME_FIELDS",
     "SCHEMA_VERSION",
+    "PLAN_OUTCOME_SCHEMA_VERSION",
+    "DemoExecutionPlanOutcomeV1",
     "DemoTradeOutcomeV1",
     "SER8DemoTradeOutcomeControl",
     "SER8DemoTradeOutcomeError",
+    "demo_trade_outcome_from_payload",
 ]

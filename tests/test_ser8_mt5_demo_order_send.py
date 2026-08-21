@@ -3684,7 +3684,9 @@ def test_tampered_persisted_pending_expiry_fails_plan_integrity(tmp_path: Path) 
         control.get_plan(plan.plan_id)
 
 
-def test_terminal_pending_only_plan_is_inactive_and_other_symbol_is_never_inherently_blocked(tmp_path: Path) -> None:
+def test_terminal_pending_only_plan_requires_aggregate_outcome_before_unlock(tmp_path: Path) -> None:
+    from trademind.ser8_demo_trade_outcome_capture import SER8DemoTradeOutcomeControl
+
     context, claim, decision, candidate = _claim_case(tmp_path, candidate_factory=_stop_candidate)
     control = SER8DemoOrderSendControl(
         registry=context.registry,
@@ -3696,5 +3698,12 @@ def test_terminal_pending_only_plan_is_inactive_and_other_symbol_is_never_inhere
     assert control.list_active_execution_plans(LOGIN, symbol="USDJPY") == ()
 
     control.reconcile_pending_leg(claim.claim_id, terminal_order_state="CANCELLED", now=NOW)
+    # Entry truth is terminal, but the symbol remains active until the
+    # trading idea's aggregate no-fill outcome is durably recorded.
+    assert control.list_active_execution_plans(LOGIN, symbol=SYMBOL)
+    outcome_control = SER8DemoTradeOutcomeControl(registry=context.registry)
+    assert outcome_control.capture_completed_plan_outcomes(
+        send_control=control, account=LOGIN, now=NOW
+    ) == 1
     assert control.list_active_execution_plans(LOGIN, symbol=SYMBOL) == ()
     assert control.pending_risk_reservations(LOGIN) == ()

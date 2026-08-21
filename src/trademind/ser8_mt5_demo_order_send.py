@@ -203,6 +203,7 @@ from trademind.ser8_demo_account_safety_gate import (
 )
 from trademind.ser8_execution_authorization import ExecutionAuthorizationV1
 from trademind.ser8_execution_authorization_claim import ExecutionAuthorizationClaimV1
+from trademind.ser8_execution_plan_outcome import execution_plan_outcome_from_payload
 from trademind.signal_intelligence import SignalCandidate
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
 
@@ -2159,11 +2160,12 @@ class SER8DemoOrderSendControl:
     def list_active_execution_plans(
         self, demo_account_id: str, *, symbol: str | None = None
     ) -> tuple[DemoOrderExecutionPlanV1, ...]:
-        """Plans owning unattempted/pending/unknown/open-filled work.
+        """Plans whose whole trading idea has not durably finished.
 
-        A FILLED leg remains active until its close outcome is durably
-        captured in ``ser8_demo_trade_outcomes``.  Thus a missing broker
-        close is never guessed from elapsed time or an absent position row.
+        A plan remains active through unattempted/PENDING/UNKNOWN entry
+        work, every still-open FILLED position, per-leg outcome capture,
+        and final aggregate plan-outcome persistence. No timeout or mutable
+        unlock flag participates in this decision.
         """
         target_symbol = symbol.upper() if symbol else None
         with self._connect() as db:
@@ -2173,11 +2175,30 @@ class SER8DemoOrderSendControl:
             outcome_table = db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ser8_demo_trade_outcomes'"
             ).fetchone() is not None
-            closed_leg_ids = set()
+            outcome_payloads: dict[str, str] = {}
             if outcome_table:
-                closed_leg_ids = {
-                    row["leg_id"] for row in db.execute("SELECT leg_id FROM ser8_demo_trade_outcomes").fetchall()
+                outcome_payloads = {
+                    row["leg_id"]: row["payload_json"]
+                    for row in db.execute(
+                        "SELECT leg_id, payload_json FROM ser8_demo_trade_outcomes"
+                    ).fetchall()
                 }
+            plan_outcome_table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='ser8_demo_execution_plan_outcomes'"
+            ).fetchone() is not None
+            plan_outcome_payloads: dict[str, str] = {}
+            if plan_outcome_table:
+                plan_outcome_payloads = {
+                    row["plan_id"]: row["payload_json"]
+                    for row in db.execute(
+                        "SELECT plan_id, payload_json FROM ser8_demo_execution_plan_outcomes"
+                    ).fetchall()
+                }
+
+        # Local import avoids a module cycle: outcome capture imports this
+        # send control, while this read path needs its pure payload verifier.
+        from trademind.ser8_demo_trade_outcome_capture import demo_trade_outcome_from_payload
 
         active: list[DemoOrderExecutionPlanV1] = []
         for row in rows:
@@ -2187,14 +2208,64 @@ class SER8DemoOrderSendControl:
             if target_symbol is not None and plan.symbol.upper() != target_symbol:
                 continue
             plan_active = False
+            terminal_leg_states: list[tuple[str, str]] = []
+            filled_leg_outcome_hashes: list[tuple[str, str]] = []
             for leg in plan.legs:
                 receipt = self.get_leg_receipt(leg.leg_id)
-                if receipt is None or receipt.result_state in {"PENDING", "UNKNOWN"}:
+                if receipt is None or receipt.result_state not in _TERMINAL_LEG_STATES:
                     plan_active = True
                     break
-                if receipt.result_state == "FILLED" and leg.leg_id not in closed_leg_ids:
+                terminal_leg_states.append((leg.leg_id, receipt.result_state))
+                position_bearing = receipt.result_state == "FILLED" or (
+                    receipt.result_state == "PARTIAL_FILL"
+                    and receipt.filled_volume is not None
+                    and receipt.filled_volume > 0
+                )
+                if position_bearing:
+                    payload_json = outcome_payloads.get(leg.leg_id)
+                    if payload_json is None:
+                        plan_active = True
+                        break
+                    try:
+                        outcome = demo_trade_outcome_from_payload(json.loads(payload_json))
+                    except (KeyError, TypeError, ValueError, RuntimeError):
+                        plan_active = True
+                        break
+                    if (
+                        outcome.plan_id != plan.plan_id
+                        or outcome.candidate_signal_id != plan.candidate_signal_id
+                        or outcome.account_id != plan.demo_account_id
+                        or outcome.symbol.upper() != plan.symbol.upper()
+                        or outcome.terminal_reason != "CLOSED"
+                        or outcome.entry_filled_volume is None
+                        or outcome.closed_volume is None
+                        or outcome.closed_volume < outcome.entry_filled_volume - 1e-9
+                    ):
+                        plan_active = True
+                        break
+                    filled_leg_outcome_hashes.append((leg.leg_id, outcome.outcome_hash))
+
+            if not plan_active:
+                payload_json = plan_outcome_payloads.get(plan.plan_id)
+                if payload_json is None:
                     plan_active = True
-                    break
+                else:
+                    try:
+                        plan_outcome = execution_plan_outcome_from_payload(json.loads(payload_json))
+                    except (KeyError, TypeError, ValueError, RuntimeError):
+                        plan_active = True
+                    else:
+                        if (
+                            plan_outcome.plan_id != plan.plan_id
+                            or plan_outcome.plan_hash != plan.plan_hash
+                            or plan_outcome.candidate_signal_id != plan.candidate_signal_id
+                            or plan_outcome.account_id != plan.demo_account_id
+                            or plan_outcome.symbol.upper() != plan.symbol.upper()
+                            or plan_outcome.terminal_leg_states != tuple(terminal_leg_states)
+                            or plan_outcome.filled_leg_outcome_hashes
+                            != tuple(filled_leg_outcome_hashes)
+                        ):
+                            plan_active = True
             if plan_active:
                 active.append(plan)
         return tuple(active)
@@ -2321,6 +2392,17 @@ class SER8DemoOrderSendControl:
             ).fetchone()
         return _plan_from_payload(json.loads(row["payload_json"])) if row is not None else None
 
+    def list_execution_plans_for_account(
+        self, demo_account_id: str
+    ) -> tuple[DemoOrderExecutionPlanV1, ...]:
+        """Read every immutable execution plan for one account in creation order."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT payload_json FROM ser8_mt5_demo_order_plans ORDER BY created_at"
+            ).fetchall()
+        plans = tuple(_plan_from_payload(json.loads(row["payload_json"])) for row in rows)
+        return tuple(plan for plan in plans if plan.demo_account_id == demo_account_id)
+
     def _load_plan_for_claim(self, claim_id: str) -> DemoOrderExecutionPlanV1 | None:
         """Private counterpart of :meth:`get_plan_for_candidate`, looked
         up by ``claim_id`` instead -- used internally by
@@ -2336,11 +2418,14 @@ class SER8DemoOrderSendControl:
         return _plan_from_payload(json.loads(row["payload_json"]))
 
     def list_filled_leg_ids_for_account(self, demo_account_id: str) -> tuple[str, ...]:
-        """Every leg identity, across ALL claims, currently persisted
-        FILLED for this demo account -- the generic discovery entrypoint
-        an outcome-capture bridge needs (never hard-codes a specific
-        claim or ticket), mirroring :meth:`list_pending_leg_ids_for_account`
-        exactly. Read-only; never touches the transport."""
+        """Every position-bearing leg identity across all account claims.
+
+        Includes clean FILLED receipts and PARTIAL_FILL receipts carrying
+        positive filled volume. A missing position ticket remains discoverable
+        and therefore locked fail-closed. This is the generic outcome-capture
+        entrypoint; read-only, never transport-touching. The historical method
+        name remains API-compatible.
+        """
         with self._connect() as db:
             rows = db.execute(
                 "SELECT claim_id, payload_json, request_json FROM ser8_mt5_demo_order_leg_receipts "
@@ -2349,7 +2434,13 @@ class SER8DemoOrderSendControl:
         filled: list[str] = []
         for row in rows:
             payload = json.loads(row["payload_json"])
-            if payload.get("result_state") != "FILLED":
+            filled_volume = payload.get("filled_volume")
+            position_bearing = payload.get("result_state") == "FILLED" or (
+                payload.get("result_state") == "PARTIAL_FILL"
+                and isinstance(filled_volume, (int, float))
+                and filled_volume > 0
+            )
+            if not position_bearing:
                 continue
             request_payload = json.loads(row["request_json"])
             if request_payload.get("demo_account_id") != demo_account_id:

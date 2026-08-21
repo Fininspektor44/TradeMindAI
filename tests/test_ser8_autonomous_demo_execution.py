@@ -797,6 +797,122 @@ def test_active_symbol_plan_blocks_a_new_same_symbol_candidate_with_zero_sends(t
     assert fake.calls == []
 
 
+def test_all_entries_filled_with_open_position_blocks_before_authorize_claim_plan_or_send(
+    tmp_path: Path, monkeypatch
+) -> None:
+    chain = _prepared_chain(tmp_path, signal_id="sig-old-filled-open")
+    registry = HypothesisRegistry(chain.db_path)
+    control = SER8DemoOrderSendControl(
+        registry=registry, transport=FakeDemoOrderTransport()
+    )
+    _seed_leg(
+        control,
+        claim_id="sig-old-filled-open",
+        result_state="FILLED",
+        order_ticket="900",
+        deal_ticket="901",
+        position_ticket="777",
+    )
+    authorization_control = SER8ExecutionAuthorizationControl.__new__(
+        SER8ExecutionAuthorizationControl
+    )
+    authorization_control.registry = registry
+    authorization_control.final_verdict = None
+    authorization_control.path = Path(registry.path)
+    authorization_control._init_schema()
+    _seed_authorization(
+        authorization_control,
+        authorization_id="EA-sig-old-filled-open",
+        candidate_signal_id="sig-old-filled-open",
+        hypothesis_id=chain.hypothesis_id,
+    )
+    _write_candidate_journal_with_action(
+        chain.data_root,
+        signal_id="sig-new-blocked-by-open-position",
+        action="BUY",
+        observed_at=datetime.now(timezone.utc),
+    )
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    summary = worker_module.run_one_cycle(_worker_args(chain))
+    assert summary.cycle_status == "ACTIVE_SYMBOL_EXECUTION_PLAN"
+    assert summary.active_symbol_plan == "YES"
+    assert summary.authorization_id == "-"
+    assert summary.claim_id == "-"
+    assert summary.execution_plan_id == "EOP-sig-old-filled-open"
+    assert summary.broker_sends_this_cycle == 0
+    assert fake.calls == []
+
+    import sqlite3
+
+    with sqlite3.connect(chain.db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM ser8_execution_authorizations").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM ser8_execution_authorization_claims").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM ser8_mt5_demo_order_plans").fetchone()[0] == 1
+
+
+def test_closed_and_fully_captured_plan_allows_next_same_symbol_candidate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    chain = _prepared_chain(tmp_path, signal_id="sig-old-closed")
+    registry = HypothesisRegistry(chain.db_path)
+    control = SER8DemoOrderSendControl(
+        registry=registry, transport=FakeDemoOrderTransport()
+    )
+    _seed_leg(
+        control,
+        claim_id="sig-old-closed",
+        result_state="FILLED",
+        order_ticket="900",
+        deal_ticket="901",
+        position_ticket="777",
+    )
+    authorization_control = SER8ExecutionAuthorizationControl.__new__(
+        SER8ExecutionAuthorizationControl
+    )
+    authorization_control.registry = registry
+    authorization_control.final_verdict = None
+    authorization_control.path = Path(registry.path)
+    authorization_control._init_schema()
+    _seed_authorization(
+        authorization_control,
+        authorization_id="EA-sig-old-closed",
+        candidate_signal_id="sig-old-closed",
+        hypothesis_id=chain.hypothesis_id,
+        now=datetime(2026, 8, 19, 6, 0, tzinfo=timezone.utc),
+    )
+    deals_csv = chain.data_root / "mt5" / f"mt5_risk_deals_utc_{_ACCOUNT}.csv"
+    deals_csv.write_text(
+        "time_msc,account_login,deal_ticket,order_ticket,position_id,symbol,magic,side,"
+        "volume,price,entry,time_deal_msc,profit\n"
+        f"1,{_ACCOUNT},902,903,777,{_SYMBOL},{DEMO_EXECUTOR_MAGIC_NUMBER},SELL,"
+        "0.5,2020.0,OUT,1700000600000,10.0\n",
+        encoding="utf-8",
+    )
+    _write_candidate_journal_with_action(
+        chain.data_root,
+        signal_id="sig-new-after-close",
+        action="BUY",
+        observed_at=datetime.now(timezone.utc),
+    )
+    expected_new_candidate_id = _last_candidate_signal_id(chain)
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    summary = worker_module.run_one_cycle(_worker_args(chain))
+    assert summary.candidate_id == expected_new_candidate_id
+    assert summary.cycle_status == "EXECUTION_COMPLETE"
+    assert summary.outcomes_ingested == 1
+    assert summary.broker_sends_this_cycle == 1
+    assert len(fake.calls) == 1
+
+    outcomes = SER8DemoTradeOutcomeControl(registry=registry)
+    old_plan = control.get_plan("EOP-sig-old-closed")
+    assert old_plan is not None
+    assert outcomes.get_execution_plan_outcome(old_plan.plan_id) is not None
+
+
 def test_unmapped_magic_owned_active_pending_order_fails_closed(tmp_path: Path, monkeypatch) -> None:
     chain = _prepared_chain(tmp_path, signal_id="sig-unmapped")
     orders_csv = chain.data_root / "mt5" / f"mt5_risk_orders_utc_{_ACCOUNT}.csv"
@@ -1102,6 +1218,7 @@ def test_drifting_mt5_snapshot_dry_run_then_real_run_never_conflicts(tmp_path: P
     _assert_zero_rows(
         chain.db_path, "ser8_execution_authorizations", "ser8_execution_authorization_claims",
         "ser8_mt5_demo_order_plans", "ser8_mt5_demo_order_leg_receipts", "ser8_demo_trade_outcomes",
+        "ser8_demo_execution_plan_outcomes",
     )
 
     # The account snapshot moves on (the unified executor's own

@@ -105,7 +105,8 @@ Each cycle:
    (`DEFAULT_AUTHORIZATION_TTL_SECONDS` = 300s) clears it on its own —
    no new authorization-cleanup mechanism was needed or added.
 5. Every cycle also runs the outcome-capture bridge (see below) for every
-   currently-FILLED leg on the account.
+   position-bearing FILLED/PARTIAL_FILL leg on the account, then records
+   each newly complete aggregate plan outcome.
 6. Prints exactly one structured summary line
    (`SER8 AUTONOMOUS DEMO EXECUTION CYCLE -- account=... candidate_seen=...
    candidate_id=... candidate_status=... risk_state=... risk_block_reason=...
@@ -163,23 +164,39 @@ scheduled task, and no script ever calls `OrderSend`/`CTrade` directly.
 
 `trademind.ser8_demo_trade_outcome_capture.SER8DemoTradeOutcomeControl`
 is a small, additive bridge the execution worker calls every cycle for
-every currently-FILLED leg on the account
+every position-bearing FILLED or PARTIAL_FILL leg on the account
 (`SER8DemoOrderSendControl.list_filled_leg_ids_for_account`). For each
 one, it looks for `DEAL_ENTRY_OUT` (close) evidence on that leg's own
 `position_ticket` in the SAME `mt5_risk_deals_utc_<login>.csv` export
 reconciliation already reads (as of the unified executor v1.5, this
 export also carries `DEAL_PROFIT` as a `profit` column). If close
-evidence exists, it persists one `ser8_demo_trade_outcomes` row with the
+evidence covers the leg's full filled volume, it persists one
+`ser8_demo_trade_outcomes` row with the
 lineage, entry, and exit fields the future Analytics Core will need
 (`hypothesis_id`, `candidate_signal_id`, `authorization_id`, `claim_id`,
 `execution_plan_id`, `leg_id`, `symbol`, `side`, `order_type`,
 `requested_volume`, entry price/timestamp/tickets, SL/TP, exit
 price/timestamp/deal tickets, `realized_pl` when the broker evidence
-itself supplied a `profit` value, and `terminal_reason`). A position with
+itself supplied a `profit` value, `entry_filled_volume`, `closed_volume`,
+and `terminal_reason`). The filled/closed volumes are hash-bound; a legacy
+row without that proof remains locked until fresh broker evidence
+revalidates and enriches it. A position with
 no close evidence yet is simply still open — nothing is inferred from
 candles, time passing, or a snapshot's absence. This task does **not**
 redesign the analytics schema; it persists only the narrowest
 authoritative record needed.
+
+After every entry leg is terminal and every position-bearing leg has its
+verified close outcome, the bridge persists one hash-bound aggregate row
+in `ser8_demo_execution_plan_outcomes`. The row binds the immutable plan
+hash, every terminal leg state, every filled-leg outcome hash, and the
+aggregate realized result. A plan remains active for its account+symbol
+until this aggregate row exists and matches current durable truth. Thus
+FILLED entries, expired pending legs, elapsed time, or broker-close
+evidence that has not yet been captured cannot release the symbol lock.
+There is no timeout or manual-unlock flag; restart reconstructs the lock
+from SQLite. Another symbol remains independently eligible, while all
+pending/open exposure still participates in account-global risk.
 
 ## Safety invariants preserved by all three tasks together
 
@@ -199,6 +216,12 @@ authoritative record needed.
   per-leg `_reserve_leg_attempt` uniqueness guard (an already-attempted
   leg, in any state including UNKNOWN, is never resent by either entry
   point).
+- One active plan per account+symbol remains enforced through the whole
+  trade outcome: every entry leg terminal, every owned position fully
+  broker-closed, every per-leg outcome captured, and the aggregate plan
+  outcome durably recorded. Until then a same-symbol candidate stops at
+  `ACTIVE_SYMBOL_EXECUTION_PLAN` before authorization, claim, plan, or
+  broker send.
 - A plan's unattempted legs (a genuine crash strictly between two legs)
   are resumable ONLY through `resume_plan`, which never creates a second
   plan and never creates a second claim for the same plan — proven by
