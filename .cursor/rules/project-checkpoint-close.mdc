@@ -1,0 +1,22 @@
+---
+description: Require a verified immutable checkpoint when a formal engineering layer closes
+alwaysApply: true
+---
+
+# Project Checkpoint Closure
+
+For every formal engineering task that ends with both:
+
+- `FINAL STATUS: PASS`
+- `LAYER STATUS: CLOSED`
+
+also report `CHECKPOINT REQUIRED: YES`.
+
+- A layer is not operationally finalized until its checkpoint status is `CREATED` and `VERIFIED`.
+- Invoke `scripts/create_trademind_checkpoint.py` only when the user explicitly authorizes remote push.
+- Without push authorization, return the exact checkpoint command for the operator instead.
+- Never infer closure from a commit message, ordinary test pass, or random Git activity.
+- Never install a Git hook that guesses checkpoint intent.
+- Never force-update, replace, or delete a checkpoint tag.
+- Keep source commit identity distinct from any metadata identity.
+- Use `scripts/verify_trademind_checkpoint.py` for read-only verification or listing.
