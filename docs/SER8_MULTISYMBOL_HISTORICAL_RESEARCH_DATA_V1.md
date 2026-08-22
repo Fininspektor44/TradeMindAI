@@ -139,6 +139,65 @@ Candidate decisions use only bars at or before candidate time. The shadow
 evaluator receives only strictly later bars. An incomplete final horizon has no
 fabricated outcome.
 
+## Per-symbol available-coverage discovery
+
+A broker is not obligated to retain history all the way back to the operator's
+requested global start date. Rejecting an otherwise healthy symbol merely
+because its broker-supported history is shorter than the requested window
+would be a policy bug, not an integrity safeguard, so acquisition is governed
+by an explicit, versioned discovery policy
+(`ser8-backward-suffix-coverage-discovery-v1`) instead.
+
+For each symbol the deterministic calendar-month chunk plan is attempted
+backward from `requested_to_utc`. Every chunk that fetches or validates
+successfully joins the accepted contiguous suffix. A chunk failure is never
+itself the boundary — it is first positively classified:
+
+- **Genuine historical unavailable** (a closed, explicit error-code allowlist)
+  is the ONLY classification allowed to fix a truncated coverage boundary.
+  Once fixed, every older chunk is recorded as `SKIPPED_UNAVAILABLE_PREFIX`
+  without any further cache lookup or broker call — a genuinely absent broker
+  prefix is never hammered chunk-by-chunk once its boundary is established,
+  and a chunk cache already populated by a prior partial run still
+  short-circuits the accepted suffix instantly.
+- **Data-integrity failure** (a malformed/conflicting bar, or a merge conflict
+  discovered between two already-accepted chunks) always fails the whole
+  symbol closed: chunks already accepted are discarded rather than published
+  as a "truncated" dataset that hides the failing chunk.
+- **Transient/unresolved/unrecognized failure** (a plain read/acquisition
+  error, or any error code not on the genuine-unavailable allowlist) gets a
+  deterministic, bounded retry at the same chunk; if it still fails, the whole
+  symbol is left unresolved and fails closed exactly like a data-integrity
+  failure. It is never reinterpreted as "short broker history".
+
+Because only a positively-classified genuine boundary can ever truncate
+coverage, an intermittent valid/failed/valid pattern is never silently
+bridged: a transient or integrity failure anywhere in the walk discards the
+whole symbol — including chunks already accepted — rather than exposing a
+partial suffix around it. `MetaTrader5HistorySource` positively classifies
+"genuine unavailable" only when MT5's `last_error()` itself reports the
+broker "not found" for an already-verified, visible symbol; every other
+`copy_rates_range` failure (timeouts, connection errors, internal failures)
+stays generic/transient and can never shorten coverage.
+
+Every dataset manifest and inventory entry persists both the operator's
+`requested_from_utc`/`requested_to_utc` (audit intent, unchanged), the
+discovered `effective_coverage_start_utc`/`effective_coverage_end_utc`,
+`coverage_truncated_at_requested_start`/`truncation_reason_code`, and the
+explicit `unresolved_error_code`/`integrity_error_code`/
+`merge_integrity_error_code` classification — alongside the accepted,
+unavailable-prefix, discarded, and abandoned chunk audits — so an
+older-history-unavailable symbol is visibly distinct from a disabled symbol,
+an unreachable symbol, a transient acquisition failure, or a genuine
+data-integrity failure, and is never silently relabeled as one of those.
+Dataset identity binds the discovered effective coverage, not merely the
+requested range, so two symbols that share a requested window but differ in
+broker-supported history never collide. Acceptance and research readiness are
+computed from this accepted actual coverage; a rejected/unavailable prefix
+never lowers the accepted dataset's integrity bar, and the
+minimum-rows-for-replay policy still applies only to what was actually
+accepted.
+
 ## Windows verification — run one step, inspect it, then continue
 
 Use the real repository and Common Files paths shown below. Keep the autonomous

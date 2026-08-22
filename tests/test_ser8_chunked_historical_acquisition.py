@@ -15,6 +15,8 @@ import pytest
 from trademind.ser8_historical_data import (
     CHUNK_POLICY_VERSION,
     CHUNK_ACQUISITION_CODE_SHA256,
+    COVERAGE_DISCOVERY_POLICY_VERSION,
+    COVERAGE_TRUNCATED_REASON_CODE,
     READ_ONLY_MT5_OPERATIONS,
     BrokerSymbolV1,
     HistoricalBarV1,
@@ -25,8 +27,11 @@ from trademind.ser8_historical_data import (
     build_dataset_manifest,
     canonical_bars_csv,
     collector_code_sha256,
+    discover_available_coverage,
     merge_historical_bars,
     plan_calendar_month_chunks,
+    publish_dataset,
+    verify_dataset,
 )
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
 
@@ -110,6 +115,27 @@ def _acquire(
     )
 
 
+def _discover(
+    tmp_path: Path,
+    source: WindowSource,
+    *,
+    start: datetime,
+    end: datetime,
+    proof: Mapping[str, object] | None = None,
+    collector_sha256: str = COLLECTOR_SHA,
+):
+    return discover_available_coverage(
+        source=source,
+        source_proof=proof or _proof(),
+        symbol="EURUSD",
+        timeframe="M5",
+        requested_from_utc=start,
+        requested_to_utc=end,
+        staging_root=tmp_path / "staging",
+        collector_code_sha256=collector_sha256,
+    )
+
+
 def _broker() -> BrokerSymbolV1:
     row = _execution_row()
     return BrokerSymbolV1(
@@ -180,7 +206,7 @@ def _manifest(
         expected_interval_seconds=300,
         source_capture_utc=captured_at or end,
         collector_code_sha256=COLLECTOR_SHA,
-        chunk_acquisition=acquisition,
+        coverage_discovery=acquisition,
     )
     return manifest
 
@@ -465,43 +491,69 @@ def test_failed_chunk_continues_later_chunks_but_never_exposes_partial_bars(tmp_
     assert result.chunk_audit[2]["status"] == "COMPLETED"
 
 
-def test_partial_acquisition_manifest_cannot_be_accepted() -> None:
+def test_hand_crafted_zero_accepted_coverage_summary_cannot_be_accepted() -> None:
+    """A coverage-discovery summary claiming zero accepted chunks must never
+    reach dataset publication: ``build_dataset_manifest`` fails closed rather
+    than silently accepting an empty/inconsistent claim."""
     start = datetime(2024, 1, 1, tzinfo=UTC)
     end = datetime(2024, 3, 1, tzinfo=UTC)
     bar = _bar(datetime(2024, 1, 5, tzinfo=UTC))
     chunks = plan_calendar_month_chunks(start, end)
     summary = {
+        "coverage_discovery_policy_version": COVERAGE_DISCOVERY_POLICY_VERSION,
         "chunk_policy_version": CHUNK_POLICY_VERSION,
+        "coverage_resolution": "TRUNCATED_GENUINE_BOUNDARY",
         "requested_chunk_count": 2,
-        "completed_chunk_count": 1,
+        "accepted_chunk_count": 0,
         "empty_chunk_count": 0,
-        "failed_chunk_count": 1,
         "cached_chunk_count": 0,
-        "acquired_chunk_count": 1,
-        "historical_capture_complete": False,
-        "chunk_audit": [
+        "acquired_chunk_count": 0,
+        "unavailable_prefix_chunk_count": 2,
+        "discarded_chunk_count": 0,
+        "abandoned_chunk_count": 0,
+        "chunk_audit": [],
+        "unavailable_prefix_chunk_audit": [
             {
                 "chunk_id": chunks[0].chunk_id,
                 "chunk_from_utc": "2024-01-01T00:00:00Z",
                 "chunk_to_utc": "2024-02-01T00:00:00Z",
-                "status": "COMPLETED",
-                "row_count": 1,
-                "bars_sha256": sha256_bytes(canonical_bars_csv((bar,))),
+                "status": "SKIPPED_UNAVAILABLE_PREFIX",
+                "acquisition_method": "NOT_ATTEMPTED",
+                "row_count": 0,
+                "bars_sha256": None,
+                "error_code": None,
             },
             {
                 "chunk_id": chunks[1].chunk_id,
                 "chunk_from_utc": "2024-02-01T00:00:00Z",
                 "chunk_to_utc": "2024-03-01T00:00:00Z",
                 "status": "FAILED",
+                "acquisition_method": "MT5",
                 "row_count": 0,
                 "bars_sha256": None,
+                "error_code": "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE",
             },
         ],
+        "discarded_chunk_audit": [],
+        "abandoned_chunk_audit": [],
+        "coverage_truncated_at_requested_start": True,
+        "truncation_reason_code": COVERAGE_TRUNCATED_REASON_CODE,
+        "truncation_reason": "nothing was ever accepted",
+        "requested_coverage_start_utc": "2024-01-01T00:00:00Z",
+        "requested_coverage_end_utc": "2024-03-01T00:00:00Z",
+        "effective_coverage_start_utc": None,
+        "effective_coverage_end_utc": None,
+        "historical_capture_complete": False,
+        "unresolved_error_code": None,
+        "unresolved_error": None,
+        "integrity_error_code": None,
+        "integrity_error": None,
+        "merge_integrity_error_code": None,
+        "merge_integrity_error": None,
     }
-    manifest = _manifest((bar,), start=start, end=end, acquisition=summary)
-    assert manifest["accepted_historical_data"] is False
-    assert manifest["historical_capture_complete"] is False
-    assert manifest["failed_chunk_count"] == 1
+    with pytest.raises(HistoricalDataError) as caught:
+        _manifest((bar,), start=start, end=end, acquisition=summary)
+    assert caught.value.code == "COVERAGE_AUDIT_INVALID"
 
 
 def test_download_order_cache_method_retry_and_capture_time_do_not_change_dataset_hash() -> None:
@@ -517,15 +569,35 @@ def test_download_order_cache_method_retry_and_capture_time_do_not_change_datase
     changed_audit[0]["acquisition_method"] = "CACHE"
     changed_audit[0]["retry_count"] = 9
     summary = {
+        "coverage_discovery_policy_version": COVERAGE_DISCOVERY_POLICY_VERSION,
         "chunk_policy_version": CHUNK_POLICY_VERSION,
+        "coverage_resolution": "COMPLETE",
         "requested_chunk_count": 1,
-        "completed_chunk_count": 1,
+        "accepted_chunk_count": 1,
         "empty_chunk_count": 0,
-        "failed_chunk_count": 0,
         "cached_chunk_count": 1,
         "acquired_chunk_count": 0,
+        "unavailable_prefix_chunk_count": 0,
+        "discarded_chunk_count": 0,
+        "abandoned_chunk_count": 0,
         "chunk_audit": changed_audit,
+        "unavailable_prefix_chunk_audit": [],
+        "discarded_chunk_audit": [],
+        "abandoned_chunk_audit": [],
+        "coverage_truncated_at_requested_start": False,
+        "truncation_reason_code": None,
+        "truncation_reason": None,
+        "requested_coverage_start_utc": "2024-01-01T00:00:00Z",
+        "requested_coverage_end_utc": "2024-02-01T00:00:00Z",
+        "effective_coverage_start_utc": "2024-01-01T00:00:00Z",
+        "effective_coverage_end_utc": "2024-02-01T00:00:00Z",
         "historical_capture_complete": True,
+        "unresolved_error_code": None,
+        "unresolved_error": None,
+        "integrity_error_code": None,
+        "integrity_error": None,
+        "merge_integrity_error_code": None,
+        "merge_integrity_error": None,
     }
     reversed_canonical = merge_historical_bars(
         tuple(reversed(canonical)), symbol="EURUSD", timeframe="M5"
@@ -545,7 +617,7 @@ def test_manifest_records_chunk_audit_and_observable_coverage(tmp_path: Path) ->
     start = datetime(2024, 1, 1, tzinfo=UTC)
     end = datetime(2024, 3, 1, tzinfo=UTC)
     bar = _bar(datetime(2024, 2, 5, tzinfo=UTC))
-    result = _acquire(
+    result = _discover(
         tmp_path,
         WindowSource(
             {
@@ -558,9 +630,10 @@ def test_manifest_records_chunk_audit_and_observable_coverage(tmp_path: Path) ->
     )
     manifest = _manifest(result.bars, start=start, end=end, acquisition=result.manifest_summary())
     assert manifest["requested_chunk_count"] == 2
-    assert manifest["completed_chunk_count"] == 2
+    assert manifest["accepted_chunk_count"] == 2
     assert manifest["empty_chunk_count"] == 1
-    assert manifest["failed_chunk_count"] == 0
+    assert manifest["unavailable_prefix_chunk_count"] == 0
+    assert manifest["coverage_truncated_at_requested_start"] is False
     assert len(manifest["chunk_audit"]) == 2
     assert manifest["requested_duration_seconds"] == 60 * 24 * 60 * 60
     assert manifest["observed_span_seconds"] == 0
@@ -568,3 +641,280 @@ def test_manifest_records_chunk_audit_and_observable_coverage(tmp_path: Path) ->
     assert manifest["last_bar_offset_seconds"] == 25 * 24 * 60 * 60
     assert manifest["gap_repair_performed"] is False
     assert manifest["synthetic_bars_added"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-symbol available-coverage discovery (backward-suffix policy) — SER8
+# HISTORICAL AVAILABLE COVERAGE DISCOVERY V1, tests A-H.
+# ---------------------------------------------------------------------------
+
+
+def test_G_full_requested_range_available_effective_equals_requested(tmp_path: Path) -> None:
+    """Existing full-history stock behavior is unchanged: no boundary failure
+    of any kind is encountered, so nothing is ever classified/truncated."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 3, 1, tzinfo=UTC)
+    source = WindowSource(
+        {
+            "20240101T000000Z__20240201T000000Z": (_bar(datetime(2024, 1, 5, tzinfo=UTC)),),
+            "20240201T000000Z__20240301T000000Z": (_bar(datetime(2024, 2, 5, tzinfo=UTC)),),
+        }
+    )
+    result = _discover(tmp_path, source, start=start, end=end)
+    assert result.resolution == "COMPLETE"
+    assert result.coverage_truncated_at_requested_start is False
+    assert result.truncation_reason_code is None
+    assert result.unresolved_error_code is None
+    assert result.integrity_error_code is None
+    assert result.accepted_chunk_count == result.requested_chunk_count == 2
+    assert result.effective_from_utc == start
+    assert result.effective_to_utc == end
+    assert len(result.bars) == 2
+    manifest = _manifest(result.bars, start=start, end=end, acquisition=result.manifest_summary())
+    assert manifest["accepted_historical_data"] is True
+    assert manifest["historical_capture_complete"] is True
+    assert manifest["coverage_truncated_at_requested_start"] is False
+    assert manifest["effective_coverage_start_utc"] == "2024-01-01T00:00:00Z"
+    assert manifest["effective_coverage_end_utc"] == end.isoformat().replace("+00:00", "Z")
+
+
+def test_A_genuine_older_unavailable_prefix_is_truncated_and_accepted(tmp_path: Path) -> None:
+    """Only a POSITIVELY classified genuine-unavailable failure may ever fix
+    a truncated coverage boundary — a generic failure must not."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 5, 1, tzinfo=UTC)
+    ids = [item.chunk_id for item in plan_calendar_month_chunks(start, end)]
+    source = WindowSource(
+        {
+            ids[0]: AssertionError("older-than-boundary chunk must never be probed"),
+            ids[1]: HistoricalDataError(
+                "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE", "no broker history that far back"
+            ),
+            ids[2]: (_bar(datetime(2024, 3, 5, tzinfo=UTC)),),
+            ids[3]: (_bar(datetime(2024, 4, 5, tzinfo=UTC)),),
+        }
+    )
+    result = _discover(tmp_path, source, start=start, end=end)
+    # A genuine-unavailable classification is conclusive on the first
+    # observation: it is never retried, unlike a generic/transient failure.
+    assert source.calls == [ids[3], ids[2], ids[1]]
+    assert result.resolution == "TRUNCATED_GENUINE_BOUNDARY"
+    assert result.accepted_chunk_count == 2
+    assert result.unresolved_error_code is None
+    assert result.integrity_error_code is None
+    assert result.coverage_truncated_at_requested_start is True
+    assert result.truncation_reason_code == COVERAGE_TRUNCATED_REASON_CODE
+    assert len(result.unavailable_prefix_chunk_audit) == 2
+    assert result.unavailable_prefix_chunk_audit[0]["status"] == "SKIPPED_UNAVAILABLE_PREFIX"
+    assert result.unavailable_prefix_chunk_audit[1]["status"] == "FAILED"
+    assert result.unavailable_prefix_chunk_audit[1]["error_code"] == "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE"
+    assert result.effective_from_utc == datetime(2024, 3, 1, tzinfo=UTC)
+    assert result.effective_to_utc == end
+    assert len(result.bars) == 2
+    assert result.discarded_chunk_audit == ()
+    assert result.abandoned_chunk_audit == ()
+
+    manifest = _manifest(result.bars, start=start, end=end, acquisition=result.manifest_summary())
+    assert manifest["accepted_historical_data"] is True
+    assert manifest["coverage_truncated_at_requested_start"] is True
+    assert manifest["coverage_truncation_reason_code"] == COVERAGE_TRUNCATED_REASON_CODE
+    assert manifest["effective_coverage_start_utc"] == "2024-03-01T00:00:00Z"
+    assert manifest["requested_from_utc"] == "2024-01-01T00:00:00Z"
+
+    # I: dataset verification is a pure filesystem/hash operation — no MT5 object involved.
+    dataset_dir, persisted, created = publish_dataset(
+        tmp_path / "dataset", manifest, canonical_bars_csv(result.bars)
+    )
+    assert created is True
+    verified = verify_dataset(dataset_dir)
+    assert verified["accepted_historical_data"] is True
+    assert verified["coverage_truncated_at_requested_start"] is True
+
+
+def test_D_genuine_boundary_skip_efficiency_zero_calls_beyond_boundary(tmp_path: Path) -> None:
+    """After a genuine boundary is proven, zero MT5/cache calls are made for
+    any older chunk — not even a filesystem cache lookup."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 5, 1, tzinfo=UTC)
+    ids = [item.chunk_id for item in plan_calendar_month_chunks(start, end)]
+    source = WindowSource(
+        {
+            ids[0]: AssertionError("older-than-boundary chunk must never be probed"),
+            ids[1]: HistoricalDataError(
+                "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE", "no broker history that far back"
+            ),
+            ids[2]: (_bar(datetime(2024, 3, 5, tzinfo=UTC)),),
+            ids[3]: (_bar(datetime(2024, 4, 5, tzinfo=UTC)),),
+        }
+    )
+    result = _discover(tmp_path, source, start=start, end=end)
+    assert result.coverage_truncated_at_requested_start is True
+    skipped = result.unavailable_prefix_chunk_audit[0]
+    assert skipped["chunk_id"] == ids[0]
+    assert skipped["status"] == "SKIPPED_UNAVAILABLE_PREFIX"
+    assert skipped["acquisition_method"] == "NOT_ATTEMPTED"
+    assert skipped["cache_validation"] == "NOT_ATTEMPTED"
+    # No cache directory was ever created/checked for the skipped chunk.
+    staging = tmp_path / "staging"
+    assert not any(ids[0] in str(path) for path in staging.rglob("*"))
+    assert ids[0] not in source.calls
+
+
+def test_C2_merge_conflict_between_accepted_chunks_fails_closed(tmp_path: Path) -> None:
+    """A merge conflict discovered only after two individually-valid chunks
+    are accepted still fails the whole symbol closed, discarding them."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 3, 1, tzinfo=UTC)
+    boundary = _bar(datetime(2024, 2, 1, tzinfo=UTC))
+    source = WindowSource(
+        {
+            "20240101T000000Z__20240201T000000Z": (boundary,),
+            "20240201T000000Z__20240301T000000Z": (replace(boundary, close=1.1003),),
+        }
+    )
+    result = _discover(tmp_path, source, start=start, end=end)
+    assert result.resolution == "DATA_INTEGRITY_FAILED"
+    assert result.merge_integrity_error_code == "CONFLICTING_DUPLICATE_BAR"
+    assert result.coverage_available is False
+    assert result.coverage_truncated_at_requested_start is False
+    assert result.bars == ()
+
+
+def test_B_transient_failure_between_valid_chunks_fails_closed_not_truncated(
+    tmp_path: Path,
+) -> None:
+    """A transient/generic acquisition failure must never establish a
+    coverage boundary: after bounded retry it leaves the WHOLE symbol
+    unresolved/failed-closed rather than exposing a partial suffix."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 5, 1, tzinfo=UTC)
+    ids = [item.chunk_id for item in plan_calendar_month_chunks(start, end)]
+    source = WindowSource(
+        {
+            ids[0]: AssertionError("chunk beyond an unresolved failure must never be probed"),
+            ids[1]: HistoricalDataError("MT5_COPY_RATES_FAILED", "temporary read failure"),
+            ids[2]: (_bar(datetime(2024, 3, 5, tzinfo=UTC)),),
+            ids[3]: (_bar(datetime(2024, 4, 5, tzinfo=UTC)),),
+        }
+    )
+    result = _discover(tmp_path, source, start=start, end=end)
+    # The deterministic bounded retry policy gives the transient failure a
+    # second chance at the SAME chunk before giving up.
+    assert source.calls == [ids[3], ids[2], ids[1], ids[1]]
+    assert result.resolution == "UNRESOLVED_TRANSIENT_FAILURE"
+    assert result.unresolved_error_code == "MT5_COPY_RATES_FAILED"
+    assert "temporary read failure" in str(result.unresolved_error)
+    assert result.integrity_error_code is None
+    # No truncation and no accepted/published coverage: the two individually
+    # valid, newer chunks are discarded rather than exposed as a "truncated"
+    # dataset that hides the failing chunk.
+    assert result.coverage_truncated_at_requested_start is False
+    assert result.truncation_reason_code is None
+    assert result.accepted_chunk_count == 0
+    assert result.bars == ()
+    assert result.coverage_available is False
+    assert len(result.discarded_chunk_audit) == 2
+    assert {item["chunk_id"] for item in result.discarded_chunk_audit} == {ids[2], ids[3]}
+    with pytest.raises(HistoricalDataError) as caught:
+        _manifest((), start=start, end=end, acquisition=result.manifest_summary())
+    assert caught.value.code == "COVERAGE_UNRESOLVED_TRANSIENT_FAILURE"
+
+
+def test_C_data_integrity_failure_between_valid_chunks_fails_closed_not_truncated(
+    tmp_path: Path,
+) -> None:
+    """A per-chunk data-integrity failure must never be reinterpreted as an
+    unavailable prefix: it fails the whole symbol closed immediately, with
+    zero retries (unlike a transient failure) and zero further probing."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 5, 1, tzinfo=UTC)
+    ids = [item.chunk_id for item in plan_calendar_month_chunks(start, end)]
+    source = WindowSource(
+        {
+            ids[0]: AssertionError("chunk beyond an integrity failure must never be probed"),
+            ids[1]: AssertionError("chunk beyond an integrity failure must never be probed"),
+            ids[2]: HistoricalDataError("CHUNK_DATA_INTEGRITY_FAILED", "malformed canonical bars"),
+            ids[3]: (_bar(datetime(2024, 4, 5, tzinfo=UTC)),),
+        }
+    )
+    result = _discover(tmp_path, source, start=start, end=end)
+    # Conclusive on the first observation: never retried.
+    assert source.calls == [ids[3], ids[2]]
+    assert result.resolution == "DATA_INTEGRITY_FAILED"
+    assert result.integrity_error_code == "CHUNK_DATA_INTEGRITY_FAILED"
+    assert "malformed canonical bars" in str(result.integrity_error)
+    assert result.unresolved_error_code is None
+    assert result.coverage_truncated_at_requested_start is False
+    assert result.truncation_reason_code is None
+    assert result.accepted_chunk_count == 0
+    assert result.bars == ()
+    assert len(result.discarded_chunk_audit) == 1
+    assert result.discarded_chunk_audit[0]["chunk_id"] == ids[3]
+    with pytest.raises(HistoricalDataError) as caught:
+        _manifest((), start=start, end=end, acquisition=result.manifest_summary())
+    assert caught.value.code == "COVERAGE_DATA_INTEGRITY_FAILED"
+
+
+def test_J_unrecognized_failure_code_is_unresolved_not_prefix_truncation(
+    tmp_path: Path,
+) -> None:
+    """An unrecognized/unclassified error code must be treated exactly like a
+    transient failure (bounded retry, then fail closed) — never silently
+    treated as proof of genuine historical unavailability."""
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 3, 1, tzinfo=UTC)
+    ids = [item.chunk_id for item in plan_calendar_month_chunks(start, end)]
+    source = WindowSource(
+        {
+            ids[0]: AssertionError("chunk beyond an unresolved failure must never be probed"),
+            ids[1]: HistoricalDataError("SOME_UNRECOGNIZED_FUTURE_ERROR_CODE", "unmapped failure"),
+        }
+    )
+    result = _discover(tmp_path, source, start=start, end=end)
+    assert source.calls == [ids[1], ids[1]]
+    assert result.resolution == "UNRESOLVED_TRANSIENT_FAILURE"
+    assert result.unresolved_error_code == "SOME_UNRECOGNIZED_FUTURE_ERROR_CODE"
+    assert result.coverage_truncated_at_requested_start is False
+    assert result.accepted_chunk_count == 0
+
+
+def test_H_rerun_reuses_cache_and_produces_identical_dataset_identity(tmp_path: Path) -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 4, 1, tzinfo=UTC)
+    ids = [item.chunk_id for item in plan_calendar_month_chunks(start, end)]
+
+    def _make_source(boundary_error: HistoricalDataError, *, allow_recent: bool) -> WindowSource:
+        return WindowSource(
+            {
+                ids[0]: boundary_error,
+                ids[1]: (_bar(datetime(2024, 2, 5, tzinfo=UTC)),)
+                if allow_recent
+                else AssertionError("accepted chunk must be served from cache on rerun"),
+                ids[2]: (_bar(datetime(2024, 3, 5, tzinfo=UTC)),)
+                if allow_recent
+                else AssertionError("accepted chunk must be served from cache on rerun"),
+            }
+        )
+
+    first_error = HistoricalDataError(
+        "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE", "no broker history that far back"
+    )
+    first = _discover(
+        tmp_path, _make_source(first_error, allow_recent=True), start=start, end=end
+    )
+    first_manifest = _manifest(first.bars, start=start, end=end, acquisition=first.manifest_summary())
+
+    second_error = HistoricalDataError(
+        "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE", "no broker history that far back"
+    )
+    second_source = _make_source(second_error, allow_recent=False)
+    second = _discover(tmp_path, second_source, start=start, end=end)
+    # The accepted suffix (ids[1], ids[2]) is served entirely from verified
+    # chunk cache; only the never-cached boundary failure is re-attempted
+    # (once — a genuine classification is never retried).
+    assert second_source.calls == [ids[0]]
+    second_manifest = _manifest(second.bars, start=start, end=end, acquisition=second.manifest_summary())
+
+    assert first.accepted_chunk_count == second.accepted_chunk_count == 2
+    assert first_manifest["dataset_sha256"] == second_manifest["dataset_sha256"]
+    assert first_manifest["effective_coverage_start_utc"] == second_manifest["effective_coverage_start_utc"]

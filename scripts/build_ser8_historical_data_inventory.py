@@ -21,10 +21,10 @@ from trademind.ser8_historical_data import (  # noqa: E402
     EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION,
     HistoricalDataError,
     MetaTrader5HistorySource,
-    acquire_chunked_history,
     assert_historical_artifact_isolation,
     build_dataset_manifest,
     collector_code_sha256,
+    discover_available_coverage,
     load_canonical_execution_universe,
     load_inventory,
     parse_utc,
@@ -203,7 +203,7 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                         "BROKER_SYMBOL_DISABLED",
                         f"current MT5 trade mode is {symbol_metadata['trade_mode_name']}",
                     )
-                progress_counts = {"cached": 0, "acquired": 0, "empty": 0, "failed": 0}
+                progress_counts = {"cached": 0, "acquired": 0, "empty": 0, "failed": 0, "skipped": 0}
 
                 def report_chunk(
                     chunk_index: int,
@@ -216,16 +216,18 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                     progress_counts["acquired"] += int(method == "MT5" and status != "FAILED")
                     progress_counts["empty"] += int(status == "EMPTY")
                     progress_counts["failed"] += int(status == "FAILED")
+                    progress_counts["skipped"] += int(status == "SKIPPED_UNAVAILABLE_PREFIX")
                     print(
                         f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
                         f"chunk {chunk_index}/{chunk_total} status={status.lower()} "
                         f"cached={progress_counts['cached']} acquired={progress_counts['acquired']} "
-                        f"empty={progress_counts['empty']} failed={progress_counts['failed']}",
+                        f"empty={progress_counts['empty']} failed={progress_counts['failed']} "
+                        f"skipped={progress_counts['skipped']}",
                         file=sys.stderr,
                         flush=True,
                     )
 
-                acquisition = acquire_chunked_history(
+                coverage = discover_available_coverage(
                     source=source,
                     source_proof=proof,
                     symbol=broker_symbol.symbol,
@@ -236,14 +238,44 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                     collector_code_sha256=CHUNK_ACQUISITION_CODE_SHA256,
                     progress=report_chunk,
                 )
-                acquisition_summary = acquisition.manifest_summary()
-                if acquisition.merge_integrity_error_code is not None:
+                coverage_summary = coverage.manifest_summary()
+                # A generic failure is never the coverage boundary: only a
+                # positively classified genuine-unavailable chunk (see
+                # discover_available_coverage) may ever truncate coverage.
+                # Every other chunk-level failure leaves the whole symbol
+                # unresolved/integrity-failed and fails it closed here —
+                # never reinterpreted as "short broker history".
+                if coverage.unresolved_error_code is not None:
                     entries.append(
                         {
                             **base,
-                            **acquisition_summary,
+                            **coverage_summary,
+                            "status": "HISTORICAL_CHUNK_ACQUISITION_FAILED",
+                            "status_reason": (
+                                "transient/unresolved acquisition failure "
+                                f"({coverage.unresolved_error_code}) could not be positively classified "
+                                "as genuine historical unavailability after bounded retry; no truncated "
+                                f"dataset published: {coverage.unresolved_error}"
+                            ),
+                        }
+                    )
+                    print(
+                        f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                        "final=HISTORICAL_CHUNK_ACQUISITION_FAILED row_count=0",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                if coverage.integrity_error_code is not None:
+                    entries.append(
+                        {
+                            **base,
+                            **coverage_summary,
                             "status": "DATA_INTEGRITY_FAILED",
-                            "status_reason": acquisition.merge_integrity_error,
+                            "status_reason": (
+                                f"data-integrity failure ({coverage.integrity_error_code}) during "
+                                f"acquisition: {coverage.integrity_error}"
+                            ),
                         }
                     )
                     print(
@@ -253,49 +285,51 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                         flush=True,
                     )
                     continue
-                if acquisition.failed_chunk_count:
-                    integrity_codes = {
-                        "BAR_IDENTITY_MISMATCH",
-                        "CONFLICTING_DUPLICATE_BAR",
-                        "CHUNK_BAR_OUTSIDE_REQUEST",
-                        "CHUNK_DATA_INTEGRITY_FAILED",
-                    }
-                    failed_error_codes = {
-                        str(item.get("error_code"))
-                        for item in acquisition.chunk_audit
-                        if item.get("status") == "FAILED"
-                    }
-                    failed_status = (
-                        "DATA_INTEGRITY_FAILED"
-                        if failed_error_codes & integrity_codes
-                        else "HISTORICAL_CHUNK_ACQUISITION_FAILED"
-                    )
+                if coverage.merge_integrity_error_code is not None:
                     entries.append(
                         {
                             **base,
-                            **acquisition_summary,
-                            "status": failed_status,
+                            **coverage_summary,
+                            "status": "DATA_INTEGRITY_FAILED",
+                            "status_reason": coverage.merge_integrity_error,
+                        }
+                    )
+                    print(
+                        f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                        "final=DATA_INTEGRITY_FAILED row_count=0",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                if coverage.accepted_chunk_count == 0:
+                    # A genuine boundary was proven, but it covers the entire
+                    # requested range: there is no usable broker history at all.
+                    entries.append(
+                        {
+                            **base,
+                            **coverage_summary,
+                            "status": "BROKER_HISTORY_UNAVAILABLE",
                             "status_reason": (
-                                f"{acquisition.failed_chunk_count} of "
-                                f"{acquisition.requested_chunk_count} chunks failed; partial bars not published"
+                                "broker positively reports no retained history anywhere in the "
+                                f"requested range ({coverage.requested_chunk_count} chunks probed/skipped)"
                             ),
                         }
                     )
                     print(
                         f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
-                        f"final={failed_status} row_count=0",
+                        "final=BROKER_HISTORY_UNAVAILABLE row_count=0",
                         file=sys.stderr,
                         flush=True,
                     )
                     continue
-                bars = acquisition.bars
+                bars = coverage.bars
                 if not bars:
                     entries.append(
                         {
                             **base,
-                            **acquisition_summary,
+                            **coverage_summary,
                             "status": "BROKER_HISTORY_UNAVAILABLE",
-                            "status_reason": "all requested chunks completed but returned no bars",
+                            "status_reason": "every accepted chunk completed but returned no bars",
                         }
                     )
                     print(
@@ -319,13 +353,20 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                     expected_interval_seconds=expected_interval,
                     source_capture_utc=captured_at,
                     collector_code_sha256=collector_sha256,
-                    chunk_acquisition=acquisition_summary,
+                    coverage_discovery=coverage_summary,
                 )
                 dataset_dir, persisted_manifest, _created = publish_dataset(
                     dataset_root, manifest, bars_bytes
                 )
                 quality = persisted_manifest["quality"]
                 accepted = persisted_manifest["accepted_historical_data"] is True
+                truncated = persisted_manifest["coverage_truncated_at_requested_start"] is True
+                truncation_note = (
+                    f"; effective coverage starts {persisted_manifest['effective_coverage_start_utc']} "
+                    f"(requested {persisted_manifest['requested_from_utc']})"
+                    if truncated
+                    else ""
+                )
                 if not accepted:
                     status = "DATA_INTEGRITY_FAILED"
                     reason = "canonical broker bars failed deterministic integrity validation"
@@ -341,6 +382,7 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                 else:
                     status = "HISTORICAL_DATA_READY"
                     reason = "historical integrity passed; deterministic replay still required"
+                reason = f"{reason}{truncation_note}"
                 entries.append(
                     {
                         **base,
@@ -352,7 +394,7 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                         "dataset_sha256": persisted_manifest["dataset_sha256"],
                         "dataset_dir": str(dataset_dir),
                         "quality": quality,
-                        **acquisition_summary,
+                        **coverage_summary,
                     }
                 )
                 print(

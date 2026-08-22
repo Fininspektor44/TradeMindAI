@@ -33,13 +33,42 @@ from trademind.ser8_symbol_universe import (
 )
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
 
-DATASET_SCHEMA_VERSION = "ser8-historical-market-data-v2"
-INVENTORY_SCHEMA_VERSION = "ser8-historical-data-inventory-v2"
+DATASET_SCHEMA_VERSION = "ser8-historical-market-data-v3"
+INVENTORY_SCHEMA_VERSION = "ser8-historical-data-inventory-v3"
 SOURCE_PROOF_SCHEMA_VERSION = "ser8-mt5-history-source-proof-v1"
-COLLECTOR_VERSION = "1.2.0"
+COLLECTOR_VERSION = "1.3.0"
 CHUNK_COLLECTOR_VERSION = "1.1.0"
 CHUNK_POLICY_VERSION = "ser8-calendar-month-utc-v1"
 CHUNK_CACHE_SCHEMA_VERSION = "ser8-mt5-history-chunk-v1"
+COVERAGE_DISCOVERY_POLICY_VERSION = "ser8-backward-suffix-coverage-discovery-v1"
+COVERAGE_TRUNCATED_REASON_CODE = "HISTORICAL_COVERAGE_STARTS_LATER_THAN_REQUESTED"
+# A boundary may be established ONLY by a chunk failure positively classified
+# as genuine broker historical unavailability. Every other failure code —
+# transient, unknown, or a data-integrity violation — must never be
+# reinterpreted as "short history"; see _classify_chunk_failure_code().
+GENUINE_HISTORICAL_UNAVAILABLE_ERROR_CODES = frozenset(
+    {"BROKER_HISTORY_NOT_RETAINED_FOR_RANGE"}
+)
+DATA_INTEGRITY_CHUNK_ERROR_CODES = frozenset(
+    {
+        "BAR_IDENTITY_MISMATCH",
+        "CONFLICTING_DUPLICATE_BAR",
+        "CHUNK_BAR_OUTSIDE_REQUEST",
+        "CHUNK_DATA_INTEGRITY_FAILED",
+    }
+)
+# Deterministic, bounded retry budget applied only to a chunk failure that is
+# NOT yet positively classified as genuine-unavailable or data-integrity: a
+# transient/unknown failure gets this many total attempts before the symbol's
+# coverage is declared unresolved and failed closed.
+TRANSIENT_CHUNK_RETRY_ATTEMPTS = 2
+# MT5 last_error() numeric codes that positively confirm "no data found" for
+# an already symbol_info()-verified, visible symbol — as opposed to a
+# connection/timeout/internal failure, which stays generic/transient. Mapped
+# from the official MetaTrader5 Python package RES_* constants: RES_E_FAIL,
+# RES_E_INTERNAL_FAIL*, and IPC/connect/timeout codes are all left OUT of this
+# set on purpose because they do not prove historical unavailability.
+_MT5_GENUINE_NO_HISTORY_LAST_ERROR_CODES = frozenset({-4})  # RES_E_NOT_FOUND
 EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION = "ser8-execution-universe-canonical-v1"
 CHUNK_ACQUISITION_CODE_SHA256 = (
     "sha256:34a3d2633b744942eee35ab72d291bb5205275abfc4c5a38bd122f83e02607da"
@@ -242,6 +271,127 @@ class ChunkedAcquisitionV1:
 
 
 @dataclass(frozen=True, slots=True)
+class CoverageDiscoveryV1:
+    """Backward-suffix broker-coverage discovery result for one symbol.
+
+    Chunks are attempted from ``requested_to_utc`` backward. A chunk failure
+    is never itself the boundary: it is first positively classified.
+
+    - ``GENUINE_HISTORICAL_UNAVAILABLE`` (a closed, explicit error-code
+      allowlist — see ``GENUINE_HISTORICAL_UNAVAILABLE_ERROR_CODES``) is the
+      ONLY classification allowed to fix a truncated coverage boundary. Once
+      fixed, every older chunk is recorded as ``SKIPPED_UNAVAILABLE_PREFIX``
+      without any further cache lookup or broker call.
+    - ``DATA_INTEGRITY`` (``DATA_INTEGRITY_CHUNK_ERROR_CODES``, or a merge
+      conflict between two already-accepted chunks) always fails the whole
+      symbol closed: nothing is published, and whatever chunks had already
+      been individually accepted are discarded rather than silently kept as
+      a "truncated" dataset that hides the failing chunk.
+    - Anything else (``UNRESOLVED_TRANSIENT_OR_UNKNOWN`` — a transient read
+      failure, or any other unrecognized code) gets a bounded, deterministic
+      retry (``TRANSIENT_CHUNK_RETRY_ATTEMPTS``); if it still fails, coverage
+      for the whole symbol is left unresolved and fails closed exactly like a
+      data-integrity failure. It is never reinterpreted as "short history".
+
+    Because only a positively-classified genuine boundary can ever truncate
+    coverage, an intermittent valid/failed/valid pattern is never silently
+    bridged: a transient or integrity failure anywhere in the walk discards
+    the whole symbol rather than exposing a partial suffix around it.
+    """
+
+    bars: tuple[HistoricalBarV1, ...]
+    requested_from_utc: datetime
+    requested_to_utc: datetime
+    effective_from_utc: datetime | None
+    effective_to_utc: datetime | None
+    accepted_chunk_audit: tuple[Mapping[str, object], ...]
+    unavailable_prefix_chunk_audit: tuple[Mapping[str, object], ...]
+    discarded_chunk_audit: tuple[Mapping[str, object], ...]
+    abandoned_chunk_audit: tuple[Mapping[str, object], ...]
+    requested_chunk_count: int
+    accepted_chunk_count: int
+    empty_chunk_count: int
+    cached_chunk_count: int
+    acquired_chunk_count: int
+    coverage_truncated_at_requested_start: bool
+    truncation_reason_code: str | None
+    truncation_reason: str | None
+    unresolved_error_code: str | None = None
+    unresolved_error: str | None = None
+    integrity_error_code: str | None = None
+    integrity_error: str | None = None
+    merge_integrity_error_code: str | None = None
+    merge_integrity_error: str | None = None
+
+    @property
+    def resolution(self) -> str:
+        if self.unresolved_error_code is not None:
+            return "UNRESOLVED_TRANSIENT_FAILURE"
+        if self.integrity_error_code is not None or self.merge_integrity_error_code is not None:
+            return "DATA_INTEGRITY_FAILED"
+        if self.coverage_truncated_at_requested_start:
+            return "TRUNCATED_GENUINE_BOUNDARY"
+        return "COMPLETE"
+
+    @property
+    def coverage_available(self) -> bool:
+        return (
+            self.accepted_chunk_count > 0
+            and self.unresolved_error_code is None
+            and self.integrity_error_code is None
+            and self.merge_integrity_error_code is None
+        )
+
+    @property
+    def capture_complete(self) -> bool:
+        return (
+            self.requested_chunk_count > 0
+            and self.accepted_chunk_count == self.requested_chunk_count
+            and self.resolution == "COMPLETE"
+        )
+
+    def manifest_summary(self) -> dict[str, object]:
+        unavailable_prefix_chunk_count = len(self.unavailable_prefix_chunk_audit)
+        return {
+            "coverage_discovery_policy_version": COVERAGE_DISCOVERY_POLICY_VERSION,
+            "chunk_policy_version": CHUNK_POLICY_VERSION,
+            "coverage_resolution": self.resolution,
+            "requested_chunk_count": self.requested_chunk_count,
+            "accepted_chunk_count": self.accepted_chunk_count,
+            "empty_chunk_count": self.empty_chunk_count,
+            "cached_chunk_count": self.cached_chunk_count,
+            "acquired_chunk_count": self.acquired_chunk_count,
+            "unavailable_prefix_chunk_count": unavailable_prefix_chunk_count,
+            "discarded_chunk_count": len(self.discarded_chunk_audit),
+            "abandoned_chunk_count": len(self.abandoned_chunk_audit),
+            "chunk_audit": [dict(item) for item in self.accepted_chunk_audit],
+            "unavailable_prefix_chunk_audit": [
+                dict(item) for item in self.unavailable_prefix_chunk_audit
+            ],
+            "discarded_chunk_audit": [dict(item) for item in self.discarded_chunk_audit],
+            "abandoned_chunk_audit": [dict(item) for item in self.abandoned_chunk_audit],
+            "coverage_truncated_at_requested_start": self.coverage_truncated_at_requested_start,
+            "truncation_reason_code": self.truncation_reason_code,
+            "truncation_reason": self.truncation_reason,
+            "requested_coverage_start_utc": _utc_text(self.requested_from_utc),
+            "requested_coverage_end_utc": _utc_text(self.requested_to_utc),
+            "effective_coverage_start_utc": (
+                _utc_text(self.effective_from_utc) if self.effective_from_utc is not None else None
+            ),
+            "effective_coverage_end_utc": (
+                _utc_text(self.effective_to_utc) if self.effective_to_utc is not None else None
+            ),
+            "historical_capture_complete": self.capture_complete,
+            "unresolved_error_code": self.unresolved_error_code,
+            "unresolved_error": self.unresolved_error,
+            "integrity_error_code": self.integrity_error_code,
+            "integrity_error": self.integrity_error,
+            "merge_integrity_error_code": self.merge_integrity_error_code,
+            "merge_integrity_error": self.merge_integrity_error,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class HistoricalBarV1:
     time_utc: datetime
     symbol: str
@@ -354,6 +504,33 @@ def _positive_finite_or_none(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _mt5_last_error_code(last_error: object) -> int | None:
+    """Best-effort parse of MT5 ``last_error()``'s leading numeric code."""
+    if isinstance(last_error, (tuple, list)) and last_error:
+        try:
+            return int(last_error[0])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _classify_chunk_failure_code(error_code: str | None) -> str:
+    """Positively classify one chunk-level failure code.
+
+    Only ``GENUINE_HISTORICAL_UNAVAILABLE`` may ever establish a coverage
+    boundary. ``DATA_INTEGRITY`` always fails the symbol closed. Everything
+    else — including plain acquisition/read failures and unrecognized codes —
+    is ``UNRESOLVED_TRANSIENT_OR_UNKNOWN`` and must never silently shorten
+    coverage; it is only ever subject to the bounded retry policy and, if
+    still unresolved, fails the symbol closed.
+    """
+    if error_code in GENUINE_HISTORICAL_UNAVAILABLE_ERROR_CODES:
+        return "GENUINE_HISTORICAL_UNAVAILABLE"
+    if error_code in DATA_INTEGRITY_CHUNK_ERROR_CODES:
+        return "DATA_INTEGRITY"
+    return "UNRESOLVED_TRANSIENT_OR_UNKNOWN"
 
 
 def _sha256_hex(value: bytes) -> str:
@@ -879,9 +1056,22 @@ class MetaTrader5HistorySource:
             requested_to_utc.astimezone(timezone.utc),
         )
         if rates is None:
+            last_error = self._last_error()
+            if _mt5_last_error_code(last_error) in _MT5_GENUINE_NO_HISTORY_LAST_ERROR_CODES:
+                # last_error() positively reports "not found" for an already
+                # symbol_info()-verified, visible symbol: the broker has
+                # confirmed there is no data for this window, as opposed to a
+                # connection/timeout/internal failure. This is the ONLY signal
+                # allowed to establish a genuine historical-unavailability
+                # boundary; every other None-return stays generic/transient.
+                raise HistoricalDataError(
+                    "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE",
+                    f"MT5 positively reports no retained history for this window "
+                    f"(last_error={last_error})",
+                )
             raise HistoricalDataError(
                 "MT5_COPY_RATES_FAILED",
-                f"copy_rates_range failed with MT5 last_error={self._last_error()}",
+                f"copy_rates_range failed with MT5 last_error={last_error}",
             )
         names = tuple(getattr(getattr(rates, "dtype", None), "names", ()) or ())
         bars: list[HistoricalBarV1] = []
@@ -1169,6 +1359,104 @@ def _write_chunk_cache(
     return manifest
 
 
+def _attempt_chunk_acquisition(
+    *,
+    source: HistoricalRateSource,
+    source_proof: Mapping[str, object],
+    symbol: str,
+    timeframe: str,
+    chunk: HistoricalChunkV1,
+    staging_root: Path,
+    collector_code_sha256: str,
+) -> tuple[tuple[HistoricalBarV1, ...] | None, dict[str, object]]:
+    """Fetch or reuse one identity-verified chunk.
+
+    Returns ``(bars, audit)``. ``bars`` is ``None`` exactly when the chunk
+    failed; a successful chunk always returns a tuple (possibly empty, for a
+    genuinely quiet broker period).
+    """
+    identity = _chunk_cache_identity(
+        source_proof=source_proof,
+        symbol=symbol,
+        timeframe=timeframe,
+        chunk=chunk,
+        collector_code_sha256=collector_code_sha256,
+    )
+    cache_dir = chunk_cache_directory(
+        staging_root,
+        source_proof=source_proof,
+        symbol=symbol,
+        timeframe=timeframe,
+        chunk=chunk,
+    )
+    cache_validation = "NOT_PRESENT"
+    cache_error_code: str | None = None
+    bars: tuple[HistoricalBarV1, ...] | None = None
+    method = "MT5"
+    if cache_dir.exists():
+        try:
+            bars, _ = _load_valid_chunk_cache(
+                cache_dir,
+                expected_identity=identity,
+                chunk=chunk,
+            )
+            cache_validation = "VERIFIED"
+            method = "CACHE"
+        except HistoricalDataError as exc:
+            cache_validation = "REJECTED"
+            cache_error_code = exc.code
+    if bars is None:
+        try:
+            returned = source.copy_rates(
+                symbol,
+                timeframe,
+                chunk.chunk_from_utc,
+                chunk.chunk_to_utc,
+            )
+            bars = _validate_chunk_bars(
+                returned,
+                symbol=symbol,
+                timeframe=timeframe,
+                chunk=chunk,
+            )
+            cache_manifest = _write_chunk_cache(cache_dir, identity=identity, bars=bars)
+            if cache_manifest["bars_sha256"] != sha256_bytes(canonical_bars_csv(bars)):
+                raise HistoricalDataError(
+                    "CHUNK_CACHE_PUBLICATION_FAILED",
+                    f"chunk cache publication did not preserve {chunk.chunk_id}",
+                )
+        except Exception as exc:
+            error_code = exc.code if isinstance(exc, HistoricalDataError) else "CHUNK_ACQUISITION_FAILED"
+            audit = {
+                "chunk_id": chunk.chunk_id,
+                "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
+                "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
+                "status": "FAILED",
+                "acquisition_method": method,
+                "cache_validation": cache_validation,
+                "cache_error_code": cache_error_code,
+                "row_count": 0,
+                "bars_sha256": None,
+                "error_code": error_code,
+                "error": str(exc),
+            }
+            return None, audit
+    audit = {
+        "chunk_id": chunk.chunk_id,
+        "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
+        "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
+        "status": "EMPTY" if not bars else "COMPLETED",
+        "acquisition_method": method,
+        "cache_validation": cache_validation,
+        "cache_error_code": cache_error_code,
+        "row_count": len(bars),
+        "bars_sha256": sha256_bytes(canonical_bars_csv(bars)),
+        "error_code": None,
+        "error": None,
+    }
+    return bars, audit
+
+
 def acquire_chunked_history(
     *,
     source: HistoricalRateSource,
@@ -1189,98 +1477,26 @@ def acquire_chunked_history(
     audits: list[dict[str, object]] = []
     completed = empty = failed = cached = acquired = 0
     for index, chunk in enumerate(chunks, start=1):
-        identity = _chunk_cache_identity(
+        bars, audit = _attempt_chunk_acquisition(
+            source=source,
             source_proof=source_proof,
             symbol=normalized_symbol,
             timeframe=normalized_timeframe,
             chunk=chunk,
+            staging_root=staging_root,
             collector_code_sha256=collector_code_sha256,
         )
-        cache_dir = chunk_cache_directory(
-            staging_root,
-            source_proof=source_proof,
-            symbol=normalized_symbol,
-            timeframe=normalized_timeframe,
-            chunk=chunk,
-        )
-        cache_validation = "NOT_PRESENT"
-        cache_error_code: str | None = None
-        bars: tuple[HistoricalBarV1, ...] | None = None
-        method = "MT5"
-        if cache_dir.exists():
-            try:
-                bars, _ = _load_valid_chunk_cache(
-                    cache_dir,
-                    expected_identity=identity,
-                    chunk=chunk,
-                )
-                cache_validation = "VERIFIED"
-                method = "CACHE"
-                cached += 1
-            except HistoricalDataError as exc:
-                cache_validation = "REJECTED"
-                cache_error_code = exc.code
-        if bars is None:
-            try:
-                returned = source.copy_rates(
-                    normalized_symbol,
-                    normalized_timeframe,
-                    chunk.chunk_from_utc,
-                    chunk.chunk_to_utc,
-                )
-                bars = _validate_chunk_bars(
-                    returned,
-                    symbol=normalized_symbol,
-                    timeframe=normalized_timeframe,
-                    chunk=chunk,
-                )
-                cache_manifest = _write_chunk_cache(cache_dir, identity=identity, bars=bars)
-                if cache_manifest["bars_sha256"] != sha256_bytes(canonical_bars_csv(bars)):
-                    raise HistoricalDataError(
-                        "CHUNK_CACHE_PUBLICATION_FAILED",
-                        f"chunk cache publication did not preserve {chunk.chunk_id}",
-                    )
-                acquired += 1
-            except Exception as exc:
-                failed += 1
-                error_code = exc.code if isinstance(exc, HistoricalDataError) else "CHUNK_ACQUISITION_FAILED"
-                audit = {
-                    "chunk_id": chunk.chunk_id,
-                    "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
-                    "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
-                    "status": "FAILED",
-                    "acquisition_method": method,
-                    "cache_validation": cache_validation,
-                    "cache_error_code": cache_error_code,
-                    "row_count": 0,
-                    "bars_sha256": None,
-                    "error_code": error_code,
-                    "error": str(exc),
-                }
-                audits.append(audit)
-                if progress is not None:
-                    progress(index, len(chunks), audit)
-                continue
-        completed += 1
-        empty += int(not bars)
-        staged_bars.extend(bars)
-        bars_sha256 = sha256_bytes(canonical_bars_csv(bars))
-        audit = {
-            "chunk_id": chunk.chunk_id,
-            "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
-            "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
-            "status": "EMPTY" if not bars else "COMPLETED",
-            "acquisition_method": method,
-            "cache_validation": cache_validation,
-            "cache_error_code": cache_error_code,
-            "row_count": len(bars),
-            "bars_sha256": bars_sha256,
-            "error_code": None,
-            "error": None,
-        }
         audits.append(audit)
         if progress is not None:
             progress(index, len(chunks), audit)
+        if bars is None:
+            failed += 1
+            continue
+        completed += 1
+        empty += int(not bars)
+        cached += int(audit["acquisition_method"] == "CACHE")
+        acquired += int(audit["acquisition_method"] == "MT5")
+        staged_bars.extend(bars)
 
     merged: tuple[HistoricalBarV1, ...] = ()
     merge_error_code: str | None = None
@@ -1304,6 +1520,226 @@ def acquire_chunked_history(
         failed_chunk_count=failed,
         cached_chunk_count=cached,
         acquired_chunk_count=acquired,
+        merge_integrity_error_code=merge_error_code,
+        merge_integrity_error=merge_error,
+    )
+
+
+def _skipped_chunk_audit(chunk: HistoricalChunkV1, *, status: str) -> dict[str, object]:
+    return {
+        "chunk_id": chunk.chunk_id,
+        "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
+        "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
+        "status": status,
+        "acquisition_method": "NOT_ATTEMPTED",
+        "cache_validation": "NOT_ATTEMPTED",
+        "cache_error_code": None,
+        "row_count": 0,
+        "bars_sha256": None,
+        "error_code": None,
+        "error": None,
+    }
+
+
+def _attempt_chunk_with_bounded_retry(
+    *,
+    source: HistoricalRateSource,
+    source_proof: Mapping[str, object],
+    symbol: str,
+    timeframe: str,
+    chunk: HistoricalChunkV1,
+    staging_root: Path,
+    collector_code_sha256: str,
+    max_attempts: int,
+) -> tuple[tuple[HistoricalBarV1, ...] | None, dict[str, object]]:
+    """Attempt one chunk, retrying only a not-yet-positively-classified failure.
+
+    A failure classified as ``GENUINE_HISTORICAL_UNAVAILABLE`` or
+    ``DATA_INTEGRITY`` is conclusive on the first observation and is never
+    retried. Anything else (``UNRESOLVED_TRANSIENT_OR_UNKNOWN``) gets up to
+    ``max_attempts`` total tries — all read-only re-reads of the same
+    window — before being reported back as still-failing.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        bars, audit = _attempt_chunk_acquisition(
+            source=source,
+            source_proof=source_proof,
+            symbol=symbol,
+            timeframe=timeframe,
+            chunk=chunk,
+            staging_root=staging_root,
+            collector_code_sha256=collector_code_sha256,
+        )
+        audit = dict(audit)
+        audit["retry_attempts"] = attempt - 1
+        if bars is not None:
+            return bars, audit
+        classification = _classify_chunk_failure_code(audit.get("error_code"))
+        if classification != "UNRESOLVED_TRANSIENT_OR_UNKNOWN" or attempt >= max_attempts:
+            return None, audit
+
+
+def discover_available_coverage(
+    *,
+    source: HistoricalRateSource,
+    source_proof: Mapping[str, object],
+    symbol: str,
+    timeframe: str,
+    requested_from_utc: datetime,
+    requested_to_utc: datetime,
+    staging_root: Path,
+    collector_code_sha256: str,
+    progress: Any | None = None,
+    transient_retry_attempts: int = TRANSIENT_CHUNK_RETRY_ATTEMPTS,
+) -> CoverageDiscoveryV1:
+    """Discover the broker-supported contiguous coverage, working backward.
+
+    Chunks are attempted from ``requested_to_utc`` backward toward
+    ``requested_from_utc``. A chunk failure is never itself the boundary — it
+    is classified first via ``_classify_chunk_failure_code``:
+
+    - ``GENUINE_HISTORICAL_UNAVAILABLE`` fixes the coverage boundary: the
+      accepted suffix gathered so far is kept, and every older chunk is
+      recorded as ``SKIPPED_UNAVAILABLE_PREFIX`` without any further cache
+      lookup or broker call.
+    - ``DATA_INTEGRITY`` fails the whole symbol closed: chunks already
+      accepted are moved to ``discarded_chunk_audit`` (never published), and
+      no older chunk is probed.
+    - ``UNRESOLVED_TRANSIENT_OR_UNKNOWN`` gets a bounded, deterministic retry;
+      if still unresolved it fails the whole symbol closed exactly like a
+      data-integrity failure — it is never reinterpreted as a coverage
+      boundary or silently bridged around.
+
+    Because only a positively-classified genuine boundary can ever truncate
+    coverage, a merge conflict between two already-accepted chunks (detected
+    only after the walk completes) still fails the whole discovery closed via
+    ``merge_integrity_error_code``, discarding those chunks from publication.
+    """
+    normalized_symbol = symbol.strip().upper()
+    normalized_timeframe = timeframe.strip().upper()
+    chunks = plan_calendar_month_chunks(requested_from_utc, requested_to_utc)
+    total = len(chunks)
+    accepted_audits: list[dict[str, object]] = []
+    accepted_bars: list[HistoricalBarV1] = []
+    prefix_audits: list[dict[str, object]] = []
+    discarded_audits: list[dict[str, object]] = []
+    abandoned_audits: list[dict[str, object]] = []
+    cached = acquired = empty = 0
+    truncated = False
+    truncation_reason_code: str | None = None
+    truncation_reason: str | None = None
+    unresolved_error_code: str | None = None
+    unresolved_error: str | None = None
+    integrity_error_code: str | None = None
+    integrity_error: str | None = None
+    walking = True
+
+    for offset, chunk in enumerate(reversed(chunks)):
+        position = total - offset
+        if not walking:
+            status = "SKIPPED_UNAVAILABLE_PREFIX" if truncated else "NOT_ATTEMPTED_COVERAGE_UNRESOLVED"
+            audit = _skipped_chunk_audit(chunk, status=status)
+            (prefix_audits if truncated else abandoned_audits).append(audit)
+            if progress is not None:
+                progress(position, total, audit)
+            continue
+
+        bars, audit = _attempt_chunk_with_bounded_retry(
+            source=source,
+            source_proof=source_proof,
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+            chunk=chunk,
+            staging_root=staging_root,
+            collector_code_sha256=collector_code_sha256,
+            max_attempts=transient_retry_attempts,
+        )
+        if progress is not None:
+            progress(position, total, audit)
+        if bars is not None:
+            accepted_audits.append(audit)
+            accepted_bars.extend(bars)
+            empty += int(not bars)
+            cached += int(audit["acquisition_method"] == "CACHE")
+            acquired += int(audit["acquisition_method"] == "MT5")
+            continue
+
+        error_code = audit.get("error_code")
+        classification = _classify_chunk_failure_code(error_code)
+        if classification == "GENUINE_HISTORICAL_UNAVAILABLE":
+            truncated = True
+            truncation_reason_code = COVERAGE_TRUNCATED_REASON_CODE
+            truncation_reason = (
+                f"broker positively reports no retained history before "
+                f"{_utc_text(chunk.chunk_to_utc)} (chunk {chunk.chunk_id}, "
+                f"error_code={error_code})"
+            )
+            prefix_audits.append(audit)
+        elif classification == "DATA_INTEGRITY":
+            integrity_error_code = error_code
+            integrity_error = str(audit.get("error"))
+            discarded_audits.extend(accepted_audits)
+            accepted_audits = []
+            accepted_bars = []
+            abandoned_audits.append(audit)
+        else:
+            unresolved_error_code = error_code
+            unresolved_error = str(audit.get("error"))
+            discarded_audits.extend(accepted_audits)
+            accepted_audits = []
+            accepted_bars = []
+            abandoned_audits.append(audit)
+        walking = False
+
+    accepted_audits.reverse()
+    prefix_audits.reverse()
+    discarded_audits.reverse()
+    abandoned_audits.reverse()
+
+    merge_error_code: str | None = None
+    merge_error: str | None = None
+    merged: tuple[HistoricalBarV1, ...] = ()
+    if accepted_audits and unresolved_error_code is None and integrity_error_code is None:
+        try:
+            merged = merge_historical_bars(
+                accepted_bars,
+                symbol=normalized_symbol,
+                timeframe=normalized_timeframe,
+            )
+        except HistoricalDataError as exc:
+            merge_error_code = exc.code
+            merge_error = str(exc)
+
+    effective_from = (
+        parse_utc(str(accepted_audits[0]["chunk_from_utc"])) if accepted_audits else None
+    )
+    effective_to = (
+        parse_utc(str(accepted_audits[-1]["chunk_to_utc"])) if accepted_audits else None
+    )
+    return CoverageDiscoveryV1(
+        bars=merged,
+        requested_from_utc=_as_utc(requested_from_utc),
+        requested_to_utc=_as_utc(requested_to_utc),
+        effective_from_utc=effective_from,
+        effective_to_utc=effective_to,
+        accepted_chunk_audit=tuple(accepted_audits),
+        unavailable_prefix_chunk_audit=tuple(prefix_audits),
+        discarded_chunk_audit=tuple(discarded_audits),
+        abandoned_chunk_audit=tuple(abandoned_audits),
+        requested_chunk_count=total,
+        accepted_chunk_count=len(accepted_audits),
+        empty_chunk_count=empty,
+        cached_chunk_count=cached,
+        acquired_chunk_count=acquired,
+        coverage_truncated_at_requested_start=truncated,
+        truncation_reason_code=truncation_reason_code,
+        truncation_reason=truncation_reason,
+        unresolved_error_code=unresolved_error_code,
+        unresolved_error=unresolved_error,
+        integrity_error_code=integrity_error_code,
+        integrity_error=integrity_error,
         merge_integrity_error_code=merge_error_code,
         merge_integrity_error=merge_error,
     )
@@ -1511,6 +1947,246 @@ def _validate_chunk_acquisition_summary(
     return normalized
 
 
+def _default_coverage_discovery_summary(
+    *,
+    bars: Sequence[HistoricalBarV1],
+    requested_from_utc: datetime,
+    requested_to_utc: datetime,
+) -> dict[str, object]:
+    """Build a fully-accepted, untruncated coverage summary from direct input.
+
+    Used when a manifest is built from an already-validated bar list rather
+    than through :func:`discover_available_coverage` (e.g. legacy callers and
+    tests that supply bars directly).
+    """
+    base = _default_chunk_acquisition_summary(
+        bars=bars,
+        requested_from_utc=requested_from_utc,
+        requested_to_utc=requested_to_utc,
+    )
+    return {
+        "coverage_discovery_policy_version": COVERAGE_DISCOVERY_POLICY_VERSION,
+        "chunk_policy_version": CHUNK_POLICY_VERSION,
+        "coverage_resolution": "COMPLETE",
+        "requested_chunk_count": base["requested_chunk_count"],
+        "accepted_chunk_count": base["completed_chunk_count"],
+        "empty_chunk_count": base["empty_chunk_count"],
+        "cached_chunk_count": base["cached_chunk_count"],
+        "acquired_chunk_count": base["acquired_chunk_count"],
+        "unavailable_prefix_chunk_count": 0,
+        "discarded_chunk_count": 0,
+        "abandoned_chunk_count": 0,
+        "chunk_audit": base["chunk_audit"],
+        "unavailable_prefix_chunk_audit": [],
+        "discarded_chunk_audit": [],
+        "abandoned_chunk_audit": [],
+        "coverage_truncated_at_requested_start": False,
+        "truncation_reason_code": None,
+        "truncation_reason": None,
+        "requested_coverage_start_utc": _utc_text(requested_from_utc),
+        "requested_coverage_end_utc": _utc_text(requested_to_utc),
+        "effective_coverage_start_utc": _utc_text(requested_from_utc),
+        "effective_coverage_end_utc": _utc_text(requested_to_utc),
+        "historical_capture_complete": True,
+        "unresolved_error_code": None,
+        "unresolved_error": None,
+        "integrity_error_code": None,
+        "integrity_error": None,
+        "merge_integrity_error_code": None,
+        "merge_integrity_error": None,
+    }
+
+
+def _validate_coverage_discovery_summary(
+    summary: Mapping[str, object],
+    *,
+    requested_from_utc: datetime,
+    requested_to_utc: datetime,
+) -> dict[str, object]:
+    """Validate a per-symbol coverage-discovery summary against its plan.
+
+    Enforces that the accepted chunk audit is exactly the newest contiguous
+    suffix of the deterministic calendar-month plan, that the unavailable
+    prefix is exactly the older complement, that at most one boundary
+    failure exists and it is a POSITIVELY classified genuine-unavailable
+    error code (never a generic/transient/integrity code), and that
+    truncation bookkeeping is internally consistent. A summary carrying an
+    unresolved-transient, data-integrity, or merge-integrity error can never
+    be accepted for publication — this never weakens integrity checks on the
+    accepted chunks themselves, which are validated exactly like the legacy
+    full-range summary.
+    """
+    normalized = dict(summary)
+    if normalized.get("coverage_discovery_policy_version") != COVERAGE_DISCOVERY_POLICY_VERSION:
+        raise HistoricalDataError(
+            "COVERAGE_DISCOVERY_POLICY_MISMATCH",
+            f"coverage discovery policy must be {COVERAGE_DISCOVERY_POLICY_VERSION}",
+        )
+    if normalized.get("chunk_policy_version") != CHUNK_POLICY_VERSION:
+        raise HistoricalDataError("CHUNK_POLICY_MISMATCH", f"chunk policy must be {CHUNK_POLICY_VERSION}")
+    for field, code in (
+        ("merge_integrity_error_code", "COVERAGE_MERGE_INTEGRITY_FAILED"),
+        ("integrity_error_code", "COVERAGE_DATA_INTEGRITY_FAILED"),
+        ("unresolved_error_code", "COVERAGE_UNRESOLVED_TRANSIENT_FAILURE"),
+    ):
+        if normalized.get(field) is not None:
+            raise HistoricalDataError(
+                code,
+                f"coverage discovery {field} must be resolved before publication",
+            )
+    count_fields = (
+        "requested_chunk_count",
+        "accepted_chunk_count",
+        "empty_chunk_count",
+        "cached_chunk_count",
+        "acquired_chunk_count",
+        "unavailable_prefix_chunk_count",
+        "discarded_chunk_count",
+        "abandoned_chunk_count",
+    )
+    if any(type(normalized.get(field)) is not int or int(normalized[field]) < 0 for field in count_fields):
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "coverage discovery counts must be non-negative integers")
+    requested = int(normalized["requested_chunk_count"])
+    accepted = int(normalized["accepted_chunk_count"])
+    empty = int(normalized["empty_chunk_count"])
+    cached = int(normalized["cached_chunk_count"])
+    acquired = int(normalized["acquired_chunk_count"])
+    unavailable_prefix = int(normalized["unavailable_prefix_chunk_count"])
+    discarded_count = int(normalized["discarded_chunk_count"])
+    abandoned_count = int(normalized["abandoned_chunk_count"])
+    accepted_audit = normalized.get("chunk_audit")
+    prefix_audit = normalized.get("unavailable_prefix_chunk_audit")
+    discarded_audit = normalized.get("discarded_chunk_audit")
+    abandoned_audit = normalized.get("abandoned_chunk_audit")
+    if (
+        requested <= 0
+        or accepted == 0
+        or accepted + unavailable_prefix != requested
+        or discarded_count != 0
+        or abandoned_count != 0
+        or not isinstance(accepted_audit, list)
+        or len(accepted_audit) != accepted
+        or not isinstance(prefix_audit, list)
+        or len(prefix_audit) != unavailable_prefix
+        or not isinstance(discarded_audit, list)
+        or discarded_audit
+        or not isinstance(abandoned_audit, list)
+        or abandoned_audit
+        or empty > accepted
+        or cached + acquired != accepted
+    ):
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "coverage discovery summary is inconsistent")
+    status_counts = {
+        status: sum(isinstance(item, dict) and item.get("status") == status for item in accepted_audit)
+        for status in ("COMPLETED", "EMPTY")
+    }
+    if status_counts["COMPLETED"] + status_counts["EMPTY"] != accepted or status_counts["EMPTY"] != empty:
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "accepted chunk audit statuses do not match counts")
+    for item in accepted_audit:
+        if not isinstance(item, dict):
+            raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "accepted chunk audit entry must be an object")
+        status = item.get("status")
+        row_count = item.get("row_count")
+        bars_sha256 = item.get("bars_sha256")
+        if type(row_count) is not int or row_count < 0:
+            raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "chunk row count is invalid")
+        if status not in {"COMPLETED", "EMPTY"}:
+            raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "accepted chunk audit contains a non-accepted status")
+        if status == "EMPTY" and (row_count != 0 or not isinstance(bars_sha256, str)):
+            raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "empty chunk audit is invalid")
+        if status == "COMPLETED" and (row_count <= 0 or not isinstance(bars_sha256, str)):
+            raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "completed chunk audit is invalid")
+    failed_prefix_count = 0
+    for position, item in enumerate(prefix_audit):
+        if not isinstance(item, dict):
+            raise HistoricalDataError(
+                "COVERAGE_AUDIT_INVALID", "unavailable-prefix chunk audit entry must be an object"
+            )
+        status = item.get("status")
+        if status not in {"FAILED", "SKIPPED_UNAVAILABLE_PREFIX"}:
+            raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "unavailable-prefix chunk status is invalid")
+        if status == "FAILED":
+            failed_prefix_count += 1
+            if position != len(prefix_audit) - 1:
+                raise HistoricalDataError(
+                    "COVERAGE_AUDIT_INVALID",
+                    "only the newest unavailable-prefix chunk may carry a probed failure",
+                )
+            error_code = item.get("error_code")
+            if (
+                error_code not in GENUINE_HISTORICAL_UNAVAILABLE_ERROR_CODES
+                or item.get("row_count") != 0
+                or item.get("bars_sha256") is not None
+            ):
+                raise HistoricalDataError(
+                    "COVERAGE_AUDIT_INVALID",
+                    "the boundary chunk failure must be a positively classified genuine-unavailable error code",
+                )
+        else:
+            if (
+                item.get("acquisition_method") != "NOT_ATTEMPTED"
+                or item.get("row_count") != 0
+                or item.get("bars_sha256") is not None
+                or item.get("error_code") is not None
+            ):
+                raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "skipped prefix chunk audit is invalid")
+    if failed_prefix_count > 1:
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "at most one boundary failure may appear in the prefix audit")
+    planned = plan_calendar_month_chunks(requested_from_utc, requested_to_utc)
+    if len(planned) != requested:
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "chunk count does not match requested range")
+    expected_prefix = planned[:unavailable_prefix]
+    expected_accepted = planned[unavailable_prefix:]
+    for item, chunk in zip(prefix_audit, expected_prefix, strict=True):
+        if (
+            item.get("chunk_id") != chunk.chunk_id
+            or item.get("chunk_from_utc") != _utc_text(chunk.chunk_from_utc)
+            or item.get("chunk_to_utc") != _utc_text(chunk.chunk_to_utc)
+        ):
+            raise HistoricalDataError(
+                "COVERAGE_AUDIT_INVALID",
+                "unavailable-prefix boundaries do not match the deterministic UTC plan",
+            )
+    for item, chunk in zip(accepted_audit, expected_accepted, strict=True):
+        if (
+            item.get("chunk_id") != chunk.chunk_id
+            or item.get("chunk_from_utc") != _utc_text(chunk.chunk_from_utc)
+            or item.get("chunk_to_utc") != _utc_text(chunk.chunk_to_utc)
+        ):
+            raise HistoricalDataError(
+                "COVERAGE_AUDIT_INVALID",
+                "accepted chunk boundaries do not match the deterministic UTC plan",
+            )
+    expected_truncated = unavailable_prefix > 0
+    if bool(normalized.get("coverage_truncated_at_requested_start")) != expected_truncated:
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "truncation flag is inconsistent with prefix count")
+    expected_resolution = "TRUNCATED_GENUINE_BOUNDARY" if expected_truncated else "COMPLETE"
+    if normalized.get("coverage_resolution") != expected_resolution:
+        raise HistoricalDataError(
+            "COVERAGE_AUDIT_INVALID", "coverage_resolution does not match the truncation state"
+        )
+    if expected_truncated:
+        if normalized.get("truncation_reason_code") != COVERAGE_TRUNCATED_REASON_CODE:
+            raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "truncation reason code is invalid")
+        if not isinstance(normalized.get("truncation_reason"), str) or not normalized["truncation_reason"]:
+            raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "truncation reason text is required when truncated")
+    elif normalized.get("truncation_reason_code") is not None or normalized.get("truncation_reason") is not None:
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "truncation reason must be absent when not truncated")
+    expected_start = _utc_text(expected_accepted[0].chunk_from_utc)
+    expected_end = _utc_text(expected_accepted[-1].chunk_to_utc)
+    if (
+        normalized.get("requested_coverage_start_utc") != _utc_text(requested_from_utc)
+        or normalized.get("requested_coverage_end_utc") != _utc_text(requested_to_utc)
+        or normalized.get("effective_coverage_start_utc") != expected_start
+        or normalized.get("effective_coverage_end_utc") != expected_end
+    ):
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "requested/effective coverage bounds are inconsistent")
+    expected_complete = accepted == requested
+    if normalized.get("historical_capture_complete") is not expected_complete:
+        raise HistoricalDataError("COVERAGE_AUDIT_INVALID", "historical capture completion flag is inconsistent")
+    return normalized
+
+
 def build_dataset_manifest(
     *,
     bars: Sequence[HistoricalBarV1],
@@ -1526,7 +2202,7 @@ def build_dataset_manifest(
     expected_interval_seconds: int,
     source_capture_utc: datetime,
     collector_code_sha256: str,
-    chunk_acquisition: Mapping[str, object] | None = None,
+    coverage_discovery: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], bytes]:
     execution_account = str(execution_account_login).strip()
     market_data_account = str(source_proof.get("market_data_account_login") or "").strip()
@@ -1594,9 +2270,9 @@ def build_dataset_manifest(
     bars_sha256 = sha256_bytes(bars_bytes)
     requested_from = _as_utc(requested_from_utc)
     requested_to = _as_utc(requested_to_utc)
-    acquisition = _validate_chunk_acquisition_summary(
-        chunk_acquisition
-        or _default_chunk_acquisition_summary(
+    coverage = _validate_coverage_discovery_summary(
+        coverage_discovery
+        or _default_coverage_discovery_summary(
             bars=bars,
             requested_from_utc=requested_from_utc,
             requested_to_utc=requested_to_utc,
@@ -1632,6 +2308,10 @@ def build_dataset_manifest(
         "timeframe": timeframe.strip().upper(),
         "requested_from_utc": _utc_text(requested_from),
         "requested_to_utc": _utc_text(requested_to),
+        "effective_coverage_start_utc": coverage["effective_coverage_start_utc"],
+        "effective_coverage_end_utc": coverage["effective_coverage_end_utc"],
+        "coverage_truncated_at_requested_start": coverage["coverage_truncated_at_requested_start"],
+        "coverage_truncation_reason_code": coverage["truncation_reason_code"],
         "actual_first_bar_utc": _utc_text(actual_first) if actual_first else None,
         "actual_last_bar_utc": _utc_text(actual_last) if actual_last else None,
         "requested_duration_seconds": requested_duration_seconds,
@@ -1686,11 +2366,11 @@ def build_dataset_manifest(
         "risk_model_reason": broker_symbol.risk_model_reason or None,
         "collector_version": COLLECTOR_VERSION,
         "collector_code_sha256": collector_code_sha256,
-        **acquisition,
+        **coverage,
         **quality,
         "quality": quality,
         "accepted_historical_data": bool(
-            quality["data_integrity_pass"] and acquisition["historical_capture_complete"]
+            quality["data_integrity_pass"] and coverage["accepted_chunk_count"] > 0
         ),
         "gap_repair_performed": False,
         "synthetic_bars_added": 0,
@@ -1891,26 +2571,57 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
         raise HistoricalDataError("DATASET_QUALITY_MISMATCH", f"quality manifest mismatch: {dataset_dir}")
     requested_from = parse_utc(str(manifest.get("requested_from_utc") or ""))
     requested_to = parse_utc(str(manifest.get("requested_to_utc") or ""))
-    acquisition = _validate_chunk_acquisition_summary(
+    coverage = _validate_coverage_discovery_summary(
         {
             key: manifest.get(key)
             for key in (
+                "coverage_discovery_policy_version",
                 "chunk_policy_version",
+                "coverage_resolution",
                 "requested_chunk_count",
-                "completed_chunk_count",
+                "accepted_chunk_count",
                 "empty_chunk_count",
-                "failed_chunk_count",
                 "cached_chunk_count",
                 "acquired_chunk_count",
+                "unavailable_prefix_chunk_count",
+                "discarded_chunk_count",
+                "abandoned_chunk_count",
                 "chunk_audit",
+                "unavailable_prefix_chunk_audit",
+                "discarded_chunk_audit",
+                "abandoned_chunk_audit",
+                "coverage_truncated_at_requested_start",
+                "truncation_reason_code",
+                "truncation_reason",
+                "requested_coverage_start_utc",
+                "requested_coverage_end_utc",
+                "effective_coverage_start_utc",
+                "effective_coverage_end_utc",
                 "historical_capture_complete",
+                "unresolved_error_code",
+                "unresolved_error",
+                "integrity_error_code",
+                "integrity_error",
+                "merge_integrity_error_code",
+                "merge_integrity_error",
             )
         },
         requested_from_utc=requested_from,
         requested_to_utc=requested_to,
     )
+    if (
+        manifest.get("effective_coverage_start_utc") != coverage["effective_coverage_start_utc"]
+        or manifest.get("effective_coverage_end_utc") != coverage["effective_coverage_end_utc"]
+        or manifest.get("coverage_truncated_at_requested_start")
+        != coverage["coverage_truncated_at_requested_start"]
+        or manifest.get("coverage_truncation_reason_code") != coverage["truncation_reason_code"]
+    ):
+        raise HistoricalDataError(
+            "DATASET_COVERAGE_PROVENANCE_MISMATCH",
+            f"effective coverage provenance mismatch: {dataset_dir}",
+        )
     expected_acceptance = bool(
-        quality["data_integrity_pass"] and acquisition["historical_capture_complete"]
+        quality["data_integrity_pass"] and coverage["accepted_chunk_count"] > 0
     )
     if manifest.get("accepted_historical_data") is not expected_acceptance:
         raise HistoricalDataError("DATASET_ACCEPTANCE_MISMATCH", f"acceptance mismatch: {dataset_dir}")
@@ -1940,7 +2651,10 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
         "execution_universe_sha256", "execution_universe_canonical_sha256",
         "execution_universe_canonical_schema_version", "market_data_account_server",
         "market_data_account_company", "market_data_account_currency", "symbol", "timeframe",
-        "requested_from_utc", "requested_to_utc", "actual_first_bar_utc",
+        "requested_from_utc", "requested_to_utc",
+        "effective_coverage_start_utc", "effective_coverage_end_utc",
+        "coverage_truncated_at_requested_start", "coverage_truncation_reason_code",
+        "actual_first_bar_utc",
         "actual_last_bar_utc", "requested_duration_seconds", "observed_span_seconds",
         "first_bar_offset_seconds", "last_bar_offset_seconds", "bars_sha256",
         "symbol_point", "symbol_digits",
@@ -2219,7 +2933,13 @@ __all__ = [
     "ASSET_CLASS_FX",
     "BAR_FIELDS",
     "CHUNK_ACQUISITION_CODE_SHA256",
+    "CHUNK_POLICY_VERSION",
     "COLLECTOR_VERSION",
+    "COVERAGE_DISCOVERY_POLICY_VERSION",
+    "COVERAGE_TRUNCATED_REASON_CODE",
+    "DATA_INTEGRITY_CHUNK_ERROR_CODES",
+    "GENUINE_HISTORICAL_UNAVAILABLE_ERROR_CODES",
+    "TRANSIENT_CHUNK_RETRY_ATTEMPTS",
     "EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS",
     "EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION",
     "EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS",
@@ -2231,21 +2951,27 @@ __all__ = [
     "SER8_EXECUTION_ACCOUNT_LOGIN",
     "BrokerSymbolV1",
     "CanonicalExecutionUniverseV1",
+    "ChunkedAcquisitionV1",
+    "CoverageDiscoveryV1",
     "HistoricalBarV1",
     "HistoricalDataError",
     "HistoricalRateSource",
     "MetaTrader5HistorySource",
+    "acquire_chunked_history",
     "assert_historical_artifact_isolation",
     "build_dataset_manifest",
     "build_canonical_execution_universe",
     "canonical_bars_csv",
+    "discover_available_coverage",
     "load_canonical_execution_universe",
     "collector_code_sha256",
     "inventory_hash",
     "load_broker_universe",
     "load_canonical_bars",
     "load_inventory",
+    "merge_historical_bars",
     "parse_utc",
+    "plan_calendar_month_chunks",
     "publish_dataset",
     "publish_canonical_execution_universe_snapshot",
     "source_proof_result",

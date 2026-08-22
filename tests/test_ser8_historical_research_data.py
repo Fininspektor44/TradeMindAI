@@ -364,6 +364,102 @@ def test_missing_history_is_unavailable_and_never_fabricated(
     assert compatibility.read_text() == "symbol,rows\nEURUSD,120\n"
 
 
+class _ChunkAwareFakeSource:
+    """Fake MT5 source whose per-chunk response depends on the requested
+    window, so the full collection CLI can be exercised against a genuine
+    older-prefix-unavailable / recent-suffix-available broker pattern."""
+
+    unavailable_before: datetime = datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+    def __init__(self, **kwargs: object) -> None:
+        self.closed = False
+
+    def source_proof(self) -> dict[str, object]:
+        return _proof()
+
+    def symbol_metadata(self, symbol: str) -> dict[str, object]:
+        return {
+            "name": symbol,
+            "point": 0.00001,
+            "digits": 5,
+            "visible": True,
+            "trade_tick_size": 0.00001,
+            "trade_mode_name": "FULL",
+        }
+
+    def copy_rates(
+        self, symbol: str, timeframe: str, requested_from_utc: datetime, requested_to_utc: datetime
+    ) -> tuple[HistoricalBarV1, ...]:
+        if requested_from_utc < self.unavailable_before:
+            raise HistoricalDataError(
+                "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE", "no broker history that far back"
+            )
+        return _bars(150, symbol=symbol, start=requested_from_utc + timedelta(hours=1))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_full_pipeline_accepts_truncated_coverage_for_older_prefix_unavailable_symbol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    common = tmp_path / "Common Files" / "TradeMindAI"
+    _write_universe(common / f"mt5_risk_symbols_utc_{ACCOUNT}.csv", [_symbol_row("EURUSD")])
+    monkeypatch.setattr(inventory_cli, "MetaTrader5HistorySource", _ChunkAwareFakeSource)
+    dataset_root = tmp_path / "historical data"
+    inventory = dataset_root / "historical_inventory.json"
+    compatibility = dataset_root / "historical_rows.csv"
+    exit_code = inventory_cli.main(
+        [
+            "--mode", "collect",
+            "--execution-account", ACCOUNT,
+            "--market-data-account", MARKET_DATA_ACCOUNT,
+            "--mt5-export-dir", str(common),
+            "--from-utc", "2026-05-01T00:00:00Z",
+            "--to-utc", "2026-08-21T00:00:00Z",
+            "--dataset-root", str(dataset_root),
+            "--inventory", str(inventory),
+            "--compatibility-csv", str(compatibility),
+        ]
+    )
+    capsys.readouterr()
+    assert exit_code == 0
+    entry = load_inventory(inventory)["entries"][0]
+    assert entry["status"] == "HISTORICAL_DATA_READY"
+    assert entry["coverage_truncated_at_requested_start"] is True
+    assert entry["truncation_reason_code"] == "HISTORICAL_COVERAGE_STARTS_LATER_THAN_REQUESTED"
+    assert entry["effective_coverage_start_utc"] == "2026-07-01T00:00:00Z"
+    assert entry["requested_coverage_start_utc"] == "2026-05-01T00:00:00Z"
+    assert "effective coverage starts" in entry["status_reason"]
+    assert entry["row_count"] == 300
+    assert entry["accepted_historical_data"] is True
+    manifest = verify_dataset(Path(str(entry["dataset_dir"])))
+    assert manifest["coverage_truncated_at_requested_start"] is True
+    assert manifest["accepted_historical_data"] is True
+
+    # Rerun: the accepted suffix comes entirely from verified chunk cache, and
+    # the dataset identity is unchanged (deterministic, resumable coverage).
+    second_exit_code = inventory_cli.main(
+        [
+            "--mode", "collect",
+            "--execution-account", ACCOUNT,
+            "--market-data-account", MARKET_DATA_ACCOUNT,
+            "--mt5-export-dir", str(common),
+            "--from-utc", "2026-05-01T00:00:00Z",
+            "--to-utc", "2026-08-21T00:00:00Z",
+            "--dataset-root", str(dataset_root),
+            "--inventory", str(inventory),
+            "--compatibility-csv", str(compatibility),
+        ]
+    )
+    capsys.readouterr()
+    assert second_exit_code == 0
+    second_entry = load_inventory(inventory)["entries"][0]
+    assert second_entry["dataset_sha256"] == entry["dataset_sha256"]
+
+
 def test_inventory_binds_both_accounts_and_excludes_market_data_only_symbol(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -569,6 +665,92 @@ def test_unsupported_and_disabled_symbols_stay_gated(
     assert entries["US500"]["status"] == "RISK_MODEL_UNSUPPORTED"
     assert entries["EURUSD"]["status"] == "BROKER_SYMBOL_DISABLED"
     assert entries["EURUSD"]["dataset_sha256"] is None
+    # F: broker-symbol-disabled must never be reinterpreted as truncated
+    # historical coverage — the entry never even reached chunk discovery.
+    assert "coverage_truncated_at_requested_start" not in entries["EURUSD"]
+
+
+def test_broker_symbol_unavailable_is_never_reinterpreted_as_short_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class _UnavailableSymbolSource(_FakeSource):
+        def symbol_metadata(self, symbol: str) -> dict[str, object]:
+            if symbol == "EURUSD":
+                raise HistoricalDataError(
+                    "BROKER_SYMBOL_UNAVAILABLE", "MT5 symbol_info unavailable for EURUSD"
+                )
+            return super().symbol_metadata(symbol)
+
+    common = tmp_path / "Common Files" / "TradeMindAI"
+    _write_universe(common / f"mt5_risk_symbols_utc_{ACCOUNT}.csv", [_symbol_row("EURUSD")])
+    _FakeSource.bars_by_symbol = {"EURUSD": _bars(120)}
+    monkeypatch.setattr(inventory_cli, "MetaTrader5HistorySource", _UnavailableSymbolSource)
+    dataset_root = tmp_path / "historical data"
+    inventory = dataset_root / "historical_inventory.json"
+    exit_code = inventory_cli.main(
+        [
+            "--mode", "collect",
+            "--execution-account", ACCOUNT,
+            "--market-data-account", MARKET_DATA_ACCOUNT,
+            "--mt5-export-dir", str(common),
+            "--from-utc", "2026-08-01T00:00:00Z",
+            "--to-utc", "2026-08-21T00:00:00Z",
+            "--dataset-root", str(dataset_root),
+            "--inventory", str(inventory),
+            "--compatibility-csv", str(dataset_root / "historical_rows.csv"),
+        ]
+    )
+    capsys.readouterr()
+    assert exit_code == 0
+    entry = load_inventory(inventory)["entries"][0]
+    # E: broker-symbol-unavailable must remain exactly that — never
+    # reinterpreted as truncated/short historical coverage.
+    assert entry["status"] == "BROKER_SYMBOL_UNAVAILABLE"
+    assert "coverage_truncated_at_requested_start" not in entry
+    assert entry["dataset_sha256"] is None
+
+
+def test_transient_failure_full_pipeline_fails_closed_not_truncated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """B: a transient/generic acquisition failure between valid chunks must
+    fail the symbol closed through the full CLI pipeline too — never
+    published as a truncated dataset."""
+
+    class _TransientFailureSource(_ChunkAwareFakeSource):
+        def copy_rates(
+            self, symbol: str, timeframe: str, requested_from_utc: datetime, requested_to_utc: datetime
+        ) -> tuple[HistoricalBarV1, ...]:
+            if requested_from_utc < datetime(2026, 6, 1, tzinfo=timezone.utc):
+                raise HistoricalDataError("MT5_COPY_RATES_FAILED", "temporary read failure")
+            return _bars(150, symbol=symbol, start=requested_from_utc + timedelta(hours=1))
+
+    common = tmp_path / "Common Files" / "TradeMindAI"
+    _write_universe(common / f"mt5_risk_symbols_utc_{ACCOUNT}.csv", [_symbol_row("EURUSD")])
+    monkeypatch.setattr(inventory_cli, "MetaTrader5HistorySource", _TransientFailureSource)
+    dataset_root = tmp_path / "historical data"
+    inventory = dataset_root / "historical_inventory.json"
+    exit_code = inventory_cli.main(
+        [
+            "--mode", "collect",
+            "--execution-account", ACCOUNT,
+            "--market-data-account", MARKET_DATA_ACCOUNT,
+            "--mt5-export-dir", str(common),
+            "--from-utc", "2026-05-01T00:00:00Z",
+            "--to-utc", "2026-08-21T00:00:00Z",
+            "--dataset-root", str(dataset_root),
+            "--inventory", str(inventory),
+            "--compatibility-csv", str(dataset_root / "historical_rows.csv"),
+        ]
+    )
+    capsys.readouterr()
+    assert exit_code == 0
+    entry = load_inventory(inventory)["entries"][0]
+    assert entry["status"] == "HISTORICAL_CHUNK_ACQUISITION_FAILED"
+    assert entry["coverage_truncated_at_requested_start"] is False
+    assert entry["unresolved_error_code"] == "MT5_COPY_RATES_FAILED"
+    assert entry["dataset_sha256"] is None
+    assert entry["accepted_historical_data"] is False
 
 
 def test_mt5_source_verifies_terminal_account_symbol_and_utc() -> None:
@@ -1043,7 +1225,7 @@ def test_dataset_verifier_detects_tampered_bar(tmp_path: Path) -> None:
 
 def test_policy_uses_existing_research_minimum_and_m5_contract() -> None:
     policy = load_research_policy(POLICY_PATH)
-    assert policy["collector_version"] == "1.2.0"
+    assert policy["collector_version"] == "1.3.0"
     assert policy["chunk_policy_version"] == "ser8-calendar-month-utc-v1"
     assert policy["initial_timeframe"] == "M5"
     assert policy["expected_interval_seconds"] == 300
