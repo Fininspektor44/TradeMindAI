@@ -70,18 +70,33 @@ raw-export audit evidence from stable execution semantics:
   `data/ser8_historical_market_data/execution_universe_snapshots/<sha256>/snapshot.json`.
   Dataset verification recomputes its hash without reading the current live CSV.
 
-The authoritative export schema is classified explicitly. `time_msc` is
-AUDIT/VOLATILE because it records export capture time and is not consumed by
-execution or research semantics. Every other declared source field is
-IDENTITY-RELEVANT:
+The authoritative current schema emitted by both
+`TradeMind_MT5_Risk_Snapshot_Exporter.mq5` and the demo executor is classified
+explicitly: `time_msc`, `account_login`, `server`, `currency`, `symbol`,
+`digits`, `trade_mode`, `bid`, `ask`, `tick_size`, `tick_value`,
+`tick_value_profit`, `tick_value_loss`, `volume_min`, `volume_max`,
+`volume_step`, `contract_size`, `margin_initial`, `margin_maintenance`,
+`margin_buy_per_volume`, `margin_sell_per_volume`, `leverage`, and
+`expiration_mode_flags`.
 
-- identity and account compatibility: `account_login`, `currency`, `symbol`;
+`time_msc`, `bid`, and `ask` are AUDIT/VOLATILE. They record capture time and
+the live quote observed during export, remain protected by the exact-byte raw
+SHA, and are deliberately absent from the canonical semantic rows. A quote or
+capture-time change therefore cannot change canonical identity. Every other
+declared source field is IDENTITY-RELEVANT:
+
+- execution-source and account compatibility: `account_login`, `server`,
+  `currency`, `symbol`. Server text is trimmed but case-preserved; a genuine
+  execution-account server change changes canonical identity and mixed-server
+  rows fail closed;
 - trade-direction eligibility: `trade_mode`;
-- price/risk sizing: `tick_size`, `tick_value`, `tick_value_profit`,
-  `tick_value_loss`;
+- price precision and risk sizing: `digits`, `tick_size`, `tick_value`,
+  `tick_value_profit`, `tick_value_loss`;
 - order-volume constraints: `volume_min`, `volume_max`, `volume_step`;
 - margin/notional fallback: `contract_size`, `margin_initial`,
-  `margin_buy_per_volume`, `margin_sell_per_volume`, `leverage`.
+  `margin_maintenance`, `margin_buy_per_volume`, `margin_sell_per_volume`,
+  `leverage`;
+- broker order-lifetime capability: `expiration_mode_flags`.
 
 The snapshot also binds deterministic derived `asset_class` and
 `risk_model_supported` fields. Numeric source values become finite canonical

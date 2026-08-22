@@ -125,8 +125,10 @@ def _broker() -> BrokerSymbolV1:
 def _execution_row() -> dict[str, str]:
     return {
         "account_login": ACCOUNT,
+        "server": "RoboForex-Demo",
         "currency": "USD",
         "symbol": "EURUSD",
+        "digits": "5",
         "trade_mode": "FULL",
         "tick_size": "0.00001",
         "tick_value": "1",
@@ -137,9 +139,11 @@ def _execution_row() -> dict[str, str]:
         "volume_step": "0.01",
         "contract_size": "100000",
         "margin_initial": "0",
+        "margin_maintenance": "0",
         "margin_buy_per_volume": "1",
         "margin_sell_per_volume": "1",
         "leverage": "100",
+        "expiration_mode_flags": "15",
     }
 
 

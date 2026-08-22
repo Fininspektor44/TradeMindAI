@@ -70,9 +70,13 @@ def _symbol_row(symbol: str, *, trade_mode: str = "FULL") -> dict[str, str]:
     return {
         "time_msc": "1787313600000",
         "account_login": ACCOUNT,
+        "server": "RoboForex-Demo",
         "currency": "USD",
         "symbol": symbol,
+        "digits": "5",
         "trade_mode": trade_mode,
+        "bid": "1.10000",
+        "ask": "1.10010",
         "tick_size": "0.00001",
         "tick_value": "1",
         "tick_value_profit": "1",
@@ -82,9 +86,11 @@ def _symbol_row(symbol: str, *, trade_mode: str = "FULL") -> dict[str, str]:
         "volume_step": "0.01",
         "contract_size": "100000",
         "margin_initial": "0",
+        "margin_maintenance": "0",
         "margin_buy_per_volume": "1",
         "margin_sell_per_volume": "1",
         "leverage": "100",
+        "expiration_mode_flags": "15",
     }
 
 

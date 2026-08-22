@@ -28,7 +28,6 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from trademind.ser8_symbol_universe import (
     ASSET_CLASS_FX,
-    SYMBOL_REQUIRED_FIELDS,
     classify_asset_class,
     risk_model_support_for_symbol_row,
 )
@@ -72,15 +71,16 @@ _DATASET_HASH_DOMAIN = b"trademind:ser8:historical-market-data:v2"
 _INVENTORY_HASH_DOMAIN = b"trademind:ser8:historical-data-inventory:v2"
 _CHUNK_SOURCE_HASH_DOMAIN = b"trademind:ser8:historical-chunk-source:v1"
 _EXECUTION_UNIVERSE_HASH_DOMAIN = b"trademind:ser8:execution-universe-canonical:v1"
-EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS = ("time_msc",)
-EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS = tuple(
-    field for field in SYMBOL_REQUIRED_FIELDS if field not in EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS
-)
-EXECUTION_UNIVERSE_DERIVED_IDENTITY_FIELDS = (
-    "asset_class",
-    "risk_model_supported",
-)
-_EXECUTION_UNIVERSE_NUMERIC_FIELDS = (
+EXECUTION_UNIVERSE_SOURCE_FIELDS = (
+    "time_msc",
+    "account_login",
+    "server",
+    "currency",
+    "symbol",
+    "digits",
+    "trade_mode",
+    "bid",
+    "ask",
     "tick_size",
     "tick_value",
     "tick_value_profit",
@@ -90,9 +90,38 @@ _EXECUTION_UNIVERSE_NUMERIC_FIELDS = (
     "volume_step",
     "contract_size",
     "margin_initial",
+    "margin_maintenance",
     "margin_buy_per_volume",
     "margin_sell_per_volume",
     "leverage",
+    "expiration_mode_flags",
+)
+EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS = ("time_msc", "bid", "ask")
+EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS = tuple(
+    field
+    for field in EXECUTION_UNIVERSE_SOURCE_FIELDS
+    if field not in EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS
+)
+EXECUTION_UNIVERSE_DERIVED_IDENTITY_FIELDS = (
+    "asset_class",
+    "risk_model_supported",
+)
+_EXECUTION_UNIVERSE_NUMERIC_FIELDS = (
+    "digits",
+    "tick_size",
+    "tick_value",
+    "tick_value_profit",
+    "tick_value_loss",
+    "volume_min",
+    "volume_max",
+    "volume_step",
+    "contract_size",
+    "margin_initial",
+    "margin_maintenance",
+    "margin_buy_per_volume",
+    "margin_sell_per_volume",
+    "leverage",
+    "expiration_mode_flags",
 )
 _LIVE_ARTIFACT_PATH_PARTS = frozenset({
     "live_signal_runtime_v1",
@@ -401,17 +430,19 @@ def _canonicalize_execution_universe_row(
             f"symbol export account {actual_login!r} does not match {account_login!r}",
         )
     symbol = str(row.get("symbol") or "").strip().upper()
+    server = str(row.get("server") or "").strip()
     currency = str(row.get("currency") or "").strip().upper()
     trade_mode = str(row.get("trade_mode") or "").strip().upper()
     if not symbol:
         raise HistoricalDataError("BROKER_SYMBOL_MISSING", "broker universe contains an empty symbol")
-    if not currency or not trade_mode:
+    if not server or not currency or not trade_mode:
         raise HistoricalDataError(
             "BROKER_UNIVERSE_FIELD_MALFORMED",
-            f"{symbol} currency and trade_mode must be non-empty",
+            f"{symbol} server, currency, and trade_mode must be non-empty",
         )
     normalized: dict[str, object] = {
         "account_login": actual_login,
+        "server": server,
         "currency": currency,
         "symbol": symbol,
         "trade_mode": trade_mode,
@@ -431,6 +462,7 @@ def _canonical_universe_contract() -> dict[str, object]:
         "audit_volatile_source_fields": list(EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS),
         "derived_identity_fields": list(EXECUTION_UNIVERSE_DERIVED_IDENTITY_FIELDS),
         "numeric_representation": "FINITE_DECIMAL_CANONICAL_STRING",
+        "server_representation": "TRIMMED_CASE_PRESERVED_EXECUTION_SOURCE_IDENTITY",
         "row_order": "EXACT_NORMALIZED_SYMBOL_ASCENDING",
         "duplicate_symbol_policy": "IDENTICAL_NORMALIZED_ROWS_DEDUPLICATED_CONFLICTS_REJECTED",
     }
@@ -543,6 +575,12 @@ def build_canonical_execution_universe(
         by_symbol[symbol] = normalized
     if not by_symbol:
         raise HistoricalDataError("BROKER_UNIVERSE_EMPTY", "broker universe contains no rows")
+    servers = {str(row["server"]) for row in by_symbol.values()}
+    if len(servers) != 1:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_SERVER_MISMATCH",
+            "broker universe contains multiple execution-account servers",
+        )
     canonical_rows = [by_symbol[symbol] for symbol in sorted(by_symbol)]
     snapshot: dict[str, object] = {
         "schema_version": EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION,
@@ -601,13 +639,13 @@ def load_canonical_execution_universe(
             "BROKER_UNIVERSE_COLUMNS_DUPLICATE",
             "broker universe contains duplicate column names",
         )
-    missing = [field for field in SYMBOL_REQUIRED_FIELDS if field not in fieldnames]
+    missing = [field for field in EXECUTION_UNIVERSE_SOURCE_FIELDS if field not in fieldnames]
     if missing:
         raise HistoricalDataError(
             "BROKER_UNIVERSE_COLUMNS_MISSING",
             f"broker universe is missing required columns: {missing}",
         )
-    unclassified = [field for field in fieldnames if field not in SYMBOL_REQUIRED_FIELDS]
+    unclassified = [field for field in fieldnames if field not in EXECUTION_UNIVERSE_SOURCE_FIELDS]
     if unclassified:
         raise HistoricalDataError(
             "BROKER_UNIVERSE_COLUMNS_UNCLASSIFIED",
@@ -2178,7 +2216,10 @@ __all__ = [
     "BAR_FIELDS",
     "CHUNK_ACQUISITION_CODE_SHA256",
     "COLLECTOR_VERSION",
+    "EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS",
     "EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION",
+    "EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS",
+    "EXECUTION_UNIVERSE_SOURCE_FIELDS",
     "DATASET_SCHEMA_VERSION",
     "INVENTORY_SCHEMA_VERSION",
     "READ_ONLY_MT5_OPERATIONS",

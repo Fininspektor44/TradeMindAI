@@ -10,7 +10,10 @@ from pathlib import Path
 import pytest
 
 from trademind.ser8_historical_data import (
+    EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS,
     EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION,
+    EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS,
+    EXECUTION_UNIVERSE_SOURCE_FIELDS,
     READ_ONLY_MT5_OPERATIONS,
     HistoricalBarV1,
     HistoricalDataError,
@@ -22,7 +25,6 @@ from trademind.ser8_historical_data import (
     verify_canonical_execution_universe_snapshot,
     verify_dataset,
 )
-from trademind.ser8_symbol_universe import SYMBOL_REQUIRED_FIELDS
 
 ACCOUNT = "67206924"
 MARKET_DATA_ACCOUNT = "77053345"
@@ -36,15 +38,25 @@ def _row(
     *,
     time_msc: str = "1787313600000",
     account_login: str = ACCOUNT,
+    server: str = "RoboForex-Demo",
+    digits: str = "5",
     trade_mode: str = "FULL",
+    bid: str = "1.10000",
+    ask: str = "1.10010",
     tick_size: str = "0.00001",
+    margin_maintenance: str = "0",
+    expiration_mode_flags: str = "15",
 ) -> dict[str, str]:
     return {
         "time_msc": time_msc,
         "account_login": account_login,
+        "server": server,
         "currency": "USD",
         "symbol": symbol,
+        "digits": digits,
         "trade_mode": trade_mode,
+        "bid": bid,
+        "ask": ask,
         "tick_size": tick_size,
         "tick_value": "1",
         "tick_value_profit": "1.0",
@@ -54,9 +66,11 @@ def _row(
         "volume_step": "0.010",
         "contract_size": "100000",
         "margin_initial": "0",
+        "margin_maintenance": margin_maintenance,
         "margin_buy_per_volume": "1",
         "margin_sell_per_volume": "1.0",
         "leverage": "100",
+        "expiration_mode_flags": expiration_mode_flags,
     }
 
 
@@ -64,7 +78,7 @@ def _csv_bytes(
     rows: list[dict[str, str]],
     *,
     line_ending: str = "\n",
-    fieldnames: tuple[str, ...] = SYMBOL_REQUIRED_FIELDS,
+    fieldnames: tuple[str, ...] = EXECUTION_UNIVERSE_SOURCE_FIELDS,
 ) -> bytes:
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=fieldnames, lineterminator=line_ending)
@@ -133,6 +147,88 @@ def _manifest(universe, *, captured_at: datetime = END):
         source_capture_utc=captured_at,
         collector_code_sha256="sha256:" + "c" * 64,
     )
+
+
+def test_actual_authoritative_export_schema_is_explicitly_classified_and_accepted(
+    tmp_path: Path,
+) -> None:
+    universe = _load(tmp_path, "actual-schema.csv", _csv_bytes([_row("EURUSD")]))
+    assert EXECUTION_UNIVERSE_SOURCE_FIELDS == (
+        "time_msc", "account_login", "server", "currency", "symbol", "digits",
+        "trade_mode", "bid", "ask", "tick_size", "tick_value", "tick_value_profit",
+        "tick_value_loss", "volume_min", "volume_max", "volume_step", "contract_size",
+        "margin_initial", "margin_maintenance", "margin_buy_per_volume",
+        "margin_sell_per_volume", "leverage", "expiration_mode_flags",
+    )
+    assert EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS == ("time_msc", "bid", "ask")
+    assert {
+        "server", "digits", "margin_maintenance", "expiration_mode_flags",
+    } <= set(EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS)
+    canonical_row = universe.canonical_snapshot["rows"][0]
+    assert set(EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS).isdisjoint(canonical_row)
+    assert canonical_row["server"] == "RoboForex-Demo"
+    assert canonical_row["digits"] == "5"
+    assert canonical_row["margin_maintenance"] == "0"
+    assert canonical_row["expiration_mode_flags"] == "15"
+
+
+@pytest.mark.parametrize(("field", "changed"), [("bid", "1.20000"), ("ask", "1.20010")])
+def test_bid_and_ask_changes_are_raw_only_and_do_not_change_canonical_sha(
+    tmp_path: Path,
+    field: str,
+    changed: str,
+) -> None:
+    original = _row("EURUSD")
+    first = _load(tmp_path, f"{field}-first.csv", _csv_bytes([original]))
+    second = _load(
+        tmp_path,
+        f"{field}-second.csv",
+        _csv_bytes([{**original, field: changed}]),
+    )
+    assert first.raw_sha256 != second.raw_sha256
+    assert first.canonical_sha256 == second.canonical_sha256
+    assert first.canonical_snapshot == second.canonical_snapshot
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("digits", "4"),
+        ("margin_maintenance", "250"),
+        ("expiration_mode_flags", "7"),
+    ],
+)
+def test_new_execution_semantic_fields_change_canonical_sha(
+    tmp_path: Path,
+    field: str,
+    changed: str,
+) -> None:
+    original = _row("EURUSD")
+    first = _load(tmp_path, f"{field}-first.csv", _csv_bytes([original]))
+    second = _load(
+        tmp_path,
+        f"{field}-second.csv",
+        _csv_bytes([{**original, field: changed}]),
+    )
+    assert first.canonical_sha256 != second.canonical_sha256
+
+
+def test_server_is_trimmed_case_preserved_execution_source_identity(tmp_path: Path) -> None:
+    original = _row("EURUSD", server="RoboForex-Demo")
+    first = _load(tmp_path, "server-first.csv", _csv_bytes([original]))
+    whitespace = _load(
+        tmp_path,
+        "server-whitespace.csv",
+        _csv_bytes([{**original, "server": "  RoboForex-Demo  "}]),
+    )
+    changed = _load(
+        tmp_path,
+        "server-changed.csv",
+        _csv_bytes([{**original, "server": "RoboForex-Pro"}]),
+    )
+    assert first.canonical_sha256 == whitespace.canonical_sha256
+    assert first.canonical_sha256 != changed.canonical_sha256
+    assert first.canonical_snapshot["rows"][0]["server"] == "RoboForex-Demo"
 
 
 def test_raw_order_line_endings_and_capture_timestamp_do_not_change_canonical_sha(
@@ -215,7 +311,7 @@ def test_unclassified_export_column_fails_closed(tmp_path: Path) -> None:
     row = {**_row("EURUSD"), "new_unknown_field": "value"}
     path = tmp_path / "unknown.csv"
     path.write_bytes(
-        _csv_bytes([row], fieldnames=(*SYMBOL_REQUIRED_FIELDS, "new_unknown_field"))
+        _csv_bytes([row], fieldnames=(*EXECUTION_UNIVERSE_SOURCE_FIELDS, "new_unknown_field"))
     )
     with pytest.raises(HistoricalDataError) as caught:
         load_canonical_execution_universe(path, account_login=ACCOUNT)
