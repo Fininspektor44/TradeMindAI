@@ -47,35 +47,81 @@ _CANDIDATE_DEFINITION_HASH_DOMAIN = b"trademind:signal-statistics:candidate-defi
 _CANDIDATE_CONTENT_HASH_DOMAIN = b"trademind:signal-statistics:candidate-content:v2"
 _REPORT_CONTENT_HASH_DOMAIN = b"trademind:signal-statistics:report-content:v2"
 _PACKET_CONTENT_HASH_DOMAIN = b"trademind:signal-statistics:packet-content:v2"
+_BUDGET_FIELDS = (
+    "max_depth",
+    "max_nodes",
+    "max_mapping_entries",
+    "max_sequence_length",
+    "max_string_length",
+    "max_total_string_bytes",
+    "max_integer_abs",
+    "max_canonical_bytes",
+)
 
 
 class ProvenanceError(ValueError):
     """Raised when provenance data is not strict, canonical, or bounded."""
 
 
+@dataclass(frozen=True, slots=True)
+class JsonSafetyBudget:
+    """One explicit, named, finite JSON safety envelope.
+
+    ``DEFAULT_JSON_SAFETY_BUDGET`` reproduces the original fixed module
+    constants exactly, so every existing caller of ``canonical_json_bytes``,
+    ``freeze_json``, ``freeze_json_object``, or ``parse_json`` that does not
+    pass ``budget=`` keeps its original bounded behavior byte-for-byte
+    unchanged. A distinct, still-finite budget may be constructed for ONE
+    specific, sized artifact (see
+    ``ser8_historical_data.HISTORICAL_INVENTORY_JSON_BUDGET``) without
+    touching the safety ceiling of any other artifact: safety is never
+    "removed", only explicitly re-sized for a named, bounded envelope.
+    """
+
+    max_depth: int = MAX_JSON_DEPTH
+    max_nodes: int = MAX_JSON_NODES
+    max_mapping_entries: int = MAX_JSON_MAPPING_ENTRIES
+    max_sequence_length: int = MAX_JSON_SEQUENCE_LENGTH
+    max_string_length: int = MAX_JSON_STRING_LENGTH
+    max_total_string_bytes: int = MAX_JSON_TOTAL_STRING_BYTES
+    max_integer_abs: int = MAX_JSON_INTEGER_ABS
+    max_canonical_bytes: int = MAX_CANONICAL_JSON_BYTES
+
+    def __post_init__(self) -> None:
+        for field_name in _BUDGET_FIELDS:
+            value = getattr(self, field_name)
+            if type(value) is not int or value <= 0:
+                raise ProvenanceError(f"JsonSafetyBudget.{field_name} must be a positive integer")
+
+
+DEFAULT_JSON_SAFETY_BUDGET = JsonSafetyBudget()
+
+
 @dataclass(slots=True)
 class _ValidationState:
+    budget: JsonSafetyBudget = field(default_factory=lambda: DEFAULT_JSON_SAFETY_BUDGET)
     nodes: int = 0
     string_bytes: int = 0
 
     def consume_node(self, *, path: str) -> None:
         self.nodes += 1
-        if self.nodes > MAX_JSON_NODES:
-            raise ProvenanceError(f"{path} exceeds maximum JSON node count {MAX_JSON_NODES}")
+        if self.nodes > self.budget.max_nodes:
+            raise ProvenanceError(f"{path} exceeds maximum JSON node count {self.budget.max_nodes}")
 
     def consume_string(self, value: str, *, path: str) -> None:
-        if len(value) > MAX_JSON_STRING_LENGTH:
+        if len(value) > self.budget.max_string_length:
             raise ProvenanceError(
-                f"{path} exceeds maximum JSON string length {MAX_JSON_STRING_LENGTH}"
+                f"{path} exceeds maximum JSON string length {self.budget.max_string_length}"
             )
         try:
             encoded = value.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise ProvenanceError(f"{path} is not valid UTF-8 text") from exc
         self.string_bytes += len(encoded)
-        if self.string_bytes > MAX_JSON_TOTAL_STRING_BYTES:
+        if self.string_bytes > self.budget.max_total_string_bytes:
             raise ProvenanceError(
-                f"{path} exceeds maximum aggregate JSON string bytes {MAX_JSON_TOTAL_STRING_BYTES}"
+                f"{path} exceeds maximum aggregate JSON string bytes "
+                f"{self.budget.max_total_string_bytes}"
             )
 
 
@@ -87,16 +133,16 @@ def _freeze(
     state: _ValidationState,
     active_containers: set[int],
 ) -> FrozenJsonValue:
-    if depth > MAX_JSON_DEPTH:
-        raise ProvenanceError(f"{path} exceeds maximum JSON depth {MAX_JSON_DEPTH}")
+    if depth > state.budget.max_depth:
+        raise ProvenanceError(f"{path} exceeds maximum JSON depth {state.budget.max_depth}")
     state.consume_node(path=path)
 
     if value is None or type(value) is bool:
         return value
     if type(value) is int:
-        if abs(value) > MAX_JSON_INTEGER_ABS:
+        if abs(value) > state.budget.max_integer_abs:
             raise ProvenanceError(
-                f"{path} exceeds maximum JSON integer magnitude {MAX_JSON_INTEGER_ABS}"
+                f"{path} exceeds maximum JSON integer magnitude {state.budget.max_integer_abs}"
             )
         return value
     if type(value) is float:
@@ -121,9 +167,9 @@ def _freeze(
             seen: set[str] = set()
             try:
                 for key, nested in value.items():
-                    if len(snapshot) >= MAX_JSON_MAPPING_ENTRIES:
+                    if len(snapshot) >= state.budget.max_mapping_entries:
                         raise ProvenanceError(
-                            f"{path} exceeds maximum mapping entries {MAX_JSON_MAPPING_ENTRIES}"
+                            f"{path} exceeds maximum mapping entries {state.budget.max_mapping_entries}"
                         )
                     if type(key) is not str:
                         raise ProvenanceError(f"{path} mapping keys must be exact strings")
@@ -160,9 +206,9 @@ def _freeze(
             frozen_items: list[FrozenJsonValue] = []
             try:
                 for index, nested in enumerate(value):
-                    if index >= MAX_JSON_SEQUENCE_LENGTH:
+                    if index >= state.budget.max_sequence_length:
                         raise ProvenanceError(
-                            f"{path} exceeds maximum sequence length {MAX_JSON_SEQUENCE_LENGTH}"
+                            f"{path} exceeds maximum sequence length {state.budget.max_sequence_length}"
                         )
                     frozen_items.append(
                         _freeze(
@@ -209,14 +255,15 @@ def _canonical_float(value: float) -> bytes:
 
 @dataclass(slots=True)
 class _CanonicalWriter:
+    max_bytes: int = MAX_CANONICAL_JSON_BYTES
     parts: list[bytes] = field(default_factory=list)
     size: int = 0
 
     def append(self, value: bytes) -> None:
         next_size = self.size + len(value)
-        if next_size > MAX_CANONICAL_JSON_BYTES:
+        if next_size > self.max_bytes:
             raise ProvenanceError(
-                f"payload exceeds maximum canonical JSON bytes {MAX_CANONICAL_JSON_BYTES}"
+                f"payload exceeds maximum canonical JSON bytes {self.max_bytes}"
             )
         self.parts.append(value)
         self.size = next_size
@@ -263,28 +310,45 @@ def _write_frozen(value: FrozenJsonValue, writer: _CanonicalWriter) -> None:
     raise ProvenanceError("validated provenance JSON contains an unsupported frozen value")
 
 
-def _encode_frozen(value: FrozenJsonValue) -> bytes:
-    writer = _CanonicalWriter()
+def _encode_frozen(value: FrozenJsonValue, *, max_bytes: int = MAX_CANONICAL_JSON_BYTES) -> bytes:
+    writer = _CanonicalWriter(max_bytes=max_bytes)
     _write_frozen(value, writer)
     return b"".join(writer.parts)
 
 
-def _freeze_snapshot(value: object, *, field_name: str) -> FrozenJsonValue:
+def _freeze_snapshot(
+    value: object,
+    *,
+    field_name: str,
+    budget: JsonSafetyBudget = DEFAULT_JSON_SAFETY_BUDGET,
+) -> FrozenJsonValue:
     if type(field_name) is not str or not field_name:
         raise ProvenanceError("field_name must be a non-empty string")
+    if type(budget) is not JsonSafetyBudget:
+        raise ProvenanceError("budget must be a JsonSafetyBudget")
     return _freeze(
         value,
         path=field_name,
         depth=0,
-        state=_ValidationState(),
+        state=_ValidationState(budget=budget),
         active_containers=set(),
     )
 
 
-def freeze_json(value: object, *, field_name: str = "payload") -> FrozenJsonValue:
-    """Take one detached, deeply immutable, bounded JSON snapshot."""
-    frozen = _freeze_snapshot(value, field_name=field_name)
-    _encode_frozen(frozen)
+def freeze_json(
+    value: object,
+    *,
+    field_name: str = "payload",
+    budget: JsonSafetyBudget = DEFAULT_JSON_SAFETY_BUDGET,
+) -> FrozenJsonValue:
+    """Take one detached, deeply immutable, bounded JSON snapshot.
+
+    ``budget`` defaults to :data:`DEFAULT_JSON_SAFETY_BUDGET`, reproducing the
+    original fixed module limits exactly; pass an explicit, named
+    :class:`JsonSafetyBudget` only for one specific, sized artifact.
+    """
+    frozen = _freeze_snapshot(value, field_name=field_name, budget=budget)
+    _encode_frozen(frozen, max_bytes=budget.max_canonical_bytes)
     return frozen
 
 
@@ -292,25 +356,41 @@ def freeze_json_object(
     value: object,
     *,
     field_name: str = "payload",
+    budget: JsonSafetyBudget = DEFAULT_JSON_SAFETY_BUDGET,
 ) -> Mapping[str, FrozenJsonValue]:
     """Freeze a JSON object root; scalar and array roots are rejected."""
-    frozen = freeze_json(value, field_name=field_name)
+    frozen = freeze_json(value, field_name=field_name, budget=budget)
     if not isinstance(frozen, Mapping):
         raise ProvenanceError(f"{field_name} must be a JSON object")
     return frozen
 
 
-def canonical_json_bytes(value: object) -> bytes:
-    """Return deterministic UTF-8 bytes for one strict bounded JSON value."""
-    return _encode_frozen(_freeze_snapshot(value, field_name="payload"))
+def canonical_json_bytes(
+    value: object,
+    *,
+    budget: JsonSafetyBudget = DEFAULT_JSON_SAFETY_BUDGET,
+) -> bytes:
+    """Return deterministic UTF-8 bytes for one strict bounded JSON value.
+
+    ``budget`` defaults to :data:`DEFAULT_JSON_SAFETY_BUDGET` — every existing
+    caller that omits it keeps the original fixed safety ceiling unchanged.
+    """
+    return _encode_frozen(
+        _freeze_snapshot(value, field_name="payload", budget=budget),
+        max_bytes=budget.max_canonical_bytes,
+    )
 
 
-def parse_json(value: str | bytes) -> FrozenJsonValue:
+def parse_json(
+    value: str | bytes,
+    *,
+    budget: JsonSafetyBudget = DEFAULT_JSON_SAFETY_BUDGET,
+) -> FrozenJsonValue:
     """Parse strict bounded JSON and reject duplicate keys and extensions."""
     if type(value) is bytes:
-        if len(value) > MAX_CANONICAL_JSON_BYTES:
+        if len(value) > budget.max_canonical_bytes:
             raise ProvenanceError(
-                f"payload exceeds maximum canonical JSON bytes {MAX_CANONICAL_JSON_BYTES}"
+                f"payload exceeds maximum canonical JSON bytes {budget.max_canonical_bytes}"
             )
         try:
             text = value.decode("utf-8")
@@ -321,9 +401,9 @@ def parse_json(value: str | bytes) -> FrozenJsonValue:
             encoded_size = len(value.encode("utf-8"))
         except UnicodeEncodeError as exc:
             raise ProvenanceError("payload must be valid UTF-8") from exc
-        if encoded_size > MAX_CANONICAL_JSON_BYTES:
+        if encoded_size > budget.max_canonical_bytes:
             raise ProvenanceError(
-                f"payload exceeds maximum canonical JSON bytes {MAX_CANONICAL_JSON_BYTES}"
+                f"payload exceeds maximum canonical JSON bytes {budget.max_canonical_bytes}"
             )
         text = value
     else:
@@ -350,7 +430,7 @@ def parse_json(value: str | bytes) -> FrozenJsonValue:
         raise
     except (ValueError, RecursionError) as exc:
         raise ProvenanceError("payload contains malformed JSON") from exc
-    return freeze_json(parsed)
+    return freeze_json(parsed, budget=budget)
 
 
 def validate_sha256_ref(value: object) -> str:

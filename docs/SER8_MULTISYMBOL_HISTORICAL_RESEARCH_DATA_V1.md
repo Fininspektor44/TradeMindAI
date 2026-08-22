@@ -198,6 +198,25 @@ never lowers the accepted dataset's integrity bar, and the
 minimum-rows-for-replay policy still applies only to what was actually
 accepted.
 
+### Historical-inventory JSON capacity
+
+The full inventory aggregates every broker symbol's accepted, unavailable-
+prefix, discarded, and abandoned chunk-audit records across the entire
+requested calendar-month plan, plus the canonical execution-universe
+snapshot and source/account provenance — legitimately far larger than any
+single small provenance artifact (a candidate, a report projection, one
+chunk-cache manifest). It is hashed and written under an explicit,
+inventory-specific, still-finite `JsonSafetyBudget` (see
+`HISTORICAL_INVENTORY_JSON_BUDGET`), deterministically sized for the
+supported envelope with documented headroom above the real broker-export
+symbol count and the documented multi-year monthly chunk plan. Every
+unrelated JSON artifact keeps the original, stricter, module-wide default
+budget completely unchanged; only the two call sites that hash/write the
+full inventory pass the larger budget explicitly. A payload that still
+exceeds the inventory-specific ceiling fails closed before any file is
+touched, so a validation failure never leaves a partial canonical
+`historical_inventory.json` behind.
+
 ## Windows verification — run one step, inspect it, then continue
 
 Use the real repository and Common Files paths shown below. Keep the autonomous

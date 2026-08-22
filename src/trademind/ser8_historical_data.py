@@ -31,7 +31,11 @@ from trademind.ser8_symbol_universe import (
     classify_asset_class,
     risk_model_support_for_symbol_row,
 )
-from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
+from trademind.signal_statistics_provenance import (
+    JsonSafetyBudget,
+    canonical_json_bytes,
+    sha256_bytes,
+)
 
 DATASET_SCHEMA_VERSION = "ser8-historical-market-data-v3"
 INVENTORY_SCHEMA_VERSION = "ser8-historical-data-inventory-v3"
@@ -69,6 +73,78 @@ TRANSIENT_CHUNK_RETRY_ATTEMPTS = 2
 # RES_E_INTERNAL_FAIL*, and IPC/connect/timeout codes are all left OUT of this
 # set on purpose because they do not prove historical unavailability.
 _MT5_GENUINE_NO_HISTORY_LAST_ERROR_CODES = frozenset({-4})  # RES_E_NOT_FOUND
+
+# --- Historical-inventory-specific bounded JSON capacity ------------------
+#
+# The generic, module-wide JSON safety ceiling in signal_statistics_provenance
+# (196_608 aggregate string bytes, 10_000 nodes, 262_144 canonical bytes) is
+# sized for individual small provenance artifacts — a candidate, a report
+# projection, one chunk-cache manifest. It is deliberately NOT sized for one
+# aggregate document that legitimately contains many symbols times many
+# months of chunk-audit provenance, and must not be raised globally just to
+# fit that one artifact: every unrelated caller of canonical_json_bytes/
+# freeze_json/parse_json must keep the original, stricter ceiling.
+#
+# The full SER8 historical inventory is exactly that aggregate document: one
+# entry per broker symbol, each carrying its accepted/unavailable-prefix/
+# discarded/abandoned chunk-audit lists (chunk_id, coverage bounds, cache
+# provenance, bars_sha256, failure classification) for every requested
+# calendar-month chunk, plus the inventory-wide canonical execution-universe
+# snapshot (one row per symbol) and source/account provenance. The real
+# broker export is 90 symbols; the documented initial multi-year request
+# window plans at most ~32 monthly chunks per symbol (see
+# docs/SER8_MULTISYMBOL_HISTORICAL_RESEARCH_DATA_V1.md). The envelope below
+# adds explicit headroom above both real figures so a slightly larger
+# universe or a longer requested window still fits deterministically, while
+# remaining a finite, fail-closed ceiling rather than an unbounded one.
+HISTORICAL_INVENTORY_MAX_SYMBOLS = 128
+HISTORICAL_INVENTORY_MAX_CHUNKS_PER_SYMBOL = 64
+# Conservative worst-case string-byte estimate (keys + values) for one
+# chunk-audit entry: chunk_id, chunk_from_utc, chunk_to_utc, status,
+# acquisition_method, cache_validation, cache_error_code, row_count,
+# bars_sha256 ("sha256:" + 64 hex), error_code, error, retry_attempts.
+_HISTORICAL_INVENTORY_BYTES_PER_CHUNK_AUDIT_ENTRY = 512
+# Conservative worst-case string-byte estimate for the rest of one symbol
+# entry: the quality dict, status/status_reason text, dataset identifiers
+# and paths, and every coverage-discovery scalar/classification field.
+_HISTORICAL_INVENTORY_BYTES_PER_SYMBOL_ENTRY = 4_096
+# Conservative worst-case string-byte estimate for inventory-level provenance
+# carried once: source proof, cross-account provenance, broker/account
+# identity strings, and the canonical execution-universe snapshot (one row
+# per symbol, ~20 fields/row).
+_HISTORICAL_INVENTORY_FIXED_OVERHEAD_BYTES = (
+    65_536 + HISTORICAL_INVENTORY_MAX_SYMBOLS * 2_048
+)
+_HISTORICAL_INVENTORY_MAX_STRING_BYTES = (
+    HISTORICAL_INVENTORY_MAX_SYMBOLS
+    * (
+        HISTORICAL_INVENTORY_MAX_CHUNKS_PER_SYMBOL
+        * _HISTORICAL_INVENTORY_BYTES_PER_CHUNK_AUDIT_ENTRY
+        + _HISTORICAL_INVENTORY_BYTES_PER_SYMBOL_ENTRY
+    )
+    + _HISTORICAL_INVENTORY_FIXED_OVERHEAD_BYTES
+)
+# Canonical JSON serialization adds quoting/escaping and punctuation on top
+# of the raw aggregate string content; double it for headroom.
+_HISTORICAL_INVENTORY_MAX_CANONICAL_BYTES = _HISTORICAL_INVENTORY_MAX_STRING_BYTES * 2
+# Node-count estimate: ~16 nodes per chunk-audit entry (leaf fields plus the
+# entry object itself) and ~60 nodes for the remainder of one symbol entry
+# (quality dict, coverage-discovery scalars, list containers), plus the
+# canonical execution-universe snapshot (~21 nodes/row) and a fixed
+# inventory-level allowance.
+_HISTORICAL_INVENTORY_MAX_NODES = (
+    HISTORICAL_INVENTORY_MAX_SYMBOLS
+    * (HISTORICAL_INVENTORY_MAX_CHUNKS_PER_SYMBOL * 16 + 60)
+    + HISTORICAL_INVENTORY_MAX_SYMBOLS * 21
+    + 4_096
+)
+HISTORICAL_INVENTORY_JSON_BUDGET = JsonSafetyBudget(
+    max_nodes=_HISTORICAL_INVENTORY_MAX_NODES,
+    max_total_string_bytes=_HISTORICAL_INVENTORY_MAX_STRING_BYTES,
+    max_canonical_bytes=_HISTORICAL_INVENTORY_MAX_CANONICAL_BYTES,
+)
+# --- end historical-inventory-specific bounded JSON capacity --------------
+
 EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION = "ser8-execution-universe-canonical-v1"
 CHUNK_ACQUISITION_CODE_SHA256 = (
     "sha256:34a3d2633b744942eee35ab72d291bb5205275abfc4c5a38bd122f83e02607da"
@@ -2734,12 +2810,21 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
 
 
 def inventory_hash(payload: Mapping[str, object]) -> str:
+    """Hash the full historical inventory under its dedicated JSON budget.
+
+    The inventory legitimately aggregates many symbols times many monthly
+    chunk-audit records and can exceed the generic, module-wide JSON safety
+    ceiling used for every other artifact; ``HISTORICAL_INVENTORY_JSON_BUDGET``
+    is the explicit, still-finite envelope sized for that one document (see
+    its definition for the deterministic sizing derivation). No other caller
+    of ``canonical_json_bytes`` is affected.
+    """
     semantic = dict(payload)
     semantic.pop("inventory_sha256", None)
     digest = hashlib.sha256()
     digest.update(_INVENTORY_HASH_DOMAIN)
     digest.update(b"\x00")
-    digest.update(canonical_json_bytes(semantic))
+    digest.update(canonical_json_bytes(semantic, budget=HISTORICAL_INVENTORY_JSON_BUDGET))
     return digest.hexdigest()
 
 
@@ -2878,7 +2963,10 @@ def write_inventory_artifacts(
     writer.writerow(("symbol", "rows"))
     writer.writerows(accepted)
     for path, content in (
-        (inventory_path, canonical_json_bytes(inventory_payload) + b"\n"),
+        (
+            inventory_path,
+            canonical_json_bytes(inventory_payload, budget=HISTORICAL_INVENTORY_JSON_BUDGET) + b"\n",
+        ),
         (compatibility_path, compatibility.getvalue().encode("utf-8")),
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
