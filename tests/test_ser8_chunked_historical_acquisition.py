@@ -14,14 +14,17 @@ import pytest
 
 from trademind.ser8_historical_data import (
     CHUNK_POLICY_VERSION,
+    CHUNK_ACQUISITION_CODE_SHA256,
     READ_ONLY_MT5_OPERATIONS,
     BrokerSymbolV1,
     HistoricalBarV1,
     HistoricalDataError,
     MetaTrader5HistorySource,
     acquire_chunked_history,
+    build_canonical_execution_universe,
     build_dataset_manifest,
     canonical_bars_csv,
+    collector_code_sha256,
     merge_historical_bars,
     plan_calendar_month_chunks,
 )
@@ -93,6 +96,7 @@ def _acquire(
     start: datetime,
     end: datetime,
     proof: Mapping[str, object] | None = None,
+    collector_sha256: str = COLLECTOR_SHA,
 ):
     return acquire_chunked_history(
         source=source,
@@ -102,19 +106,41 @@ def _acquire(
         requested_from_utc=start,
         requested_to_utc=end,
         staging_root=tmp_path / "staging",
-        collector_code_sha256=COLLECTOR_SHA,
+        collector_code_sha256=collector_sha256,
     )
 
 
 def _broker() -> BrokerSymbolV1:
+    row = _execution_row()
     return BrokerSymbolV1(
         symbol="EURUSD",
         trade_mode="FULL",
-        source_row={"account_login": ACCOUNT, "tick_size": "0.00001"},
+        source_row=row,
         asset_class="FX",
         risk_model_supported=True,
         risk_model_reason="",
     )
+
+
+def _execution_row() -> dict[str, str]:
+    return {
+        "account_login": ACCOUNT,
+        "currency": "USD",
+        "symbol": "EURUSD",
+        "trade_mode": "FULL",
+        "tick_size": "0.00001",
+        "tick_value": "1",
+        "tick_value_profit": "1",
+        "tick_value_loss": "1",
+        "volume_min": "0.01",
+        "volume_max": "100",
+        "volume_step": "0.01",
+        "contract_size": "100000",
+        "margin_initial": "0",
+        "margin_buy_per_volume": "1",
+        "margin_sell_per_volume": "1",
+        "leverage": "100",
+    }
 
 
 def _manifest(
@@ -125,6 +151,11 @@ def _manifest(
     acquisition: Mapping[str, object] | None = None,
     captured_at: datetime | None = None,
 ) -> dict[str, object]:
+    universe = build_canonical_execution_universe(
+        [_execution_row()],
+        account_login=ACCOUNT,
+        raw_sha256=sha256_bytes(b"universe raw"),
+    )
     manifest, _ = build_dataset_manifest(
         bars=bars,
         source_proof=_proof(),
@@ -138,7 +169,7 @@ def _manifest(
         broker_symbol=_broker(),
         execution_account_login=ACCOUNT,
         execution_universe_source=f"mt5_risk_symbols_utc_{ACCOUNT}.csv",
-        execution_universe_sha256=sha256_bytes(b"universe"),
+        execution_universe=universe,
         timeframe="M5",
         requested_from_utc=start,
         requested_to_utc=end,
@@ -313,6 +344,33 @@ def test_valid_chunk_cache_is_reused_without_source_call(tmp_path: Path) -> None
     assert second.cached_chunk_count == 1
     assert second.acquired_chunk_count == 0
     assert second_source.calls == []
+
+
+def test_deployed_b7_chunk_cache_survives_final_layer_only_amendment(tmp_path: Path) -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    end = datetime(2024, 2, 1, tzinfo=UTC)
+    chunk_id = "20240101T000000Z__20240201T000000Z"
+    bar = _bar(start)
+    assert collector_code_sha256() != CHUNK_ACQUISITION_CODE_SHA256
+    first = _acquire(
+        tmp_path,
+        WindowSource({chunk_id: (bar,)}),
+        start=start,
+        end=end,
+        collector_sha256=CHUNK_ACQUISITION_CODE_SHA256,
+    )
+    assert first.acquired_chunk_count == 1
+    source = WindowSource({chunk_id: AssertionError("deployed cache must be reused")})
+    second = _acquire(
+        tmp_path,
+        source,
+        start=start,
+        end=end,
+        collector_sha256=CHUNK_ACQUISITION_CODE_SHA256,
+    )
+    assert second.cached_chunk_count == 1
+    assert second.acquired_chunk_count == 0
+    assert source.calls == []
 
 
 def test_tampered_chunk_bars_are_rejected_and_reacquired(tmp_path: Path) -> None:

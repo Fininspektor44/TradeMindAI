@@ -16,25 +16,28 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from trademind.ser8_historical_data import (  # noqa: E402
     INVENTORY_SCHEMA_VERSION,
     CHUNK_POLICY_VERSION,
+    CHUNK_ACQUISITION_CODE_SHA256,
     COLLECTOR_VERSION,
+    EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION,
     HistoricalDataError,
     MetaTrader5HistorySource,
     acquire_chunked_history,
     assert_historical_artifact_isolation,
     build_dataset_manifest,
     collector_code_sha256,
-    load_broker_universe,
+    load_canonical_execution_universe,
     load_inventory,
     parse_utc,
     publish_dataset,
+    publish_canonical_execution_universe_snapshot,
     source_proof_result,
     validate_active_account_contract,
     verify_dataset,
+    verify_canonical_execution_universe_artifact,
     verify_inventory_account_identities,
     write_inventory_artifacts,
 )
 from trademind.ser8_historical_replay import load_research_policy  # noqa: E402
-from trademind.signal_statistics_provenance import sha256_bytes  # noqa: E402
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -123,10 +126,14 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
         inventory_path=args.inventory,
         compatibility_path=args.compatibility_csv,
     )
-    universe_sha256 = sha256_bytes(symbols_csv.read_bytes())
-    universe = load_broker_universe(
+    canonical_universe = load_canonical_execution_universe(
         symbols_csv,
         account_login=args.execution_account,
+    )
+    universe = canonical_universe.symbols
+    canonical_snapshot_path = publish_canonical_execution_universe_snapshot(
+        dataset_root,
+        canonical_universe,
     )
     source = MetaTrader5HistorySource(
         market_data_account_login=args.market_data_account,
@@ -226,7 +233,7 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                     requested_from_utc=requested_from,
                     requested_to_utc=requested_to,
                     staging_root=dataset_root / "staging",
-                    collector_code_sha256=collector_sha256,
+                    collector_code_sha256=CHUNK_ACQUISITION_CODE_SHA256,
                     progress=report_chunk,
                 )
                 acquisition_summary = acquisition.manifest_summary()
@@ -305,7 +312,7 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                     broker_symbol=broker_symbol,
                     execution_account_login=args.execution_account,
                     execution_universe_source=symbols_csv.name,
-                    execution_universe_sha256=universe_sha256,
+                    execution_universe=canonical_universe,
                     timeframe=timeframe,
                     requested_from_utc=requested_from,
                     requested_to_utc=requested_to,
@@ -373,6 +380,14 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
         "execution_account_login": str(args.execution_account),
         "market_data_account_login": str(args.market_data_account),
         "execution_universe_source": symbols_csv.name,
+        "execution_universe_sha256": canonical_universe.canonical_sha256,
+        "execution_universe_raw_sha256": canonical_universe.raw_sha256,
+        "execution_universe_canonical_sha256": canonical_universe.canonical_sha256,
+        "execution_universe_canonical_schema_version": (
+            EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION
+        ),
+        "execution_universe_canonical_snapshot": dict(canonical_universe.canonical_snapshot),
+        "execution_universe_canonical_snapshot_artifact": str(canonical_snapshot_path),
         "market_data_source_type": proof["source_type"],
         "market_data_account_server": proof["market_data_account_server"],
         "market_data_account_company": proof.get("market_data_account_company")
@@ -386,7 +401,7 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
             "research_evidence_scope": "MARKET_DATA_SOURCE_OBSERVED_NOT_EXECUTION_PRICE_EQUIVALENCE",
         },
         "broker_universe_path": str(symbols_csv),
-        "broker_universe_sha256": universe_sha256,
+        "broker_universe_raw_sha256": canonical_universe.raw_sha256,
         "timeframe": timeframe,
         "requested_from_utc": requested_from.isoformat().replace("+00:00", "Z"),
         "requested_to_utc": requested_to.isoformat().replace("+00:00", "Z"),
@@ -419,6 +434,16 @@ def _verify_inventory(args: argparse.Namespace) -> dict[str, object]:
         execution_account_login=args.execution_account,
         market_data_account_login=args.market_data_account,
     )
+    snapshot_artifact = payload.get("execution_universe_canonical_snapshot_artifact")
+    if not isinstance(snapshot_artifact, str):
+        raise HistoricalDataError(
+            "INVENTORY_CANONICAL_UNIVERSE_ARTIFACT_MISSING",
+            "canonical execution-universe snapshot artifact path is missing",
+        )
+    verify_canonical_execution_universe_artifact(
+        Path(snapshot_artifact),
+        expected_sha256=str(payload["execution_universe_canonical_sha256"]),
+    )
     verified = 0
     for entry in payload["entries"]:
         dataset_dir = entry.get("dataset_dir")
@@ -430,6 +455,8 @@ def _verify_inventory(args: argparse.Namespace) -> dict[str, object]:
                 != payload["execution_account_login"]
                 or manifest["market_data_account_login"]
                 != payload["market_data_account_login"]
+                or manifest["execution_universe_canonical_sha256"]
+                != payload["execution_universe_canonical_sha256"]
             ):
                 raise HistoricalDataError(
                     "INVENTORY_DATASET_MISMATCH",
@@ -462,7 +489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _require_export(args)
             # Universe validation is part of capability proof, not merely MT5 initialization.
             universe_path = _require_export(args)
-            load_broker_universe(
+            canonical_universe = load_canonical_execution_universe(
                 universe_path,
                 account_login=args.execution_account,
             )
@@ -474,6 +501,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source.source_proof(),
                 execution_account_login=args.execution_account,
                 execution_universe_source=universe_path.name,
+                execution_universe=canonical_universe,
             )
         elif args.mode == "collect":
             result = _collect(args)

@@ -346,6 +346,12 @@ def create_replay(
         "execution_account_login": dataset_manifest["execution_account_login"],
         "market_data_account_login": dataset_manifest["market_data_account_login"],
         "execution_universe_source": dataset_manifest["execution_universe_source"],
+        "execution_universe_canonical_sha256": dataset_manifest[
+            "execution_universe_canonical_sha256"
+        ],
+        "execution_universe_canonical_schema_version": dataset_manifest[
+            "execution_universe_canonical_schema_version"
+        ],
         "market_data_source_type": dataset_manifest["market_data_source_type"],
         "market_data_account_server": dataset_manifest["market_data_account_server"],
         "symbol": dataset_manifest["symbol"],
@@ -445,6 +451,8 @@ def verify_replay(replay_dir: Path) -> dict[str, object]:
     identity_keys = (
         "schema_version", "dataset_id", "dataset_sha256", "execution_account_login",
         "market_data_account_login", "execution_universe_source", "market_data_source_type",
+        "execution_universe_canonical_sha256",
+        "execution_universe_canonical_schema_version",
         "market_data_account_server", "symbol", "timeframe",
         "policy_schema_version", "policy_sha256", "shadow_max_bars", "shadow_cost_r",
         "research_minimum_completed_outcomes", "code_provenance", "candidates_sha256",
@@ -576,6 +584,13 @@ def build_research_readiness_inventory(
         "execution_account_login": historical["execution_account_login"],
         "market_data_account_login": historical["market_data_account_login"],
         "execution_universe_source": historical["execution_universe_source"],
+        "execution_universe_raw_sha256": historical["execution_universe_raw_sha256"],
+        "execution_universe_canonical_sha256": historical[
+            "execution_universe_canonical_sha256"
+        ],
+        "execution_universe_canonical_schema_version": historical[
+            "execution_universe_canonical_schema_version"
+        ],
         "market_data_source_type": historical["market_data_source_type"],
         "market_data_account_server": historical["market_data_account_server"],
         "historical_inventory_sha256": historical["inventory_sha256"],
@@ -637,6 +652,9 @@ def load_verified_research_readiness(
         "execution_account_login",
         "market_data_account_login",
         "execution_universe_source",
+        "execution_universe_raw_sha256",
+        "execution_universe_canonical_sha256",
+        "execution_universe_canonical_schema_version",
         "market_data_source_type",
         "market_data_account_server",
     ):
@@ -677,12 +695,16 @@ def load_verified_research_readiness(
                 != payload.get("execution_account_login")
                 or dataset_manifest.get("market_data_account_login")
                 != payload.get("market_data_account_login")
+                or dataset_manifest.get("execution_universe_canonical_sha256")
+                != payload.get("execution_universe_canonical_sha256")
                 or replay_manifest.get("replay_sha256") != replay_sha
                 or replay_manifest.get("dataset_sha256") != dataset_sha
                 or replay_manifest.get("execution_account_login")
                 != payload.get("execution_account_login")
                 or replay_manifest.get("market_data_account_login")
                 != payload.get("market_data_account_login")
+                or replay_manifest.get("execution_universe_canonical_sha256")
+                != payload.get("execution_universe_canonical_sha256")
                 or replay_manifest.get("completed_outcome_count") != entry.get("completed_outcome_count")
                 or replay_manifest.get("research_minimum_completed_outcomes") != entry.get("research_minimum")
                 or replay_manifest.get("research_ready") is not entry.get("research_ready")

@@ -45,14 +45,50 @@ credential/login argument.
 
 ## Integrity and cross-account identity
 
-The content identity binds both account logins, the execution-universe export
-and hash, market-data broker/server/company identity, exact symbol identity,
+The content identity binds both account logins, the canonical semantic
+execution-universe hash, market-data broker/server/company identity, exact symbol identity,
 available execution/source trade-tick-size compatibility, timeframe,
 requested and actual coverage, the versioned calendar-month UTC chunk policy,
 point/digits, expected interval, and exact canonical bar bytes.
 `source_capture_utc`, chunk download order, cache/acquisition method, and retry
 history are audit metadata excluded from dataset identity, so an identical
 rerun is idempotent.
+
+### Canonical execution-universe identity
+
+Historical dataset schema `ser8-historical-market-data-v2` separates mutable
+raw-export audit evidence from stable execution semantics:
+
+- `execution_universe_raw_sha256` hashes the exact live CSV bytes for audit only.
+  It is excluded from dataset identity.
+- `execution_universe_sha256` is redefined as the canonical semantic SHA and
+  equals `execution_universe_canonical_sha256`.
+- `execution_universe_canonical_schema_version` is
+  `ser8-execution-universe-canonical-v1`.
+- The normalized snapshot is embedded in every dataset manifest and also
+  atomically persisted under
+  `data/ser8_historical_market_data/execution_universe_snapshots/<sha256>/snapshot.json`.
+  Dataset verification recomputes its hash without reading the current live CSV.
+
+The authoritative export schema is classified explicitly. `time_msc` is
+AUDIT/VOLATILE because it records export capture time and is not consumed by
+execution or research semantics. Every other declared source field is
+IDENTITY-RELEVANT:
+
+- identity and account compatibility: `account_login`, `currency`, `symbol`;
+- trade-direction eligibility: `trade_mode`;
+- price/risk sizing: `tick_size`, `tick_value`, `tick_value_profit`,
+  `tick_value_loss`;
+- order-volume constraints: `volume_min`, `volume_max`, `volume_step`;
+- margin/notional fallback: `contract_size`, `margin_initial`,
+  `margin_buy_per_volume`, `margin_sell_per_volume`, `leverage`.
+
+The snapshot also binds deterministic derived `asset_class` and
+`risk_model_supported` fields. Numeric source values become finite canonical
+decimal strings, symbols/enum text are normalized to uppercase, rows are
+sorted by exact normalized symbol, identical normalized duplicates are
+deduplicated, and conflicting duplicates fail closed. Any new unclassified
+export column fails closed until this versioned classification is reviewed.
 
 The ECN history is research evidence from account `77053345`; it is not a
 claim that its spread or price feed is byte-identical to DEMO execution account
@@ -147,7 +183,7 @@ calendar-month boundary and therefore proves more than one internal chunk.
 
 ```powershell
 Set-Location "C:\Users\meff4\Documents\TradeMindAI"
-& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "C:\Program Files\RoboForex MT5 Terminal\terminal64.exe" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-07-20T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 1
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "C:\Program Files\RoboForex MT5 Terminal\terminal64.exe" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-07-20T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 6
 ```
 
 Stop and require multiple completed chunks, zero failed chunks, accepted real
@@ -159,7 +195,7 @@ Run the exact C1 command again. Require the attempted chunks to report cached,
 the same dataset SHA, and no MT5 acquisition calls for valid cached chunks.
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "C:\Program Files\RoboForex MT5 Terminal\terminal64.exe" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-07-20T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 1
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "C:\Program Files\RoboForex MT5 Terminal\terminal64.exe" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-07-20T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 6
 ```
 
 ### C3. Full-universe multi-year acquisition

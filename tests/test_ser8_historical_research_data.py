@@ -21,6 +21,8 @@ import pytest
 
 from trademind.ser8_historical_data import (
     DATASET_SCHEMA_VERSION,
+    EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION,
+    INVENTORY_SCHEMA_VERSION,
     READ_ONLY_MT5_OPERATIONS,
     HistoricalBarV1,
     HistoricalDataError,
@@ -28,6 +30,7 @@ from trademind.ser8_historical_data import (
     BrokerSymbolV1,
     assert_historical_artifact_isolation,
     build_dataset_manifest,
+    build_canonical_execution_universe,
     canonical_bars_csv,
     load_broker_universe,
     load_inventory,
@@ -139,10 +142,23 @@ def _proof() -> dict[str, object]:
 
 
 def _inventory_identity() -> dict[str, object]:
+    universe = build_canonical_execution_universe(
+        [_symbol_row("EURUSD")],
+        account_login=ACCOUNT,
+        raw_sha256=sha256_bytes(b"execution universe raw"),
+    )
     return {
         "execution_account_login": ACCOUNT,
         "market_data_account_login": MARKET_DATA_ACCOUNT,
         "execution_universe_source": f"mt5_risk_symbols_utc_{ACCOUNT}.csv",
+        "execution_universe_sha256": universe.canonical_sha256,
+        "execution_universe_raw_sha256": universe.raw_sha256,
+        "execution_universe_canonical_sha256": universe.canonical_sha256,
+        "execution_universe_canonical_schema_version": universe.canonical_snapshot[
+            "schema_version"
+        ],
+        "execution_universe_canonical_snapshot": dict(universe.canonical_snapshot),
+        "broker_universe_raw_sha256": universe.raw_sha256,
         "market_data_source_type": "MT5_PYTHON_COPY_RATES_RANGE",
         "market_data_account_server": "Broker-ECN",
         "market_data_account_company": "Broker",
@@ -169,6 +185,11 @@ def _manifest(
     broker: BrokerSymbolV1 | None = None,
 ) -> tuple[dict[str, object], bytes]:
     active = broker or _broker(bars[0].symbol if bars else "EURUSD")
+    universe = build_canonical_execution_universe(
+        [active.source_row],
+        account_login=ACCOUNT,
+        raw_sha256=sha256_bytes(b"execution universe raw"),
+    )
     return build_dataset_manifest(
         bars=bars,
         source_proof=_proof(),
@@ -182,7 +203,7 @@ def _manifest(
         broker_symbol=active,
         execution_account_login=ACCOUNT,
         execution_universe_source=f"mt5_risk_symbols_utc_{ACCOUNT}.csv",
-        execution_universe_sha256=sha256_bytes(b"execution universe"),
+        execution_universe=universe,
         timeframe="M5",
         requested_from_utc=NOW - timedelta(days=10),
         requested_to_utc=NOW,
@@ -290,6 +311,13 @@ def test_explicit_execution_and_market_data_accounts_may_differ(
     assert payload["execution_account_login"] == ACCOUNT
     assert payload["market_data_account_login"] == MARKET_DATA_ACCOUNT
     assert payload["execution_universe_source"] == f"mt5_risk_symbols_utc_{ACCOUNT}.csv"
+    assert payload["execution_universe_sha256"] == payload[
+        "execution_universe_canonical_sha256"
+    ]
+    assert payload["execution_universe_canonical_schema_version"] == (
+        EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION
+    )
+    assert payload["execution_universe_raw_sha256"].startswith("sha256:")
     assert _FakeSource.initialization["market_data_account_login"] == MARKET_DATA_ACCOUNT
 
 
@@ -350,6 +378,14 @@ def test_inventory_binds_both_accounts_and_excludes_market_data_only_symbol(
     assert payload["execution_account_login"] == ACCOUNT
     assert payload["market_data_account_login"] == MARKET_DATA_ACCOUNT
     assert payload["execution_universe_source"] == f"mt5_risk_symbols_utc_{ACCOUNT}.csv"
+    assert payload["execution_universe_raw_sha256"] == payload["broker_universe_raw_sha256"]
+    assert payload["execution_universe_sha256"] == payload[
+        "execution_universe_canonical_sha256"
+    ]
+    assert payload["execution_universe_canonical_schema_version"] == (
+        EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION
+    )
+    assert payload["execution_universe_canonical_snapshot"]["row_count"] == 1
     assert payload["market_data_source_type"] == "MT5_PYTHON_COPY_RATES_RANGE"
     assert [entry["symbol"] for entry in payload["entries"]] == ["EURUSD"]
 
@@ -463,6 +499,8 @@ def test_manifest_contains_required_quality_and_no_gap_repair() -> None:
     required = {
         "schema_version", "dataset_id", "dataset_sha256", "source_type",
         "execution_account_login", "market_data_account_login", "execution_universe_source",
+        "execution_universe_raw_sha256", "execution_universe_canonical_sha256",
+        "execution_universe_canonical_schema_version", "execution_universe_canonical_snapshot",
         "market_data_source_type", "market_data_account_server", "symbol", "timeframe",
         "cross_account_provenance", "symbol_compatibility",
         "requested_from_utc", "requested_to_utc",
@@ -772,7 +810,7 @@ def test_replay_is_content_addressed_idempotent_and_never_touches_live_runtime(
         compatibility_path=compatibility,
         payload={
             **_inventory_identity(),
-            "schema_version": "ser8-historical-data-inventory-v1",
+            "schema_version": INVENTORY_SCHEMA_VERSION,
             "captured_at_utc": NOW.isoformat(),
             "total_broker_symbols": 1,
             "accepted_dataset_count": 1,
@@ -842,7 +880,7 @@ def test_discovery_consumes_hash_verified_replay_inventory(tmp_path: Path) -> No
         compatibility_path=tmp_path / "historical" / "historical_rows.csv",
         payload={
             **_inventory_identity(),
-            "schema_version": "ser8-historical-data-inventory-v1",
+            "schema_version": INVENTORY_SCHEMA_VERSION,
             "captured_at_utc": NOW.isoformat(),
             "total_broker_symbols": 1,
             "accepted_dataset_count": 1,
@@ -999,6 +1037,8 @@ def test_dataset_verifier_detects_tampered_bar(tmp_path: Path) -> None:
 
 def test_policy_uses_existing_research_minimum_and_m5_contract() -> None:
     policy = load_research_policy(POLICY_PATH)
+    assert policy["collector_version"] == "1.2.0"
+    assert policy["chunk_policy_version"] == "ser8-calendar-month-utc-v1"
     assert policy["initial_timeframe"] == "M5"
     assert policy["expected_interval_seconds"] == 300
     assert policy["research_minimum_completed_outcomes"] == 300

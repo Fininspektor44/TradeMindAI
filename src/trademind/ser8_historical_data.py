@@ -22,6 +22,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -33,12 +34,17 @@ from trademind.ser8_symbol_universe import (
 )
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
 
-DATASET_SCHEMA_VERSION = "ser8-historical-market-data-v1"
-INVENTORY_SCHEMA_VERSION = "ser8-historical-data-inventory-v1"
+DATASET_SCHEMA_VERSION = "ser8-historical-market-data-v2"
+INVENTORY_SCHEMA_VERSION = "ser8-historical-data-inventory-v2"
 SOURCE_PROOF_SCHEMA_VERSION = "ser8-mt5-history-source-proof-v1"
-COLLECTOR_VERSION = "1.1.0"
+COLLECTOR_VERSION = "1.2.0"
+CHUNK_COLLECTOR_VERSION = "1.1.0"
 CHUNK_POLICY_VERSION = "ser8-calendar-month-utc-v1"
 CHUNK_CACHE_SCHEMA_VERSION = "ser8-mt5-history-chunk-v1"
+EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION = "ser8-execution-universe-canonical-v1"
+CHUNK_ACQUISITION_CODE_SHA256 = (
+    "sha256:34a3d2633b744942eee35ab72d291bb5205275abfc4c5a38bd122f83e02607da"
+)
 SOURCE_TYPE = "MT5_PYTHON_COPY_RATES_RANGE"
 SER8_EXECUTION_ACCOUNT_LOGIN = "67206924"
 SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN = "77053345"
@@ -62,9 +68,32 @@ BAR_FIELDS = (
     "spread",
     "real_volume",
 )
-_DATASET_HASH_DOMAIN = b"trademind:ser8:historical-market-data:v1"
-_INVENTORY_HASH_DOMAIN = b"trademind:ser8:historical-data-inventory:v1"
+_DATASET_HASH_DOMAIN = b"trademind:ser8:historical-market-data:v2"
+_INVENTORY_HASH_DOMAIN = b"trademind:ser8:historical-data-inventory:v2"
 _CHUNK_SOURCE_HASH_DOMAIN = b"trademind:ser8:historical-chunk-source:v1"
+_EXECUTION_UNIVERSE_HASH_DOMAIN = b"trademind:ser8:execution-universe-canonical:v1"
+EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS = ("time_msc",)
+EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS = tuple(
+    field for field in SYMBOL_REQUIRED_FIELDS if field not in EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS
+)
+EXECUTION_UNIVERSE_DERIVED_IDENTITY_FIELDS = (
+    "asset_class",
+    "risk_model_supported",
+)
+_EXECUTION_UNIVERSE_NUMERIC_FIELDS = (
+    "tick_size",
+    "tick_value",
+    "tick_value_profit",
+    "tick_value_loss",
+    "volume_min",
+    "volume_max",
+    "volume_step",
+    "contract_size",
+    "margin_initial",
+    "margin_buy_per_volume",
+    "margin_sell_per_volume",
+    "leverage",
+)
 _LIVE_ARTIFACT_PATH_PARTS = frozenset({
     "live_signal_runtime_v1",
     "signal_intelligence_v1_16",
@@ -108,6 +137,20 @@ class BrokerSymbolV1:
     asset_class: str
     risk_model_supported: bool
     risk_model_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalExecutionUniverseV1:
+    """Parsed broker universe plus stable semantic and volatile raw identities."""
+
+    symbols: tuple[BrokerSymbolV1, ...]
+    raw_sha256: str
+    canonical_sha256: str
+    canonical_snapshot: Mapping[str, object]
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return canonical_json_bytes(dict(self.canonical_snapshot))
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,59 +369,271 @@ def assert_historical_artifact_isolation(
     return root, inventory, compatibility
 
 
-def load_broker_universe(symbols_csv: Path, *, account_login: str) -> tuple[BrokerSymbolV1, ...]:
-    """Load every unique symbol from the real MT5 risk-symbol export."""
-    if not symbols_csv.is_file():
-        raise HistoricalDataError("BROKER_UNIVERSE_MISSING", f"broker universe not found: {symbols_csv}")
-    with symbols_csv.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = reader.fieldnames or []
-        missing = [field for field in SYMBOL_REQUIRED_FIELDS if field not in fieldnames]
-        if missing:
-            raise HistoricalDataError(
-                "BROKER_UNIVERSE_COLUMNS_MISSING",
-                f"broker universe is missing required columns: {missing}",
-            )
-        raw_rows = [{key: str(value or "").strip() for key, value in row.items()} for row in reader]
-    if not raw_rows:
-        raise HistoricalDataError("BROKER_UNIVERSE_EMPTY", "broker universe contains no rows")
+def _canonical_decimal_text(value: object, *, field_name: str) -> str:
+    text = str(value or "").strip().replace(",", ".")
+    try:
+        parsed = Decimal(text)
+    except (InvalidOperation, ValueError) as exc:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_FIELD_MALFORMED",
+            f"execution-universe field {field_name} must be numeric",
+        ) from exc
+    if not parsed.is_finite():
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_FIELD_MALFORMED",
+            f"execution-universe field {field_name} must be finite",
+        )
+    if parsed == 0:
+        return "0"
+    canonical = format(parsed.normalize(), "f")
+    return canonical.rstrip("0").rstrip(".") if "." in canonical else canonical
 
+
+def _canonicalize_execution_universe_row(
+    row: Mapping[str, object],
+    *,
+    account_login: str,
+) -> dict[str, object]:
+    actual_login = str(row.get("account_login") or "").strip()
+    if actual_login != account_login:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_ACCOUNT_MISMATCH",
+            f"symbol export account {actual_login!r} does not match {account_login!r}",
+        )
+    symbol = str(row.get("symbol") or "").strip().upper()
+    currency = str(row.get("currency") or "").strip().upper()
+    trade_mode = str(row.get("trade_mode") or "").strip().upper()
+    if not symbol:
+        raise HistoricalDataError("BROKER_SYMBOL_MISSING", "broker universe contains an empty symbol")
+    if not currency or not trade_mode:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_FIELD_MALFORMED",
+            f"{symbol} currency and trade_mode must be non-empty",
+        )
+    normalized: dict[str, object] = {
+        "account_login": actual_login,
+        "currency": currency,
+        "symbol": symbol,
+        "trade_mode": trade_mode,
+    }
+    for field in _EXECUTION_UNIVERSE_NUMERIC_FIELDS:
+        normalized[field] = _canonical_decimal_text(row.get(field), field_name=field)
+    string_row = {key: str(value) for key, value in normalized.items()}
+    supported, _reason = risk_model_support_for_symbol_row(string_row)
+    normalized["asset_class"] = classify_asset_class(symbol)
+    normalized["risk_model_supported"] = supported
+    return normalized
+
+
+def _canonical_universe_contract() -> dict[str, object]:
+    return {
+        "identity_relevant_source_fields": list(EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS),
+        "audit_volatile_source_fields": list(EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS),
+        "derived_identity_fields": list(EXECUTION_UNIVERSE_DERIVED_IDENTITY_FIELDS),
+        "numeric_representation": "FINITE_DECIMAL_CANONICAL_STRING",
+        "row_order": "EXACT_NORMALIZED_SYMBOL_ASCENDING",
+        "duplicate_symbol_policy": "IDENTICAL_NORMALIZED_ROWS_DEDUPLICATED_CONFLICTS_REJECTED",
+    }
+
+
+def _canonical_execution_universe_sha256(snapshot: Mapping[str, object]) -> str:
+    return sha256_bytes(
+        _EXECUTION_UNIVERSE_HASH_DOMAIN + b"\x00" + canonical_json_bytes(dict(snapshot))
+    )
+
+
+def verify_canonical_execution_universe_snapshot(
+    snapshot: Mapping[str, object],
+    *,
+    expected_sha256: str | None = None,
+) -> str:
+    expected_keys = {
+        "schema_version",
+        "execution_account_login",
+        "canonicalization_contract",
+        "row_count",
+        "rows",
+    }
+    if set(snapshot) != expected_keys:
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_SNAPSHOT_INVALID",
+            "canonical execution-universe snapshot fields are invalid",
+        )
+    if snapshot.get("schema_version") != EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION:
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_SCHEMA_INVALID",
+            "canonical execution-universe schema version is invalid",
+        )
+    account_login = str(snapshot.get("execution_account_login") or "")
+    if account_login != SER8_EXECUTION_ACCOUNT_LOGIN:
+        raise HistoricalDataError(
+            "SER8_EXECUTION_ACCOUNT_NOT_ACTIVE",
+            f"canonical universe must belong to {SER8_EXECUTION_ACCOUNT_LOGIN}",
+        )
+    if snapshot.get("canonicalization_contract") != _canonical_universe_contract():
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_CONTRACT_INVALID",
+            "canonical execution-universe field classification is invalid",
+        )
+    rows = snapshot.get("rows")
+    if not isinstance(rows, list) or not rows or snapshot.get("row_count") != len(rows):
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_SNAPSHOT_INVALID",
+            "canonical execution-universe rows are missing or inconsistent",
+        )
+    expected_row_keys = set(EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS) | set(
+        EXECUTION_UNIVERSE_DERIVED_IDENTITY_FIELDS
+    )
+    symbols: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != expected_row_keys:
+            raise HistoricalDataError(
+                "CANONICAL_UNIVERSE_ROW_INVALID",
+                "canonical execution-universe row fields are invalid",
+            )
+        normalized = _canonicalize_execution_universe_row(row, account_login=account_login)
+        if normalized != row:
+            raise HistoricalDataError(
+                "CANONICAL_UNIVERSE_ROW_NOT_CANONICAL",
+                f"canonical execution-universe row is not normalized: {row.get('symbol')}",
+            )
+        symbols.append(str(row["symbol"]))
+    if symbols != sorted(symbols) or len(symbols) != len(set(symbols)):
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_ORDER_INVALID",
+            "canonical execution-universe symbols must be sorted and unique",
+        )
+    actual_sha256 = _canonical_execution_universe_sha256(snapshot)
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_HASH_MISMATCH",
+            "canonical execution-universe snapshot hash mismatch",
+        )
+    return actual_sha256
+
+
+def build_canonical_execution_universe(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    account_login: str,
+    raw_sha256: str,
+) -> CanonicalExecutionUniverseV1:
+    """Build stable semantics from already parsed authoritative export rows."""
     expected_login = str(account_login).strip()
     if expected_login != SER8_EXECUTION_ACCOUNT_LOGIN:
         raise HistoricalDataError(
             "SER8_EXECUTION_ACCOUNT_NOT_ACTIVE",
             f"active SER8 execution account must be {SER8_EXECUTION_ACCOUNT_LOGIN}",
         )
-    by_symbol: dict[str, BrokerSymbolV1] = {}
-    row_fingerprints: dict[str, bytes] = {}
-    for row in raw_rows:
-        if row.get("account_login") != expected_login:
-            raise HistoricalDataError(
-                "BROKER_UNIVERSE_ACCOUNT_MISMATCH",
-                f"symbol export account {row.get('account_login')!r} does not match {expected_login!r}",
-            )
-        symbol = row.get("symbol", "").upper()
-        if not symbol:
-            raise HistoricalDataError("BROKER_SYMBOL_MISSING", "broker universe contains an empty symbol")
-        encoded = canonical_json_bytes(row)
-        if symbol in by_symbol:
-            if row_fingerprints[symbol] != encoded:
-                raise HistoricalDataError(
-                    "BROKER_SYMBOL_CONFLICT",
-                    f"broker universe contains conflicting rows for {symbol}",
-                )
-            continue
-        supported, reason = risk_model_support_for_symbol_row(row)
-        by_symbol[symbol] = BrokerSymbolV1(
-            symbol=symbol,
-            trade_mode=row.get("trade_mode", "").upper(),
-            source_row=row,
-            asset_class=classify_asset_class(symbol),
-            risk_model_supported=supported,
-            risk_model_reason=reason,
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", raw_sha256) is None:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_RAW_HASH_INVALID",
+            "raw execution-universe SHA-256 is malformed",
         )
-        row_fingerprints[symbol] = encoded
-    return tuple(by_symbol[symbol] for symbol in sorted(by_symbol))
+    by_symbol: dict[str, dict[str, object]] = {}
+    for raw_row in rows:
+        normalized = _canonicalize_execution_universe_row(raw_row, account_login=expected_login)
+        symbol = str(normalized["symbol"])
+        existing = by_symbol.get(symbol)
+        if existing is not None and existing != normalized:
+            raise HistoricalDataError(
+                "BROKER_SYMBOL_CONFLICT",
+                f"broker universe contains conflicting normalized rows for {symbol}",
+            )
+        by_symbol[symbol] = normalized
+    if not by_symbol:
+        raise HistoricalDataError("BROKER_UNIVERSE_EMPTY", "broker universe contains no rows")
+    canonical_rows = [by_symbol[symbol] for symbol in sorted(by_symbol)]
+    snapshot: dict[str, object] = {
+        "schema_version": EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION,
+        "execution_account_login": expected_login,
+        "canonicalization_contract": _canonical_universe_contract(),
+        "row_count": len(canonical_rows),
+        "rows": canonical_rows,
+    }
+    canonical_sha256 = verify_canonical_execution_universe_snapshot(snapshot)
+    symbols: list[BrokerSymbolV1] = []
+    for row in canonical_rows:
+        string_row = {
+            key: str(value)
+            for key, value in row.items()
+            if key in EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS
+        }
+        supported, reason = risk_model_support_for_symbol_row(string_row)
+        symbols.append(
+            BrokerSymbolV1(
+                symbol=str(row["symbol"]),
+                trade_mode=str(row["trade_mode"]),
+                source_row=string_row,
+                asset_class=str(row["asset_class"]),
+                risk_model_supported=supported,
+                risk_model_reason=reason,
+            )
+        )
+    return CanonicalExecutionUniverseV1(
+        symbols=tuple(symbols),
+        raw_sha256=raw_sha256,
+        canonical_sha256=canonical_sha256,
+        canonical_snapshot=snapshot,
+    )
+
+
+def load_canonical_execution_universe(
+    symbols_csv: Path,
+    *,
+    account_login: str,
+) -> CanonicalExecutionUniverseV1:
+    """Parse the authoritative raw export into stable execution semantics."""
+    if not symbols_csv.is_file():
+        raise HistoricalDataError("BROKER_UNIVERSE_MISSING", f"broker universe not found: {symbols_csv}")
+    raw_bytes = symbols_csv.read_bytes()
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_ENCODING_INVALID",
+            "broker universe must be UTF-8 CSV",
+        ) from exc
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    fieldnames = reader.fieldnames or []
+    if len(fieldnames) != len(set(fieldnames)):
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_COLUMNS_DUPLICATE",
+            "broker universe contains duplicate column names",
+        )
+    missing = [field for field in SYMBOL_REQUIRED_FIELDS if field not in fieldnames]
+    if missing:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_COLUMNS_MISSING",
+            f"broker universe is missing required columns: {missing}",
+        )
+    unclassified = [field for field in fieldnames if field not in SYMBOL_REQUIRED_FIELDS]
+    if unclassified:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_COLUMNS_UNCLASSIFIED",
+            f"broker universe contains unclassified columns: {unclassified}",
+        )
+    rows: list[dict[str, object]] = []
+    for raw_row in reader:
+        if None in raw_row:
+            raise HistoricalDataError(
+                "BROKER_UNIVERSE_ROW_MALFORMED",
+                "broker universe row has more values than classified columns",
+            )
+        rows.append(dict(raw_row))
+    return build_canonical_execution_universe(
+        rows,
+        account_login=account_login,
+        raw_sha256=sha256_bytes(raw_bytes),
+    )
+
+
+def load_broker_universe(symbols_csv: Path, *, account_login: str) -> tuple[BrokerSymbolV1, ...]:
+    """Backward-compatible view of the canonical authoritative universe."""
+    return load_canonical_execution_universe(
+        symbols_csv,
+        account_login=account_login,
+    ).symbols
 
 
 def verify_cross_account_symbol_compatibility(
@@ -749,7 +1004,7 @@ def _chunk_cache_identity(
         "chunk_id": chunk.chunk_id,
         "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
         "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
-        "collector_version": COLLECTOR_VERSION,
+        "collector_version": CHUNK_COLLECTOR_VERSION,
         "collector_code_sha256": collector_code_sha256,
     }
 
@@ -1222,7 +1477,7 @@ def build_dataset_manifest(
     broker_symbol: BrokerSymbolV1,
     execution_account_login: str,
     execution_universe_source: str,
-    execution_universe_sha256: str,
+    execution_universe: CanonicalExecutionUniverseV1,
     timeframe: str,
     requested_from_utc: datetime,
     requested_to_utc: datetime,
@@ -1241,6 +1496,37 @@ def build_dataset_manifest(
         raise HistoricalDataError(
             "BROKER_UNIVERSE_ACCOUNT_MISMATCH",
             "dataset execution account does not match its broker-universe row",
+        )
+    canonical_sha256 = verify_canonical_execution_universe_snapshot(
+        execution_universe.canonical_snapshot,
+        expected_sha256=execution_universe.canonical_sha256,
+    )
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", execution_universe.raw_sha256) is None:
+        raise HistoricalDataError(
+            "BROKER_UNIVERSE_RAW_HASH_INVALID",
+            "raw execution-universe SHA-256 is malformed",
+        )
+    canonical_rows = execution_universe.canonical_snapshot.get("rows")
+    if not isinstance(canonical_rows, list):
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_SNAPSHOT_INVALID",
+            "canonical execution-universe rows are missing",
+        )
+    canonical_symbol_row = next(
+        (
+            row
+            for row in canonical_rows
+            if isinstance(row, dict) and row.get("symbol") == broker_symbol.symbol
+        ),
+        None,
+    )
+    if canonical_symbol_row is None or canonical_symbol_row != _canonicalize_execution_universe_row(
+        broker_symbol.source_row,
+        account_login=execution_account,
+    ):
+        raise HistoricalDataError(
+            "DATASET_CANONICAL_UNIVERSE_SYMBOL_MISMATCH",
+            f"{broker_symbol.symbol} does not match the canonical execution-universe snapshot",
         )
     if not market_data_account or source_proof.get("source_type") != SOURCE_TYPE:
         raise HistoricalDataError(
@@ -1291,7 +1577,11 @@ def build_dataset_manifest(
         "execution_account_login": execution_account,
         "market_data_account_login": market_data_account,
         "execution_universe_source": execution_universe_source,
-        "execution_universe_sha256": execution_universe_sha256,
+        "execution_universe_sha256": canonical_sha256,
+        "execution_universe_canonical_sha256": canonical_sha256,
+        "execution_universe_canonical_schema_version": (
+            EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION
+        ),
         "market_data_account_server": source_proof.get("market_data_account_server"),
         "market_data_account_company": source_proof.get("market_data_account_company")
         or source_proof.get("terminal_company"),
@@ -1329,6 +1619,8 @@ def build_dataset_manifest(
         "dataset_id": f"ser8-historical:sha256:{dataset_sha256}",
         "dataset_sha256": dataset_sha256,
         "source_capture_utc": _utc_text(source_capture_utc),
+        "execution_universe_raw_sha256": execution_universe.raw_sha256,
+        "execution_universe_canonical_snapshot": dict(execution_universe.canonical_snapshot),
         "source_proof": dict(source_proof),
         "cross_account_provenance": {
             "execution_account_login": execution_account,
@@ -1343,6 +1635,7 @@ def build_dataset_manifest(
             "name": broker_symbol.symbol,
             "trade_mode": broker_symbol.trade_mode,
             "trade_tick_size": compatibility["execution_tick_size"],
+            "canonical_tick_size": canonical_symbol_row["tick_size"],
         },
         "source_symbol_metadata": dict(symbol_metadata),
         "broker_trade_mode": broker_symbol.trade_mode,
@@ -1385,6 +1678,64 @@ def _fsync_directory(path: Path) -> None:
             pass
     finally:
         os.close(descriptor)
+
+
+def verify_canonical_execution_universe_artifact(
+    artifact_path: Path,
+    *,
+    expected_sha256: str,
+) -> dict[str, object]:
+    try:
+        snapshot = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_ARTIFACT_INVALID",
+            f"cannot read canonical execution-universe artifact: {artifact_path}",
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise HistoricalDataError(
+            "CANONICAL_UNIVERSE_ARTIFACT_INVALID",
+            f"canonical execution-universe artifact is not an object: {artifact_path}",
+        )
+    verify_canonical_execution_universe_snapshot(snapshot, expected_sha256=expected_sha256)
+    return snapshot
+
+
+def publish_canonical_execution_universe_snapshot(
+    root: Path,
+    universe: CanonicalExecutionUniverseV1,
+) -> Path:
+    """Atomically persist one content-addressed, independently verifiable snapshot."""
+    root = _assert_not_live_artifact_path(root, field_name="dataset_root")
+    verify_canonical_execution_universe_snapshot(
+        universe.canonical_snapshot,
+        expected_sha256=universe.canonical_sha256,
+    )
+    digest = universe.canonical_sha256.removeprefix("sha256:")
+    snapshot_root = root / "execution_universe_snapshots"
+    destination = snapshot_root / digest
+    artifact_path = destination / "snapshot.json"
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        verify_canonical_execution_universe_artifact(
+            artifact_path,
+            expected_sha256=universe.canonical_sha256,
+        )
+        return artifact_path
+    temporary = Path(tempfile.mkdtemp(prefix=".ser8-universe-", dir=snapshot_root))
+    try:
+        _write_synced(
+            temporary / "snapshot.json",
+            canonical_json_bytes(dict(universe.canonical_snapshot)) + b"\n",
+        )
+        _fsync_directory(temporary)
+        temporary.replace(destination)
+        _fsync_directory(snapshot_root)
+    except BaseException:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        raise
+    return artifact_path
 
 
 def publish_dataset(
@@ -1450,6 +1801,40 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
     semantic_manifest.pop("manifest_sha256", None)
     if supplied_manifest_hash != _sha256_hex(canonical_json_bytes(semantic_manifest)):
         raise HistoricalDataError("DATASET_MANIFEST_HASH_MISMATCH", f"manifest hash mismatch: {dataset_dir}")
+    raw_universe_sha256 = manifest.get("execution_universe_raw_sha256")
+    canonical_universe_sha256 = manifest.get("execution_universe_canonical_sha256")
+    canonical_snapshot = manifest.get("execution_universe_canonical_snapshot")
+    if (
+        not isinstance(raw_universe_sha256, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", raw_universe_sha256) is None
+    ):
+        raise HistoricalDataError(
+            "DATASET_RAW_UNIVERSE_HASH_INVALID",
+            f"raw execution-universe hash is invalid: {dataset_dir}",
+        )
+    if (
+        manifest.get("execution_universe_canonical_schema_version")
+        != EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION
+        or not isinstance(canonical_universe_sha256, str)
+        or not isinstance(canonical_snapshot, dict)
+    ):
+        raise HistoricalDataError(
+            "DATASET_CANONICAL_UNIVERSE_PROVENANCE_MISSING",
+            f"canonical execution-universe provenance is missing: {dataset_dir}",
+        )
+    verify_canonical_execution_universe_snapshot(
+        canonical_snapshot,
+        expected_sha256=canonical_universe_sha256,
+    )
+    if (
+        manifest.get("execution_universe_sha256") != canonical_universe_sha256
+        or canonical_snapshot.get("execution_account_login")
+        != manifest.get("execution_account_login")
+    ):
+        raise HistoricalDataError(
+            "DATASET_CANONICAL_UNIVERSE_PROVENANCE_MISMATCH",
+            f"canonical execution-universe provenance does not match manifest: {dataset_dir}",
+        )
     bars_bytes = bars_path.read_bytes()
     if manifest.get("bars_sha256") != sha256_bytes(bars_bytes):
         raise HistoricalDataError("DATASET_BARS_HASH_MISMATCH", f"bars checksum mismatch: {dataset_dir}")
@@ -1510,7 +1895,8 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
     identity_keys = (
         "schema_version", "source_type", "market_data_source_type",
         "execution_account_login", "market_data_account_login", "execution_universe_source",
-        "execution_universe_sha256", "market_data_account_server",
+        "execution_universe_sha256", "execution_universe_canonical_sha256",
+        "execution_universe_canonical_schema_version", "market_data_account_server",
         "market_data_account_company", "market_data_account_currency", "symbol", "timeframe",
         "requested_from_utc", "requested_to_utc", "actual_first_bar_utc",
         "actual_last_bar_utc", "requested_duration_seconds", "observed_span_seconds",
@@ -1525,6 +1911,8 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
         "market_data_account_login",
         "execution_universe_source",
         "execution_universe_sha256",
+        "execution_universe_canonical_sha256",
+        "execution_universe_canonical_schema_version",
         "market_data_account_server",
     ):
         if not manifest.get(key):
@@ -1556,6 +1944,27 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
         raise HistoricalDataError(
             "DATASET_SYMBOL_COMPATIBILITY_INVALID",
             f"cross-account symbol compatibility is invalid: {dataset_dir}",
+        )
+    canonical_symbol_row = next(
+        (
+            row
+            for row in canonical_snapshot["rows"]
+            if isinstance(row, dict) and row.get("symbol") == manifest.get("symbol")
+        ),
+        None,
+    )
+    execution_metadata = manifest.get("execution_symbol_metadata")
+    if not isinstance(execution_metadata, dict) or canonical_symbol_row is None or (
+        canonical_symbol_row.get("trade_mode") != manifest.get("broker_trade_mode")
+        or canonical_symbol_row.get("asset_class") != manifest.get("asset_class")
+        or canonical_symbol_row.get("risk_model_supported")
+        is not manifest.get("risk_model_supported")
+        or canonical_symbol_row.get("tick_size")
+        != execution_metadata.get("canonical_tick_size")
+    ):
+        raise HistoricalDataError(
+            "DATASET_CANONICAL_UNIVERSE_SYMBOL_MISMATCH",
+            f"dataset symbol does not match its canonical execution universe: {dataset_dir}",
         )
     identity = {key: manifest.get(key) for key in identity_keys}
     digest = hashlib.sha256()
@@ -1596,6 +2005,38 @@ def verify_inventory(payload: Mapping[str, object]) -> None:
         raise HistoricalDataError(
             "INVENTORY_EXECUTION_UNIVERSE_MISMATCH",
             f"execution universe must be {expected_source}, got {universe_source!r}",
+        )
+    raw_universe_sha256 = payload.get("execution_universe_raw_sha256")
+    canonical_universe_sha256 = payload.get("execution_universe_canonical_sha256")
+    canonical_snapshot = payload.get("execution_universe_canonical_snapshot")
+    if (
+        not isinstance(raw_universe_sha256, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", raw_universe_sha256) is None
+        or payload.get("broker_universe_raw_sha256") != raw_universe_sha256
+    ):
+        raise HistoricalDataError(
+            "INVENTORY_RAW_UNIVERSE_PROVENANCE_INVALID",
+            "historical inventory raw execution-universe provenance is invalid",
+        )
+    if (
+        payload.get("execution_universe_canonical_schema_version")
+        != EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION
+        or not isinstance(canonical_universe_sha256, str)
+        or payload.get("execution_universe_sha256") != canonical_universe_sha256
+        or not isinstance(canonical_snapshot, dict)
+    ):
+        raise HistoricalDataError(
+            "INVENTORY_CANONICAL_UNIVERSE_PROVENANCE_INVALID",
+            "historical inventory canonical execution-universe provenance is invalid",
+        )
+    verify_canonical_execution_universe_snapshot(
+        canonical_snapshot,
+        expected_sha256=canonical_universe_sha256,
+    )
+    if canonical_snapshot.get("execution_account_login") != execution_account:
+        raise HistoricalDataError(
+            "INVENTORY_CANONICAL_UNIVERSE_PROVENANCE_INVALID",
+            "historical inventory canonical universe account is invalid",
         )
     if payload.get("market_data_source_type") != SOURCE_TYPE:
         raise HistoricalDataError(
@@ -1700,6 +2141,7 @@ def source_proof_result(
     *,
     execution_account_login: str,
     execution_universe_source: str,
+    execution_universe: CanonicalExecutionUniverseV1,
 ) -> dict[str, object]:
     market_data_account_login = str(proof.get("market_data_account_login") or "")
     execution_account_login, market_data_account_login = validate_active_account_contract(
@@ -1711,6 +2153,12 @@ def source_proof_result(
         "execution_account_login": str(execution_account_login),
         "market_data_account_login": market_data_account_login,
         "execution_universe_source": execution_universe_source,
+        "execution_universe_sha256": execution_universe.canonical_sha256,
+        "execution_universe_raw_sha256": execution_universe.raw_sha256,
+        "execution_universe_canonical_sha256": execution_universe.canonical_sha256,
+        "execution_universe_canonical_schema_version": (
+            EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION
+        ),
         "market_data_source_type": proof.get("source_type"),
         "cross_account_provenance": {
             "execution_account_login": str(execution_account_login),
@@ -1728,20 +2176,25 @@ def source_proof_result(
 __all__ = [
     "ASSET_CLASS_FX",
     "BAR_FIELDS",
+    "CHUNK_ACQUISITION_CODE_SHA256",
     "COLLECTOR_VERSION",
+    "EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION",
     "DATASET_SCHEMA_VERSION",
     "INVENTORY_SCHEMA_VERSION",
     "READ_ONLY_MT5_OPERATIONS",
     "SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN",
     "SER8_EXECUTION_ACCOUNT_LOGIN",
     "BrokerSymbolV1",
+    "CanonicalExecutionUniverseV1",
     "HistoricalBarV1",
     "HistoricalDataError",
     "HistoricalRateSource",
     "MetaTrader5HistorySource",
     "assert_historical_artifact_isolation",
     "build_dataset_manifest",
+    "build_canonical_execution_universe",
     "canonical_bars_csv",
+    "load_canonical_execution_universe",
     "collector_code_sha256",
     "inventory_hash",
     "load_broker_universe",
@@ -1749,10 +2202,13 @@ __all__ = [
     "load_inventory",
     "parse_utc",
     "publish_dataset",
+    "publish_canonical_execution_universe_snapshot",
     "source_proof_result",
     "validate_historical_bars",
     "validate_active_account_contract",
     "verify_dataset",
+    "verify_canonical_execution_universe_artifact",
+    "verify_canonical_execution_universe_snapshot",
     "verify_inventory",
     "verify_inventory_account_identities",
     "verify_cross_account_symbol_compatibility",
