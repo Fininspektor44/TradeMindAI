@@ -12,9 +12,14 @@ signals, or write to live candidate/outcome journals.
    authenticated market-data account `77053345`, broker/server identity, and
    the real execution-account universe `mt5_risk_symbols_utc_67206924.csv`.
 2. The same command in `collect` mode processes every unique broker-exported
-   symbol. It never imports an internet data source and never calls
-   `symbol_select`, login, order, deal, position, or trade APIs.
-3. Canonical `bars.csv` plus `manifest.json` are atomically published under
+   symbol through deterministic calendar-month UTC chunks. Each successful
+   chunk is identity-bound and staged for safe resume. It never imports an
+   internet data source and never calls `symbol_select`, login, order, deal,
+   position, or trade APIs.
+3. Staged chunks are never canonical research inputs. Only after every chunk
+   completes, identical boundary observations are deduplicated, conflicts fail
+   closed, and merged bars pass integrity validation are canonical `bars.csv`
+   plus `manifest.json` atomically published under
    `data/ser8_historical_market_data/<dataset_sha256>/`.
 4. `replay_ser8_historical_data.py` reuses the production `SignalEngine`,
    `MarketStructureEngine`, FX candidate adapter, and conservative shadow
@@ -43,17 +48,23 @@ credential/login argument.
 The content identity binds both account logins, the execution-universe export
 and hash, market-data broker/server/company identity, exact symbol identity,
 available execution/source trade-tick-size compatibility, timeframe,
-requested and actual coverage, point/digits, expected interval, and exact
-canonical bar bytes. `source_capture_utc` is audit metadata and is excluded
-from the dataset identity, so an identical rerun is idempotent.
+requested and actual coverage, the versioned calendar-month UTC chunk policy,
+point/digits, expected interval, and exact canonical bar bytes.
+`source_capture_utc`, chunk download order, cache/acquisition method, and retry
+history are audit metadata excluded from dataset identity, so an identical
+rerun is idempotent.
 
 The ECN history is research evidence from account `77053345`; it is not a
 claim that its spread or price feed is byte-identical to DEMO execution account
 `67206924`. No cross-account normalization or equivalence is invented.
 
-Validation preserves source order and reports duplicate and out-of-order
-timestamps, finite/numeric status, OHLC violations, gap counts, and largest
-gap. No row is repaired, dropped, interpolated, forward-filled, or synthesized.
+Each chunk cache binds source type, market-data account, server, symbol,
+timeframe, exact UTC range, bar hash, row count, collector version, and code
+hash. A missing, tampered, or identity-mismatched cache is reacquired. Final
+merge sorts timestamps ascending, drops only value-identical duplicate
+observations, and rejects conflicting values at the same timestamp. Validation
+reports finite/numeric status, OHLC violations, gap counts, and largest gap. No
+market observation is repaired, interpolated, forward-filled, or synthesized.
 UTC weekend overlap is descriptive only; broker session rules are not guessed,
 so gaps remain counted as unexplained until a broker-specific session calendar
 is separately proven.
@@ -76,9 +87,8 @@ fabricated outcome.
 
 Use the real repository and Common Files paths shown below. Keep the autonomous
 task running; none of these commands addresses Task Scheduler.
-Only Step A1 is the current next action. Step A2 follows after the correct
-terminal executable is operator-proven. Steps B-F are corrected here for later
-controlled use; do not run them yet.
+Steps A1, A2, and B are already evidenced. C1 is the current next action. Run
+C1-C4 sequentially and inspect each result before proceeding to D-F.
 
 ### A1. Read-only attachment identity check
 
@@ -115,10 +125,10 @@ This explicit-path verification is required before Steps B-F.
   --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI"
 ```
 
-### B. Small read-only acquisition proof
+### B. Previously completed seven-day source proof
 
-The limit selects the first symbol from the broker export; it is not a
-handwritten symbol allowlist.
+The original seven-day proof established that real broker bars are accessible.
+It is retained below as historical procedure, not the next action.
 
 ```powershell
 & ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-08-14T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 1
@@ -127,18 +137,55 @@ handwritten symbol allowlist.
 Stop and inspect the one attempted entry, manifest quality, and the zero-order
 safety fields. Do not treat the proof inventory as the full result.
 
-### C. Full-universe acquisition
+### C. Chunked Windows acquisition sequence
+
+### C1. Small multi-chunk acquisition proof
+
+The real export is sorted deterministically; `--proof-symbol-limit 1` selects
+one broker-derived symbol without adding an allowlist. The range crosses a UTC
+calendar-month boundary and therefore proves more than one internal chunk.
+
+```powershell
+Set-Location "C:\Users\meff4\Documents\TradeMindAI"
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "C:\Program Files\RoboForex MT5 Terminal\terminal64.exe" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-07-20T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 1
+```
+
+Stop and require multiple completed chunks, zero failed chunks, accepted real
+bars, deterministic ascending output, and all zero broker-mutation fields.
+
+### C2. Exact cache/idempotency rerun
+
+Run the exact C1 command again. Require the attempted chunks to report cached,
+the same dataset SHA, and no MT5 acquisition calls for valid cached chunks.
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "C:\Program Files\RoboForex MT5 Terminal\terminal64.exe" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-07-20T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 1
+```
+
+### C3. Full-universe multi-year acquisition
 
 This declared initial coverage window is explicit and may only be changed by
 changing both UTC arguments deliberately.
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2024-01-01T00:00:00Z" --to-utc "2026-08-21T00:00:00Z"
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "C:\Program Files\RoboForex MT5 Terminal\terminal64.exe" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2024-01-01T00:00:00Z" --to-utc "2026-08-21T00:00:00Z"
 ```
 
 Stop and confirm `total_broker_symbols` matches the real export. Unavailable,
 disabled, unsupported, insufficient, and integrity-failed symbols must remain
 visible rather than disappearing.
+
+### C4. Inventory summary
+
+```powershell
+$inventory = Get-Content ".\data\ser8_historical_market_data\historical_inventory.json" -Raw | ConvertFrom-Json
+$inventory | Select-Object total_broker_symbols, accepted_dataset_count, chunk_policy_version, orders_sent, orders_canceled, positions_modified
+$inventory.entries | Group-Object status | Sort-Object Name | Select-Object Name, Count
+```
+
+Stop and inspect the per-status counts plus each attempted entry's requested,
+completed, empty, and failed chunk counts. C1-C4 are evidence gates; synthetic
+pytest results cannot substitute for them.
 
 ### D. Integrity inventory verification
 

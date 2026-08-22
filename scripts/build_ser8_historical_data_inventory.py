@@ -15,8 +15,11 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from trademind.ser8_historical_data import (  # noqa: E402
     INVENTORY_SCHEMA_VERSION,
+    CHUNK_POLICY_VERSION,
+    COLLECTOR_VERSION,
     HistoricalDataError,
     MetaTrader5HistorySource,
+    acquire_chunked_history,
     assert_historical_artifact_isolation,
     build_dataset_manifest,
     collector_code_sha256,
@@ -89,6 +92,16 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
     if not args.from_utc or not args.to_utc:
         raise HistoricalDataError("COLLECTION_RANGE_REQUIRED", "--from-utc and --to-utc are required")
     policy = load_research_policy(args.policy.expanduser().resolve())
+    if policy.get("collector_version") != COLLECTOR_VERSION:
+        raise HistoricalDataError(
+            "COLLECTOR_POLICY_MISMATCH",
+            f"policy collector version must be {COLLECTOR_VERSION}",
+        )
+    if policy.get("chunk_policy_version") != CHUNK_POLICY_VERSION:
+        raise HistoricalDataError(
+            "CHUNK_POLICY_MISMATCH",
+            f"policy chunk version must be {CHUNK_POLICY_VERSION}",
+        )
     timeframe = args.timeframe.strip().upper()
     expected_interval = int(policy["expected_interval_seconds"])
     if timeframe == policy["initial_timeframe"]:
@@ -127,7 +140,8 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
             item.symbol
             for item in (universe[: args.proof_symbol_limit] if args.proof_symbol_limit else universe)
         }
-        for broker_symbol in universe:
+        collector_sha256 = collector_code_sha256()
+        for symbol_index, broker_symbol in enumerate(universe, start=1):
             base: dict[str, object] = {
                 "symbol": broker_symbol.symbol,
                 "broker_trade_mode": broker_symbol.trade_mode,
@@ -139,9 +153,21 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                 "dataset_id": None,
                 "dataset_sha256": None,
                 "dataset_dir": None,
+                "chunk_policy_version": CHUNK_POLICY_VERSION,
             }
+            print(
+                f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol}",
+                file=sys.stderr,
+                flush=True,
+            )
             if broker_symbol.symbol not in selected:
                 entries.append({**base, "status": "NOT_REQUESTED_PROOF_LIMIT", "status_reason": "small proof limit"})
+                print(
+                    f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                    "final=NOT_REQUESTED_PROOF_LIMIT row_count=0",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 continue
             if broker_symbol.trade_mode in {"DISABLED", "CLOSEONLY"}:
                 entries.append(
@@ -150,6 +176,12 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                         "status": "BROKER_SYMBOL_DISABLED",
                         "status_reason": f"trade_mode={broker_symbol.trade_mode}",
                     }
+                )
+                print(
+                    f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                    "final=BROKER_SYMBOL_DISABLED row_count=0",
+                    file=sys.stderr,
+                    flush=True,
                 )
                 continue
             try:
@@ -164,14 +196,108 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                         "BROKER_SYMBOL_DISABLED",
                         f"current MT5 trade mode is {symbol_metadata['trade_mode_name']}",
                     )
-                bars = source.copy_rates(
-                    broker_symbol.symbol,
-                    timeframe,
-                    requested_from,
-                    requested_to,
+                progress_counts = {"cached": 0, "acquired": 0, "empty": 0, "failed": 0}
+
+                def report_chunk(
+                    chunk_index: int,
+                    chunk_total: int,
+                    audit: dict[str, object],
+                ) -> None:
+                    method = str(audit["acquisition_method"])
+                    status = str(audit["status"])
+                    progress_counts["cached"] += int(method == "CACHE" and status != "FAILED")
+                    progress_counts["acquired"] += int(method == "MT5" and status != "FAILED")
+                    progress_counts["empty"] += int(status == "EMPTY")
+                    progress_counts["failed"] += int(status == "FAILED")
+                    print(
+                        f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                        f"chunk {chunk_index}/{chunk_total} status={status.lower()} "
+                        f"cached={progress_counts['cached']} acquired={progress_counts['acquired']} "
+                        f"empty={progress_counts['empty']} failed={progress_counts['failed']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+                acquisition = acquire_chunked_history(
+                    source=source,
+                    source_proof=proof,
+                    symbol=broker_symbol.symbol,
+                    timeframe=timeframe,
+                    requested_from_utc=requested_from,
+                    requested_to_utc=requested_to,
+                    staging_root=dataset_root / "staging",
+                    collector_code_sha256=collector_sha256,
+                    progress=report_chunk,
                 )
+                acquisition_summary = acquisition.manifest_summary()
+                if acquisition.merge_integrity_error_code is not None:
+                    entries.append(
+                        {
+                            **base,
+                            **acquisition_summary,
+                            "status": "DATA_INTEGRITY_FAILED",
+                            "status_reason": acquisition.merge_integrity_error,
+                        }
+                    )
+                    print(
+                        f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                        "final=DATA_INTEGRITY_FAILED row_count=0",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                if acquisition.failed_chunk_count:
+                    integrity_codes = {
+                        "BAR_IDENTITY_MISMATCH",
+                        "CONFLICTING_DUPLICATE_BAR",
+                        "CHUNK_BAR_OUTSIDE_REQUEST",
+                        "CHUNK_DATA_INTEGRITY_FAILED",
+                    }
+                    failed_error_codes = {
+                        str(item.get("error_code"))
+                        for item in acquisition.chunk_audit
+                        if item.get("status") == "FAILED"
+                    }
+                    failed_status = (
+                        "DATA_INTEGRITY_FAILED"
+                        if failed_error_codes & integrity_codes
+                        else "HISTORICAL_CHUNK_ACQUISITION_FAILED"
+                    )
+                    entries.append(
+                        {
+                            **base,
+                            **acquisition_summary,
+                            "status": failed_status,
+                            "status_reason": (
+                                f"{acquisition.failed_chunk_count} of "
+                                f"{acquisition.requested_chunk_count} chunks failed; partial bars not published"
+                            ),
+                        }
+                    )
+                    print(
+                        f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                        f"final={failed_status} row_count=0",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                bars = acquisition.bars
                 if not bars:
-                    raise HistoricalDataError("BROKER_HISTORY_UNAVAILABLE", "broker returned no bars")
+                    entries.append(
+                        {
+                            **base,
+                            **acquisition_summary,
+                            "status": "BROKER_HISTORY_UNAVAILABLE",
+                            "status_reason": "all requested chunks completed but returned no bars",
+                        }
+                    )
+                    print(
+                        f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                        "final=BROKER_HISTORY_UNAVAILABLE row_count=0",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
                 manifest, bars_bytes = build_dataset_manifest(
                     bars=bars,
                     source_proof=proof,
@@ -185,7 +311,8 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                     requested_to_utc=requested_to,
                     expected_interval_seconds=expected_interval,
                     source_capture_utc=captured_at,
-                    collector_code_sha256=collector_code_sha256(),
+                    collector_code_sha256=collector_sha256,
+                    chunk_acquisition=acquisition_summary,
                 )
                 dataset_dir, persisted_manifest, _created = publish_dataset(
                     dataset_root, manifest, bars_bytes
@@ -218,10 +345,23 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
                         "dataset_sha256": persisted_manifest["dataset_sha256"],
                         "dataset_dir": str(dataset_dir),
                         "quality": quality,
+                        **acquisition_summary,
                     }
+                )
+                print(
+                    f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                    f"final={status} row_count={quality['row_count']}",
+                    file=sys.stderr,
+                    flush=True,
                 )
             except HistoricalDataError as exc:
                 entries.append({**base, "status": exc.code, "status_reason": str(exc)})
+                print(
+                    f"symbol {symbol_index}/{len(universe)} {broker_symbol.symbol} "
+                    f"final={exc.code} row_count=0",
+                    file=sys.stderr,
+                    flush=True,
+                )
     finally:
         source.close()
 
@@ -251,6 +391,8 @@ def _collect(args: argparse.Namespace) -> dict[str, object]:
         "requested_from_utc": requested_from.isoformat().replace("+00:00", "Z"),
         "requested_to_utc": requested_to.isoformat().replace("+00:00", "Z"),
         "expected_interval_seconds": expected_interval,
+        "chunk_policy_version": CHUNK_POLICY_VERSION,
+        "staging_artifacts_canonical": False,
         "total_broker_symbols": len(universe),
         "proof_symbol_limit": args.proof_symbol_limit or None,
         "entries": entries,

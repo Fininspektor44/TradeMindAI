@@ -1040,11 +1040,14 @@ def test_windows_runbook_uses_real_paths_and_stepwise_commands() -> None:
     assert "proof-symbol-limit 1" in text
     assert "--mode verify-inventory" in text
     assert "--historical-inventory" in text
-    assert text.count("--execution-account 67206924") == 7
-    assert text.count("--market-data-account 77053345") == 7
-    assert text.count("--terminal-path \"<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>\"") == 3
+    assert text.count("--execution-account 67206924") == 9
+    assert text.count("--market-data-account 77053345") == 9
+    assert text.count("--terminal-path \"<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>\"") == 2
+    assert text.count(
+        '--terminal-path "C:\\Program Files\\RoboForex MT5 Terminal\\terminal64.exe"'
+    ) == 3
     assert RETIRED_MARKET_DATA_ACCOUNT not in text
     assert "--mode verify-source --account" not in text
-    assert "do not run them yet" in text
+    assert "C1 is the current next action" in text
     assert ".\\data\\mt5" not in text
     assert "Stop and" in text

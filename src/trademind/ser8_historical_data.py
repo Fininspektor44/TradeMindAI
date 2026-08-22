@@ -17,6 +17,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -35,7 +36,9 @@ from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_
 DATASET_SCHEMA_VERSION = "ser8-historical-market-data-v1"
 INVENTORY_SCHEMA_VERSION = "ser8-historical-data-inventory-v1"
 SOURCE_PROOF_SCHEMA_VERSION = "ser8-mt5-history-source-proof-v1"
-COLLECTOR_VERSION = "1.0.0"
+COLLECTOR_VERSION = "1.1.0"
+CHUNK_POLICY_VERSION = "ser8-calendar-month-utc-v1"
+CHUNK_CACHE_SCHEMA_VERSION = "ser8-mt5-history-chunk-v1"
 SOURCE_TYPE = "MT5_PYTHON_COPY_RATES_RANGE"
 SER8_EXECUTION_ACCOUNT_LOGIN = "67206924"
 SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN = "77053345"
@@ -61,6 +64,7 @@ BAR_FIELDS = (
 )
 _DATASET_HASH_DOMAIN = b"trademind:ser8:historical-market-data:v1"
 _INVENTORY_HASH_DOMAIN = b"trademind:ser8:historical-data-inventory:v1"
+_CHUNK_SOURCE_HASH_DOMAIN = b"trademind:ser8:historical-chunk-source:v1"
 _LIVE_ARTIFACT_PATH_PARTS = frozenset({
     "live_signal_runtime_v1",
     "signal_intelligence_v1_16",
@@ -104,6 +108,61 @@ class BrokerSymbolV1:
     asset_class: str
     risk_model_supported: bool
     risk_model_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalChunkV1:
+    """One deterministic half-open logical UTC acquisition window."""
+
+    chunk_id: str
+    chunk_from_utc: datetime
+    chunk_to_utc: datetime
+
+    def __post_init__(self) -> None:
+        start = _as_utc(self.chunk_from_utc)
+        end = _as_utc(self.chunk_to_utc)
+        if end <= start:
+            raise HistoricalDataError("INVALID_CHUNK_RANGE", "chunk end must follow chunk start")
+        object.__setattr__(self, "chunk_from_utc", start)
+        object.__setattr__(self, "chunk_to_utc", end)
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkedAcquisitionV1:
+    """Bars and audit state from a complete deterministic chunk plan attempt."""
+
+    bars: tuple[HistoricalBarV1, ...]
+    chunk_audit: tuple[Mapping[str, object], ...]
+    requested_chunk_count: int
+    completed_chunk_count: int
+    empty_chunk_count: int
+    failed_chunk_count: int
+    cached_chunk_count: int
+    acquired_chunk_count: int
+    merge_integrity_error_code: str | None = None
+    merge_integrity_error: str | None = None
+
+    @property
+    def capture_complete(self) -> bool:
+        return (
+            self.requested_chunk_count > 0
+            and self.completed_chunk_count == self.requested_chunk_count
+            and self.failed_chunk_count == 0
+            and self.merge_integrity_error_code is None
+        )
+
+    def manifest_summary(self) -> dict[str, object]:
+        return {
+            "chunk_policy_version": CHUNK_POLICY_VERSION,
+            "requested_chunk_count": self.requested_chunk_count,
+            "completed_chunk_count": self.completed_chunk_count,
+            "empty_chunk_count": self.empty_chunk_count,
+            "failed_chunk_count": self.failed_chunk_count,
+            "cached_chunk_count": self.cached_chunk_count,
+            "acquired_chunk_count": self.acquired_chunk_count,
+            "chunk_audit": [dict(item) for item in self.chunk_audit],
+            "historical_capture_complete": self.capture_complete,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,9 +217,13 @@ class HistoricalRateSource(Protocol):
 
 
 def _utc_text(value: datetime) -> str:
+    return _as_utc(value).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise HistoricalDataError("TIME_NOT_AWARE", "timestamp must include timezone information")
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return value.astimezone(timezone.utc)
 
 
 def parse_utc(value: str) -> datetime:
@@ -171,6 +234,38 @@ def parse_utc(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise HistoricalDataError("INVALID_UTC_TIMESTAMP", "timestamp must include a UTC offset")
     return parsed.astimezone(timezone.utc)
+
+
+def _next_utc_month(value: datetime) -> datetime:
+    value = _as_utc(value)
+    if value.month == 12:
+        return datetime(value.year + 1, 1, 1, tzinfo=timezone.utc)
+    return datetime(value.year, value.month + 1, 1, tzinfo=timezone.utc)
+
+
+def plan_calendar_month_chunks(
+    requested_from_utc: datetime,
+    requested_to_utc: datetime,
+) -> tuple[HistoricalChunkV1, ...]:
+    """Split an authoritative range at deterministic calendar-month UTC boundaries."""
+    start = _as_utc(requested_from_utc)
+    end = _as_utc(requested_to_utc)
+    if end <= start:
+        raise HistoricalDataError("INVALID_TIME_RANGE", "requested_to_utc must follow requested_from_utc")
+    chunks: list[HistoricalChunkV1] = []
+    cursor = start
+    while cursor < end:
+        boundary = min(_next_utc_month(cursor), end)
+        chunk_id = f"{cursor:%Y%m%dT%H%M%SZ}__{boundary:%Y%m%dT%H%M%SZ}"
+        chunks.append(
+            HistoricalChunkV1(
+                chunk_id=chunk_id,
+                chunk_from_utc=cursor,
+                chunk_to_utc=boundary,
+            )
+        )
+        cursor = boundary
+    return tuple(chunks)
 
 
 def _number_text(value: float) -> str:
@@ -487,7 +582,10 @@ class MetaTrader5HistorySource:
             requested_to_utc.astimezone(timezone.utc),
         )
         if rates is None:
-            raise HistoricalDataError("BROKER_HISTORY_UNAVAILABLE", f"copy_rates_range failed: {self._last_error()}")
+            raise HistoricalDataError(
+                "MT5_COPY_RATES_FAILED",
+                f"copy_rates_range failed with MT5 last_error={self._last_error()}",
+            )
         names = tuple(getattr(getattr(rates, "dtype", None), "names", ()) or ())
         bars: list[HistoricalBarV1] = []
         for rate in rates:
@@ -539,6 +637,379 @@ def load_canonical_bars(path: Path) -> tuple[HistoricalBarV1, ...]:
                 )
             )
     return tuple(bars)
+
+
+def _bar_observation_values(bar: HistoricalBarV1) -> tuple[object, ...]:
+    return (
+        bar.symbol,
+        bar.timeframe,
+        bar.open,
+        bar.high,
+        bar.low,
+        bar.close,
+        bar.tick_volume,
+        bar.spread,
+        bar.real_volume,
+    )
+
+
+def merge_historical_bars(
+    bars: Sequence[HistoricalBarV1],
+    *,
+    symbol: str,
+    timeframe: str,
+) -> tuple[HistoricalBarV1, ...]:
+    """Sort and deduplicate identical observations, rejecting conflicts."""
+    normalized_symbol = symbol.strip().upper()
+    normalized_timeframe = timeframe.strip().upper()
+    by_timestamp: dict[datetime, HistoricalBarV1] = {}
+    for bar in bars:
+        if bar.symbol != normalized_symbol or bar.timeframe != normalized_timeframe:
+            raise HistoricalDataError(
+                "BAR_IDENTITY_MISMATCH",
+                f"bar identity {bar.symbol}/{bar.timeframe} does not match "
+                f"{normalized_symbol}/{normalized_timeframe}",
+            )
+        existing = by_timestamp.get(bar.time_utc)
+        if existing is None:
+            by_timestamp[bar.time_utc] = bar
+            continue
+        if _bar_observation_values(existing) != _bar_observation_values(bar):
+            raise HistoricalDataError(
+                "CONFLICTING_DUPLICATE_BAR",
+                f"conflicting {normalized_symbol}/{normalized_timeframe} observations at "
+                f"{_utc_text(bar.time_utc)}",
+            )
+    return tuple(by_timestamp[timestamp] for timestamp in sorted(by_timestamp))
+
+
+def _chunk_source_identity(source_proof: Mapping[str, object]) -> dict[str, object]:
+    identity = {
+        "source_type": source_proof.get("source_type"),
+        "market_data_account_login": source_proof.get("market_data_account_login"),
+        "market_data_account_server": source_proof.get("market_data_account_server"),
+        "market_data_account_company": source_proof.get("market_data_account_company")
+        or source_proof.get("terminal_company"),
+    }
+    validate_active_account_contract(
+        execution_account_login=SER8_EXECUTION_ACCOUNT_LOGIN,
+        market_data_account_login=str(identity["market_data_account_login"] or ""),
+    )
+    if identity["source_type"] != SOURCE_TYPE or not identity["market_data_account_server"]:
+        raise HistoricalDataError(
+            "CHUNK_SOURCE_IDENTITY_INVALID",
+            "verified MT5 source type, account, and server are required for chunk staging",
+        )
+    return identity
+
+
+def _safe_cache_component(value: str) -> str:
+    normalized = value.strip().upper()
+    visible = re.sub(r"[^A-Z0-9._-]+", "_", normalized).strip("._-") or "IDENTITY"
+    suffix = _sha256_hex(normalized.encode("utf-8"))[:12]
+    return f"{visible[:48]}-{suffix}"
+
+
+def chunk_cache_directory(
+    staging_root: Path,
+    *,
+    source_proof: Mapping[str, object],
+    symbol: str,
+    timeframe: str,
+    chunk: HistoricalChunkV1,
+) -> Path:
+    source_identity = _chunk_source_identity(source_proof)
+    digest = hashlib.sha256()
+    digest.update(_CHUNK_SOURCE_HASH_DOMAIN)
+    digest.update(b"\x00")
+    digest.update(canonical_json_bytes(source_identity))
+    return (
+        staging_root
+        / digest.hexdigest()
+        / _safe_cache_component(symbol)
+        / _safe_cache_component(timeframe)
+        / chunk.chunk_id
+    )
+
+
+def _chunk_cache_identity(
+    *,
+    source_proof: Mapping[str, object],
+    symbol: str,
+    timeframe: str,
+    chunk: HistoricalChunkV1,
+    collector_code_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": CHUNK_CACHE_SCHEMA_VERSION,
+        "chunk_policy_version": CHUNK_POLICY_VERSION,
+        **_chunk_source_identity(source_proof),
+        "symbol": symbol.strip().upper(),
+        "timeframe": timeframe.strip().upper(),
+        "chunk_id": chunk.chunk_id,
+        "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
+        "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
+        "collector_version": COLLECTOR_VERSION,
+        "collector_code_sha256": collector_code_sha256,
+    }
+
+
+def _load_valid_chunk_cache(
+    cache_dir: Path,
+    *,
+    expected_identity: Mapping[str, object],
+    chunk: HistoricalChunkV1,
+) -> tuple[tuple[HistoricalBarV1, ...], dict[str, object]]:
+    manifest_path = cache_dir / "manifest.json"
+    bars_path = cache_dir / "bars.csv"
+    if cache_dir.is_symlink() or manifest_path.is_symlink() or bars_path.is_symlink():
+        raise HistoricalDataError("CHUNK_CACHE_SYMLINK_FORBIDDEN", f"chunk cache contains a symlink: {cache_dir}")
+    if not manifest_path.is_file() or not bars_path.is_file():
+        raise HistoricalDataError("CHUNK_CACHE_INCOMPLETE", f"chunk cache is incomplete: {cache_dir}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HistoricalDataError("CHUNK_CACHE_INVALID", f"chunk cache manifest is invalid: {cache_dir}") from exc
+    if not isinstance(manifest, dict):
+        raise HistoricalDataError("CHUNK_CACHE_INVALID", f"chunk cache manifest is not an object: {cache_dir}")
+    supplied_manifest_hash = manifest.get("manifest_sha256")
+    semantic_manifest = dict(manifest)
+    semantic_manifest.pop("manifest_sha256", None)
+    if supplied_manifest_hash != _sha256_hex(canonical_json_bytes(semantic_manifest)):
+        raise HistoricalDataError("CHUNK_CACHE_MANIFEST_HASH_MISMATCH", f"chunk cache manifest hash mismatch: {cache_dir}")
+    for key, expected in expected_identity.items():
+        if manifest.get(key) != expected:
+            raise HistoricalDataError(
+                "CHUNK_CACHE_IDENTITY_MISMATCH",
+                f"chunk cache {key} does not match the active request",
+            )
+    try:
+        bars_bytes = bars_path.read_bytes()
+    except OSError as exc:
+        raise HistoricalDataError("CHUNK_CACHE_INVALID", f"chunk cache bars are unreadable: {cache_dir}") from exc
+    if manifest.get("bars_sha256") != sha256_bytes(bars_bytes):
+        raise HistoricalDataError("CHUNK_CACHE_BARS_HASH_MISMATCH", f"chunk cache bars hash mismatch: {cache_dir}")
+    try:
+        bars = load_canonical_bars(bars_path)
+    except (HistoricalDataError, OSError, ValueError, TypeError) as exc:
+        raise HistoricalDataError("CHUNK_CACHE_BARS_INVALID", f"chunk cache bars are invalid: {cache_dir}") from exc
+    status = manifest.get("status")
+    if status not in {"COMPLETED", "EMPTY"} or (status == "EMPTY") != (len(bars) == 0):
+        raise HistoricalDataError("CHUNK_CACHE_STATUS_INVALID", f"chunk cache status is invalid: {cache_dir}")
+    if manifest.get("row_count") != len(bars):
+        raise HistoricalDataError("CHUNK_CACHE_ROW_COUNT_MISMATCH", f"chunk cache row count mismatch: {cache_dir}")
+    merged = _validate_chunk_bars(
+        bars,
+        symbol=str(expected_identity["symbol"]),
+        timeframe=str(expected_identity["timeframe"]),
+        chunk=chunk,
+    )
+    if merged != bars:
+        raise HistoricalDataError("CHUNK_CACHE_ORDER_INVALID", f"chunk cache bars are not canonical: {cache_dir}")
+    return bars, manifest
+
+
+def _validate_chunk_bars(
+    bars: Sequence[HistoricalBarV1],
+    *,
+    symbol: str,
+    timeframe: str,
+    chunk: HistoricalChunkV1,
+) -> tuple[HistoricalBarV1, ...]:
+    merged = merge_historical_bars(bars, symbol=symbol, timeframe=timeframe)
+    if any(
+        bar.time_utc < chunk.chunk_from_utc or bar.time_utc > chunk.chunk_to_utc
+        for bar in merged
+    ):
+        raise HistoricalDataError(
+            "CHUNK_BAR_OUTSIDE_REQUEST",
+            f"chunk {chunk.chunk_id} returned a bar outside its requested UTC bounds",
+        )
+    quality = validate_historical_bars(
+        merged,
+        symbol=symbol,
+        timeframe=timeframe,
+        expected_interval_seconds=1,
+    )
+    if merged and (
+        quality["symbol_timeframe_identity_pass"] is not True
+        or quality["ohlc_integrity_pass"] is not True
+        or quality["numeric_integrity_pass"] is not True
+        or quality["monotonic_timestamp_pass"] is not True
+        or quality["duplicate_timestamp_count"] != 0
+    ):
+        raise HistoricalDataError(
+            "CHUNK_DATA_INTEGRITY_FAILED",
+            f"chunk {chunk.chunk_id} failed deterministic bar integrity validation",
+        )
+    return merged
+
+
+def _write_chunk_cache(
+    cache_dir: Path,
+    *,
+    identity: Mapping[str, object],
+    bars: Sequence[HistoricalBarV1],
+) -> dict[str, object]:
+    if cache_dir.is_symlink() or cache_dir.is_file():
+        cache_dir.unlink()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    bars_bytes = canonical_bars_csv(bars)
+    manifest: dict[str, object] = {
+        **dict(identity),
+        "status": "EMPTY" if not bars else "COMPLETED",
+        "row_count": len(bars),
+        "bars_sha256": sha256_bytes(bars_bytes),
+    }
+    manifest["manifest_sha256"] = _sha256_hex(canonical_json_bytes(manifest))
+    bars_temporary = cache_dir / ".bars.csv.tmp"
+    manifest_temporary = cache_dir / ".manifest.json.tmp"
+    _write_synced(bars_temporary, bars_bytes)
+    _write_synced(manifest_temporary, canonical_json_bytes(manifest) + b"\n")
+    bars_temporary.replace(cache_dir / "bars.csv")
+    manifest_temporary.replace(cache_dir / "manifest.json")
+    _fsync_directory(cache_dir)
+    return manifest
+
+
+def acquire_chunked_history(
+    *,
+    source: HistoricalRateSource,
+    source_proof: Mapping[str, object],
+    symbol: str,
+    timeframe: str,
+    requested_from_utc: datetime,
+    requested_to_utc: datetime,
+    staging_root: Path,
+    collector_code_sha256: str,
+    progress: Any | None = None,
+) -> ChunkedAcquisitionV1:
+    """Acquire every planned chunk, reusing only identity-verified staging artifacts."""
+    normalized_symbol = symbol.strip().upper()
+    normalized_timeframe = timeframe.strip().upper()
+    chunks = plan_calendar_month_chunks(requested_from_utc, requested_to_utc)
+    staged_bars: list[HistoricalBarV1] = []
+    audits: list[dict[str, object]] = []
+    completed = empty = failed = cached = acquired = 0
+    for index, chunk in enumerate(chunks, start=1):
+        identity = _chunk_cache_identity(
+            source_proof=source_proof,
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+            chunk=chunk,
+            collector_code_sha256=collector_code_sha256,
+        )
+        cache_dir = chunk_cache_directory(
+            staging_root,
+            source_proof=source_proof,
+            symbol=normalized_symbol,
+            timeframe=normalized_timeframe,
+            chunk=chunk,
+        )
+        cache_validation = "NOT_PRESENT"
+        cache_error_code: str | None = None
+        bars: tuple[HistoricalBarV1, ...] | None = None
+        method = "MT5"
+        if cache_dir.exists():
+            try:
+                bars, _ = _load_valid_chunk_cache(
+                    cache_dir,
+                    expected_identity=identity,
+                    chunk=chunk,
+                )
+                cache_validation = "VERIFIED"
+                method = "CACHE"
+                cached += 1
+            except HistoricalDataError as exc:
+                cache_validation = "REJECTED"
+                cache_error_code = exc.code
+        if bars is None:
+            try:
+                returned = source.copy_rates(
+                    normalized_symbol,
+                    normalized_timeframe,
+                    chunk.chunk_from_utc,
+                    chunk.chunk_to_utc,
+                )
+                bars = _validate_chunk_bars(
+                    returned,
+                    symbol=normalized_symbol,
+                    timeframe=normalized_timeframe,
+                    chunk=chunk,
+                )
+                cache_manifest = _write_chunk_cache(cache_dir, identity=identity, bars=bars)
+                if cache_manifest["bars_sha256"] != sha256_bytes(canonical_bars_csv(bars)):
+                    raise HistoricalDataError(
+                        "CHUNK_CACHE_PUBLICATION_FAILED",
+                        f"chunk cache publication did not preserve {chunk.chunk_id}",
+                    )
+                acquired += 1
+            except Exception as exc:
+                failed += 1
+                error_code = exc.code if isinstance(exc, HistoricalDataError) else "CHUNK_ACQUISITION_FAILED"
+                audit = {
+                    "chunk_id": chunk.chunk_id,
+                    "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
+                    "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
+                    "status": "FAILED",
+                    "acquisition_method": method,
+                    "cache_validation": cache_validation,
+                    "cache_error_code": cache_error_code,
+                    "row_count": 0,
+                    "bars_sha256": None,
+                    "error_code": error_code,
+                    "error": str(exc),
+                }
+                audits.append(audit)
+                if progress is not None:
+                    progress(index, len(chunks), audit)
+                continue
+        completed += 1
+        empty += int(not bars)
+        staged_bars.extend(bars)
+        bars_sha256 = sha256_bytes(canonical_bars_csv(bars))
+        audit = {
+            "chunk_id": chunk.chunk_id,
+            "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
+            "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
+            "status": "EMPTY" if not bars else "COMPLETED",
+            "acquisition_method": method,
+            "cache_validation": cache_validation,
+            "cache_error_code": cache_error_code,
+            "row_count": len(bars),
+            "bars_sha256": bars_sha256,
+            "error_code": None,
+            "error": None,
+        }
+        audits.append(audit)
+        if progress is not None:
+            progress(index, len(chunks), audit)
+
+    merged: tuple[HistoricalBarV1, ...] = ()
+    merge_error_code: str | None = None
+    merge_error: str | None = None
+    if failed == 0:
+        try:
+            merged = merge_historical_bars(
+                staged_bars,
+                symbol=normalized_symbol,
+                timeframe=normalized_timeframe,
+            )
+        except HistoricalDataError as exc:
+            merge_error_code = exc.code
+            merge_error = str(exc)
+    return ChunkedAcquisitionV1(
+        bars=merged,
+        chunk_audit=tuple(audits),
+        requested_chunk_count=len(chunks),
+        completed_chunk_count=completed,
+        empty_chunk_count=empty,
+        failed_chunk_count=failed,
+        cached_chunk_count=cached,
+        acquired_chunk_count=acquired,
+        merge_integrity_error_code=merge_error_code,
+        merge_integrity_error=merge_error,
+    )
 
 
 def validate_historical_bars(
@@ -613,6 +1084,136 @@ def validate_historical_bars(
     }
 
 
+def _default_chunk_acquisition_summary(
+    *,
+    bars: Sequence[HistoricalBarV1],
+    requested_from_utc: datetime,
+    requested_to_utc: datetime,
+) -> dict[str, object]:
+    chunks = plan_calendar_month_chunks(requested_from_utc, requested_to_utc)
+    audit: list[dict[str, object]] = []
+    for index, chunk in enumerate(chunks):
+        owned = tuple(
+            bar
+            for bar in bars
+            if bar.time_utc >= chunk.chunk_from_utc
+            and (
+                bar.time_utc < chunk.chunk_to_utc
+                or (index == len(chunks) - 1 and bar.time_utc == chunk.chunk_to_utc)
+            )
+        )
+        audit.append(
+            {
+                "chunk_id": chunk.chunk_id,
+                "chunk_from_utc": _utc_text(chunk.chunk_from_utc),
+                "chunk_to_utc": _utc_text(chunk.chunk_to_utc),
+                "status": "EMPTY" if not owned else "COMPLETED",
+                "acquisition_method": "DIRECT_VALIDATED_INPUT",
+                "cache_validation": "NOT_APPLICABLE",
+                "cache_error_code": None,
+                "row_count": len(owned),
+                "bars_sha256": sha256_bytes(canonical_bars_csv(owned)),
+                "error_code": None,
+                "error": None,
+            }
+        )
+    return {
+        "chunk_policy_version": CHUNK_POLICY_VERSION,
+        "requested_chunk_count": len(chunks),
+        "completed_chunk_count": len(chunks),
+        "empty_chunk_count": sum(item["status"] == "EMPTY" for item in audit),
+        "failed_chunk_count": 0,
+        "cached_chunk_count": 0,
+        "acquired_chunk_count": len(chunks),
+        "chunk_audit": audit,
+        "historical_capture_complete": True,
+    }
+
+
+def _validate_chunk_acquisition_summary(
+    summary: Mapping[str, object],
+    *,
+    requested_from_utc: datetime | None = None,
+    requested_to_utc: datetime | None = None,
+) -> dict[str, object]:
+    normalized = dict(summary)
+    if normalized.get("chunk_policy_version") != CHUNK_POLICY_VERSION:
+        raise HistoricalDataError(
+            "CHUNK_POLICY_MISMATCH",
+            f"chunk policy must be {CHUNK_POLICY_VERSION}",
+        )
+    count_fields = (
+        "requested_chunk_count",
+        "completed_chunk_count",
+        "empty_chunk_count",
+        "failed_chunk_count",
+        "cached_chunk_count",
+        "acquired_chunk_count",
+    )
+    if any(type(normalized.get(field)) is not int or int(normalized[field]) < 0 for field in count_fields):
+        raise HistoricalDataError("CHUNK_AUDIT_INVALID", "chunk acquisition counts must be non-negative integers")
+    requested = int(normalized["requested_chunk_count"])
+    completed = int(normalized["completed_chunk_count"])
+    empty = int(normalized["empty_chunk_count"])
+    failed = int(normalized["failed_chunk_count"])
+    cached = int(normalized["cached_chunk_count"])
+    acquired = int(normalized["acquired_chunk_count"])
+    audit = normalized.get("chunk_audit")
+    if (
+        requested <= 0
+        or not isinstance(audit, list)
+        or len(audit) != requested
+        or completed + failed != requested
+        or empty > completed
+        or cached + acquired != completed
+    ):
+        raise HistoricalDataError("CHUNK_AUDIT_INVALID", "chunk acquisition summary is inconsistent")
+    status_counts = {
+        status: sum(isinstance(item, dict) and item.get("status") == status for item in audit)
+        for status in ("COMPLETED", "EMPTY", "FAILED")
+    }
+    if (
+        status_counts["COMPLETED"] + status_counts["EMPTY"] != completed
+        or status_counts["EMPTY"] != empty
+        or status_counts["FAILED"] != failed
+    ):
+        raise HistoricalDataError("CHUNK_AUDIT_INVALID", "chunk audit statuses do not match counts")
+    for item in audit:
+        if not isinstance(item, dict):
+            raise HistoricalDataError("CHUNK_AUDIT_INVALID", "chunk audit entry must be an object")
+        status = item.get("status")
+        row_count = item.get("row_count")
+        bars_sha256 = item.get("bars_sha256")
+        if type(row_count) is not int or row_count < 0:
+            raise HistoricalDataError("CHUNK_AUDIT_INVALID", "chunk row count is invalid")
+        if status == "EMPTY" and (row_count != 0 or not isinstance(bars_sha256, str)):
+            raise HistoricalDataError("CHUNK_AUDIT_INVALID", "empty chunk audit is invalid")
+        if status == "COMPLETED" and (row_count <= 0 or not isinstance(bars_sha256, str)):
+            raise HistoricalDataError("CHUNK_AUDIT_INVALID", "completed chunk audit is invalid")
+        if status == "FAILED" and (row_count != 0 or bars_sha256 is not None):
+            raise HistoricalDataError("CHUNK_AUDIT_INVALID", "failed chunk audit is invalid")
+    if (requested_from_utc is None) != (requested_to_utc is None):
+        raise HistoricalDataError("CHUNK_AUDIT_INVALID", "both requested range endpoints are required")
+    if requested_from_utc is not None and requested_to_utc is not None:
+        planned = plan_calendar_month_chunks(requested_from_utc, requested_to_utc)
+        if len(planned) != requested:
+            raise HistoricalDataError("CHUNK_AUDIT_INVALID", "chunk count does not match requested range")
+        for item, chunk in zip(audit, planned, strict=True):
+            if (
+                item.get("chunk_id") != chunk.chunk_id
+                or item.get("chunk_from_utc") != _utc_text(chunk.chunk_from_utc)
+                or item.get("chunk_to_utc") != _utc_text(chunk.chunk_to_utc)
+            ):
+                raise HistoricalDataError(
+                    "CHUNK_AUDIT_INVALID",
+                    "chunk audit boundaries do not match the deterministic UTC plan",
+                )
+    expected_complete = completed == requested and failed == 0
+    if normalized.get("historical_capture_complete") is not expected_complete:
+        raise HistoricalDataError("CHUNK_AUDIT_INVALID", "historical capture completion flag is inconsistent")
+    return normalized
+
+
 def build_dataset_manifest(
     *,
     bars: Sequence[HistoricalBarV1],
@@ -628,6 +1229,7 @@ def build_dataset_manifest(
     expected_interval_seconds: int,
     source_capture_utc: datetime,
     collector_code_sha256: str,
+    chunk_acquisition: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], bytes]:
     execution_account = str(execution_account_login).strip()
     market_data_account = str(source_proof.get("market_data_account_login") or "").strip()
@@ -662,6 +1264,26 @@ def build_dataset_manifest(
     )
     bars_bytes = canonical_bars_csv(bars)
     bars_sha256 = sha256_bytes(bars_bytes)
+    requested_from = _as_utc(requested_from_utc)
+    requested_to = _as_utc(requested_to_utc)
+    acquisition = _validate_chunk_acquisition_summary(
+        chunk_acquisition
+        or _default_chunk_acquisition_summary(
+            bars=bars,
+            requested_from_utc=requested_from_utc,
+            requested_to_utc=requested_to_utc,
+        ),
+        requested_from_utc=requested_from,
+        requested_to_utc=requested_to,
+    )
+    actual_first = min((bar.time_utc for bar in bars), default=None)
+    actual_last = max((bar.time_utc for bar in bars), default=None)
+    requested_duration_seconds = int((requested_to - requested_from).total_seconds())
+    observed_span_seconds = (
+        int((actual_last - actual_first).total_seconds())
+        if actual_first is not None and actual_last is not None
+        else 0
+    )
     dataset_identity = {
         "schema_version": DATASET_SCHEMA_VERSION,
         "source_type": SOURCE_TYPE,
@@ -676,10 +1298,18 @@ def build_dataset_manifest(
         "market_data_account_currency": source_proof.get("market_data_account_currency"),
         "symbol": broker_symbol.symbol,
         "timeframe": timeframe.strip().upper(),
-        "requested_from_utc": _utc_text(requested_from_utc),
-        "requested_to_utc": _utc_text(requested_to_utc),
-        "actual_first_bar_utc": _utc_text(min(bar.time_utc for bar in bars)) if bars else None,
-        "actual_last_bar_utc": _utc_text(max(bar.time_utc for bar in bars)) if bars else None,
+        "requested_from_utc": _utc_text(requested_from),
+        "requested_to_utc": _utc_text(requested_to),
+        "actual_first_bar_utc": _utc_text(actual_first) if actual_first else None,
+        "actual_last_bar_utc": _utc_text(actual_last) if actual_last else None,
+        "requested_duration_seconds": requested_duration_seconds,
+        "observed_span_seconds": observed_span_seconds,
+        "first_bar_offset_seconds": (
+            int((actual_first - requested_from).total_seconds()) if actual_first else None
+        ),
+        "last_bar_offset_seconds": (
+            int((requested_to - actual_last).total_seconds()) if actual_last else None
+        ),
         "bars_sha256": bars_sha256,
         "symbol_point": symbol_metadata.get("point"),
         "symbol_digits": symbol_metadata.get("digits"),
@@ -687,6 +1317,7 @@ def build_dataset_manifest(
         "execution_symbol_tick_size": compatibility["execution_tick_size"],
         "market_data_symbol_trade_tick_size": compatibility["market_data_trade_tick_size"],
         "expected_interval_seconds": expected_interval_seconds,
+        "chunk_policy_version": CHUNK_POLICY_VERSION,
     }
     digest = hashlib.sha256()
     digest.update(_DATASET_HASH_DOMAIN)
@@ -720,9 +1351,12 @@ def build_dataset_manifest(
         "risk_model_reason": broker_symbol.risk_model_reason or None,
         "collector_version": COLLECTOR_VERSION,
         "collector_code_sha256": collector_code_sha256,
+        **acquisition,
         **quality,
         "quality": quality,
-        "accepted_historical_data": bool(quality["data_integrity_pass"]),
+        "accepted_historical_data": bool(
+            quality["data_integrity_pass"] and acquisition["historical_capture_complete"]
+        ),
         "gap_repair_performed": False,
         "synthetic_bars_added": 0,
     }
@@ -828,17 +1462,63 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
     )
     if quality != manifest.get("quality"):
         raise HistoricalDataError("DATASET_QUALITY_MISMATCH", f"quality manifest mismatch: {dataset_dir}")
-    if manifest.get("accepted_historical_data") is not bool(quality["data_integrity_pass"]):
+    requested_from = parse_utc(str(manifest.get("requested_from_utc") or ""))
+    requested_to = parse_utc(str(manifest.get("requested_to_utc") or ""))
+    acquisition = _validate_chunk_acquisition_summary(
+        {
+            key: manifest.get(key)
+            for key in (
+                "chunk_policy_version",
+                "requested_chunk_count",
+                "completed_chunk_count",
+                "empty_chunk_count",
+                "failed_chunk_count",
+                "cached_chunk_count",
+                "acquired_chunk_count",
+                "chunk_audit",
+                "historical_capture_complete",
+            )
+        },
+        requested_from_utc=requested_from,
+        requested_to_utc=requested_to,
+    )
+    expected_acceptance = bool(
+        quality["data_integrity_pass"] and acquisition["historical_capture_complete"]
+    )
+    if manifest.get("accepted_historical_data") is not expected_acceptance:
         raise HistoricalDataError("DATASET_ACCEPTANCE_MISMATCH", f"acceptance mismatch: {dataset_dir}")
+    actual_first = min((bar.time_utc for bar in bars), default=None)
+    actual_last = max((bar.time_utc for bar in bars), default=None)
+    expected_coverage = {
+        "actual_first_bar_utc": _utc_text(actual_first) if actual_first else None,
+        "actual_last_bar_utc": _utc_text(actual_last) if actual_last else None,
+        "requested_duration_seconds": int((requested_to - requested_from).total_seconds()),
+        "observed_span_seconds": (
+            int((actual_last - actual_first).total_seconds())
+            if actual_first is not None and actual_last is not None
+            else 0
+        ),
+        "first_bar_offset_seconds": (
+            int((actual_first - requested_from).total_seconds()) if actual_first else None
+        ),
+        "last_bar_offset_seconds": (
+            int((requested_to - actual_last).total_seconds()) if actual_last else None
+        ),
+    }
+    if any(manifest.get(key) != expected for key, expected in expected_coverage.items()):
+        raise HistoricalDataError("DATASET_COVERAGE_MISMATCH", f"coverage manifest mismatch: {dataset_dir}")
     identity_keys = (
         "schema_version", "source_type", "market_data_source_type",
         "execution_account_login", "market_data_account_login", "execution_universe_source",
         "execution_universe_sha256", "market_data_account_server",
         "market_data_account_company", "market_data_account_currency", "symbol", "timeframe",
         "requested_from_utc", "requested_to_utc", "actual_first_bar_utc",
-        "actual_last_bar_utc", "bars_sha256", "symbol_point", "symbol_digits",
+        "actual_last_bar_utc", "requested_duration_seconds", "observed_span_seconds",
+        "first_bar_offset_seconds", "last_bar_offset_seconds", "bars_sha256",
+        "symbol_point", "symbol_digits",
         "symbol_compatibility_verified", "execution_symbol_tick_size",
         "market_data_symbol_trade_tick_size", "expected_interval_seconds",
+        "chunk_policy_version",
     )
     for key in (
         "execution_account_login",
