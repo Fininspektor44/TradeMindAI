@@ -96,7 +96,13 @@ EXECUTION_UNIVERSE_SOURCE_FIELDS = (
     "leverage",
     "expiration_mode_flags",
 )
-EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS = ("time_msc", "bid", "ask")
+EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS = (
+    "time_msc",
+    "bid",
+    "ask",
+    "margin_buy_per_volume",
+    "margin_sell_per_volume",
+)
 EXECUTION_UNIVERSE_IDENTITY_RELEVANT_FIELDS = tuple(
     field
     for field in EXECUTION_UNIVERSE_SOURCE_FIELDS
@@ -118,8 +124,6 @@ _EXECUTION_UNIVERSE_NUMERIC_FIELDS = (
     "contract_size",
     "margin_initial",
     "margin_maintenance",
-    "margin_buy_per_volume",
-    "margin_sell_per_volume",
     "leverage",
     "expiration_mode_flags",
 )

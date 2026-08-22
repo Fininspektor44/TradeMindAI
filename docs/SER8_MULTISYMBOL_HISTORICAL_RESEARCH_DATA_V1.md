@@ -79,11 +79,17 @@ explicitly: `time_msc`, `account_login`, `server`, `currency`, `symbol`,
 `margin_buy_per_volume`, `margin_sell_per_volume`, `leverage`, and
 `expiration_mode_flags`.
 
-`time_msc`, `bid`, and `ask` are AUDIT/VOLATILE. They record capture time and
-the live quote observed during export, remain protected by the exact-byte raw
-SHA, and are deliberately absent from the canonical semantic rows. A quote or
-capture-time change therefore cannot change canonical identity. Every other
-declared source field is IDENTITY-RELEVANT:
+`time_msc`, `bid`, `ask`, `margin_buy_per_volume`, and
+`margin_sell_per_volume` are AUDIT/VOLATILE. They remain protected by the
+exact-byte raw SHA and are deliberately absent from the canonical semantic
+rows. The two margin snapshots are not broker-policy constants: both MQL5
+producers call `OrderCalcMargin` for volume `1.0`, passing the current
+`tick.ask` for BUY and current `tick.bid` for SELL. The platform evaluates that
+planned order on the current account in the current market environment and
+returns the result in account currency; it does not include existing pending
+orders or open positions. A quote, calculated margin snapshot, or capture-time
+change therefore cannot change canonical identity. Every other declared
+source field is IDENTITY-RELEVANT:
 
 - execution-source and account compatibility: `account_login`, `server`,
   `currency`, `symbol`. Server text is trimmed but case-preserved; a genuine
@@ -94,8 +100,7 @@ declared source field is IDENTITY-RELEVANT:
   `tick_value_profit`, `tick_value_loss`;
 - order-volume constraints: `volume_min`, `volume_max`, `volume_step`;
 - margin/notional fallback: `contract_size`, `margin_initial`,
-  `margin_maintenance`, `margin_buy_per_volume`, `margin_sell_per_volume`,
-  `leverage`;
+  `margin_maintenance`, `leverage`;
 - broker order-lifetime capability: `expiration_mode_flags`.
 
 The snapshot also binds deterministic derived `asset_class` and
