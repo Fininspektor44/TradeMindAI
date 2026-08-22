@@ -242,9 +242,19 @@ _LIVE_ARTIFACT_PATH_PARTS = frozenset({
 class HistoricalDataError(RuntimeError):
     """Fail-closed acquisition, integrity, or publication error."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        # Optional structured, audit-only evidence (e.g. which historical-
+        # unavailability signal was observed). Never consulted for identity;
+        # callers may fold it into a chunk audit entry when present.
+        self.details = dict(details) if details else None
 
 
 def validate_active_account_contract(
@@ -607,6 +617,90 @@ def _classify_chunk_failure_code(error_code: str | None) -> str:
     if error_code in DATA_INTEGRITY_CHUNK_ERROR_CODES:
         return "DATA_INTEGRITY"
     return "UNRESOLVED_TRANSIENT_OR_UNKNOWN"
+
+
+# Distinct, positively-observed signals that may establish a genuine
+# historical-unavailability boundary; persisted as audit-only provenance
+# alongside a GENUINE_HISTORICAL_UNAVAILABLE chunk failure so the two are
+# never conflated with each other or with any other failure class.
+HISTORICAL_UNAVAILABILITY_EVIDENCE_RES_E_NOT_FOUND = "RES_E_NOT_FOUND"
+HISTORICAL_UNAVAILABILITY_EVIDENCE_SUCCESS_SINGLE_BAR_STRICTLY_AFTER_REQUEST = (
+    "SUCCESS_SINGLE_BAR_STRICTLY_AFTER_REQUEST"
+)
+
+
+# mt5.last_error() codes that positively confirm the immediately-preceding
+# call succeeded (RES_S_OK == "Success"). Required, not inferred: see
+# _mt5_pre_history_sentinel_evidence().
+_MT5_SUCCESS_LAST_ERROR_CODES = frozenset({1})
+
+
+def _mt5_pre_history_sentinel_evidence(
+    bars: Sequence[HistoricalBarV1],
+    *,
+    symbol: str,
+    timeframe: str,
+    requested_from_utc: datetime,
+    requested_to_utc: datetime,
+    last_error: object,
+) -> dict[str, object] | None:
+    """MT5-ONLY: detect the narrow, positively-observed pre-history sentinel shape.
+
+    This is deliberately NOT part of the generic acquisition boundary and is
+    called ONLY from ``MetaTrader5HistorySource.copy_rates``, immediately
+    after the SAME ``copy_rates_range`` call that produced ``bars``, with
+    ``last_error`` captured from that same call. The generic acquisition
+    layer (``_attempt_chunk_acquisition``) never inspects returned-bar shape
+    for this purpose and cannot promote a plain single-future-bar response
+    into this classification on any source's behalf -- a fake/non-MT5
+    ``HistoricalRateSource`` can only trigger ``BROKER_HISTORY_NOT_RETAINED_
+    FOR_RANGE`` by explicitly raising it itself.
+
+    Real evidence (MT5/RoboForex, market-data account 77053345): requesting a
+    calendar chunk wholly before the broker's retained history for a symbol
+    can return EXACTLY ONE bar, strictly AFTER requested_to_utc, with
+    mt5.last_error() reporting (1, "Success") -- i.e. the call did not fail;
+    the broker's retained history for the symbol simply begins after the
+    requested window, and the terminal hands back its own earliest known bar
+    as a single row. This is a distinct signal from RES_E_NOT_FOUND (also
+    genuine, but a different observable shape) and is intentionally NARROW:
+    it must never be generalized to "any future/out-of-range bar means no
+    history".
+
+    Returns explicit evidence (for BROKER_HISTORY_NOT_RETAINED_FOR_RANGE
+    provenance) only when ALL of the following hold:
+
+    - ``last_error`` positively reports success (RES_S_OK) for the SAME call
+      that produced ``bars`` -- mandatory, never assumed;
+    - the response contains EXACTLY ONE bar;
+    - that bar's own symbol/timeframe matches the request;
+    - its timestamp is STRICTLY AFTER requested_to_utc (which, being the
+      only bar, also proves zero bars are in-range and zero are before
+      requested_from_utc).
+
+    Returns ``None`` for everything else -- a non-success last_error, zero
+    bars, more than one bar, an in-range bar alongside a future bar, a bar
+    before requested_from_utc, or a symbol/timeframe mismatch -- so the
+    caller falls through to the ordinary fail-closed validation path
+    (data-integrity or unresolved, exactly as before).
+    """
+    if _mt5_last_error_code(last_error) not in _MT5_SUCCESS_LAST_ERROR_CODES:
+        return None
+    if len(bars) != 1:
+        return None
+    sentinel = bars[0]
+    if sentinel.symbol != symbol.strip().upper() or sentinel.timeframe != timeframe.strip().upper():
+        return None
+    if sentinel.time_utc <= requested_to_utc:
+        return None
+    return {
+        "historical_unavailability_evidence_type": (
+            HISTORICAL_UNAVAILABILITY_EVIDENCE_SUCCESS_SINGLE_BAR_STRICTLY_AFTER_REQUEST
+        ),
+        "sentinel_bar_time_utc": _utc_text(sentinel.time_utc),
+        "requested_from_utc": _utc_text(requested_from_utc),
+        "requested_to_utc": _utc_text(requested_to_utc),
+    }
 
 
 def _sha256_hex(value: bytes) -> str:
@@ -1144,11 +1238,23 @@ class MetaTrader5HistorySource:
                     "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE",
                     f"MT5 positively reports no retained history for this window "
                     f"(last_error={last_error})",
+                    details={
+                        "historical_unavailability_evidence_type": (
+                            HISTORICAL_UNAVAILABILITY_EVIDENCE_RES_E_NOT_FOUND
+                        ),
+                        "requested_from_utc": _utc_text(requested_from_utc),
+                        "requested_to_utc": _utc_text(requested_to_utc),
+                    },
                 )
             raise HistoricalDataError(
                 "MT5_COPY_RATES_FAILED",
                 f"copy_rates_range failed with MT5 last_error={last_error}",
             )
+        # Captured immediately after the (non-None) copy_rates_range call,
+        # before any other MT5 operation, so it authoritatively reflects THIS
+        # call and can be positively verified before it is ever used as
+        # pre-history sentinel evidence below.
+        success_last_error = self._last_error()
         names = tuple(getattr(getattr(rates, "dtype", None), "names", ()) or ())
         bars: list[HistoricalBarV1] = []
         for rate in rates:
@@ -1167,7 +1273,26 @@ class MetaTrader5HistorySource:
                     real_volume=int(row["real_volume"]),
                 )
             )
-        return tuple(bars)
+        bars_tuple = tuple(bars)
+        # MT5-only pre-history sentinel classification: requires a positively
+        # verified success last_error() from THIS same call; see
+        # _mt5_pre_history_sentinel_evidence for the exact narrow shape.
+        sentinel_evidence = _mt5_pre_history_sentinel_evidence(
+            bars_tuple,
+            symbol=requested,
+            timeframe=normalized_timeframe,
+            requested_from_utc=requested_from_utc,
+            requested_to_utc=requested_to_utc,
+            last_error=success_last_error,
+        )
+        if sentinel_evidence is not None:
+            raise HistoricalDataError(
+                "BROKER_HISTORY_NOT_RETAINED_FOR_RANGE",
+                "MT5 returned its earliest known bar strictly after the requested "
+                f"window (evidence={sentinel_evidence}, last_error={success_last_error})",
+                details=sentinel_evidence,
+            )
+        return bars_tuple
 
 
 def canonical_bars_csv(bars: Sequence[HistoricalBarV1]) -> bytes:
@@ -1483,6 +1608,16 @@ def _attempt_chunk_acquisition(
             cache_error_code = exc.code
     if bars is None:
         try:
+            # The generic acquisition boundary never inspects returned-bar
+            # shape to infer historical unavailability: that positive
+            # classification is source-specific and lives entirely inside
+            # MetaTrader5HistorySource.copy_rates (the only place with
+            # authoritative access to mt5.last_error() for THIS call). A
+            # source raises BROKER_HISTORY_NOT_RETAINED_FOR_RANGE itself when
+            # it has genuine evidence; this layer only ever classifies
+            # whatever code a source explicitly raises (see
+            # _classify_chunk_failure_code) or validates whatever bars a
+            # source returns as ordinary data (see _validate_chunk_bars).
             returned = source.copy_rates(
                 symbol,
                 timeframe,
@@ -1516,6 +1651,8 @@ def _attempt_chunk_acquisition(
                 "error_code": error_code,
                 "error": str(exc),
             }
+            if isinstance(exc, HistoricalDataError) and exc.details:
+                audit.update(exc.details)
             return None, audit
     audit = {
         "chunk_id": chunk.chunk_id,
@@ -3027,6 +3164,8 @@ __all__ = [
     "COVERAGE_TRUNCATED_REASON_CODE",
     "DATA_INTEGRITY_CHUNK_ERROR_CODES",
     "GENUINE_HISTORICAL_UNAVAILABLE_ERROR_CODES",
+    "HISTORICAL_UNAVAILABILITY_EVIDENCE_RES_E_NOT_FOUND",
+    "HISTORICAL_UNAVAILABILITY_EVIDENCE_SUCCESS_SINGLE_BAR_STRICTLY_AFTER_REQUEST",
     "TRANSIENT_CHUNK_RETRY_ATTEMPTS",
     "EXECUTION_UNIVERSE_AUDIT_VOLATILE_FIELDS",
     "EXECUTION_UNIVERSE_CANONICAL_SCHEMA_VERSION",

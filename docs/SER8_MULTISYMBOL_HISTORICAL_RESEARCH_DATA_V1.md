@@ -174,11 +174,39 @@ Because only a positively-classified genuine boundary can ever truncate
 coverage, an intermittent valid/failed/valid pattern is never silently
 bridged: a transient or integrity failure anywhere in the walk discards the
 whole symbol — including chunks already accepted — rather than exposing a
-partial suffix around it. `MetaTrader5HistorySource` positively classifies
-"genuine unavailable" only when MT5's `last_error()` itself reports the
-broker "not found" for an already-verified, visible symbol; every other
-`copy_rates_range` failure (timeouts, connection errors, internal failures)
-stays generic/transient and can never shorten coverage.
+partial suffix around it. Two distinct, positively-observed signals may
+establish a genuine boundary; every other `copy_rates_range` outcome
+(timeouts, connection errors, internal failures, or any bar shape not
+described below) stays generic/transient or data-integrity and can never
+shorten coverage:
+
+- `MetaTrader5HistorySource` classifies "genuine unavailable" when MT5's
+  `last_error()` itself reports the broker "not found" for an
+  already-verified, visible symbol.
+- `MetaTrader5HistorySource` separately classifies a narrow, real-evidence
+  MT5 shape (`_mt5_pre_history_sentinel_evidence`): `copy_rates_range`
+  returns successfully, the response contains EXACTLY ONE bar, and that bar
+  is STRICTLY AFTER the requested window's end — the broker's own earliest
+  retained bar, handed back as a pointer past a chunk requested wholly
+  before retained history. Both classifications live ENTIRELY inside the
+  MT5-specific source, gated on a `last_error()` positively captured
+  immediately after the SAME `copy_rates_range` call; the generic
+  acquisition boundary never inspects returned-bar shape itself, so a
+  fake/non-MT5 source cannot trigger either signal merely by returning a
+  matching bar as ordinary data — only by explicitly raising the
+  already-classified error itself. This is intentionally narrow: an in-range
+  bar alongside a future bar, multiple future bars with none in range, any
+  bar before the requested start, a symbol/timeframe mismatch, or a
+  non-success `last_error()` all fall through unchanged to the ordinary
+  data-integrity/unresolved paths rather than being generalized into "any
+  future bar means no history".
+
+Both signals feed the identical existing coverage-boundary mechanism and
+persist which one was observed (`historical_unavailability_evidence_type`:
+`RES_E_NOT_FOUND` or `SUCCESS_SINGLE_BAR_STRICTLY_AFTER_REQUEST`, plus the
+sentinel bar's own timestamp) as audit-only provenance on the boundary chunk
+entry — never as part of dataset identity, since the acceptance/truncation
+semantics they feed were already versioned and unchanged.
 
 Every dataset manifest and inventory entry persists both the operator's
 `requested_from_utc`/`requested_to_utc` (audit intent, unchanged), the
