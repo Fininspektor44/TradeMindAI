@@ -21,7 +21,7 @@ cli_module = importlib.import_module("discover_ser8_symbol_universe")
 from trademind.discovery.hypothesis_registry import HypothesisRegistry  # noqa: E402
 from trademind.ser8_symbol_universe import SER8SymbolUniverseControl  # noqa: E402
 
-_ACCOUNT = "77053345"
+_ACCOUNT = "67206924"
 
 
 def _write_symbols_csv(path: Path, symbols: list[str]) -> None:

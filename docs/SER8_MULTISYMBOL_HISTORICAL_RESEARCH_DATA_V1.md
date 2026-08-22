@@ -9,7 +9,7 @@ signals, or write to live candidate/outcome journals.
 
 1. `build_ser8_historical_data_inventory.py --mode verify-source` verifies the
    official MetaTrader5 Python capability, connected terminal, already
-   authenticated market-data account `37365712`, broker/server identity, and
+   authenticated market-data account `77053345`, broker/server identity, and
    the real execution-account universe `mt5_risk_symbols_utc_67206924.csv`.
 2. The same command in `collect` mode processes every unique broker-exported
    symbol. It never imports an internet data source and never calls
@@ -25,10 +25,10 @@ signals, or write to live candidate/outcome journals.
 
 The two account roles are intentionally separate. `67206924` is the DEMO
 execution/research-target account whose export defines the universe;
-`37365712` is the ECN market-data account whose already-authenticated terminal
-provides historical rates. Neither account is logged in, switched, selected,
-or mutated by this layer. A market-data-only symbol cannot broaden the
-execution universe.
+`77053345` is the active ECN market-data account whose already-authenticated
+terminal provides historical rates. Neither account is logged in, switched,
+selected, or mutated by this layer. A market-data-only symbol cannot broaden
+the execution universe.
 
 The official MetaTrader5 Python API was selected because the repository had
 no existing Python path that could acquire full-universe OHLC history. Existing
@@ -47,7 +47,7 @@ requested and actual coverage, point/digits, expected interval, and exact
 canonical bar bytes. `source_capture_utc` is audit metadata and is excluded
 from the dataset identity, so an identical rerun is idempotent.
 
-The ECN history is research evidence from account `37365712`; it is not a
+The ECN history is research evidence from account `77053345`; it is not a
 claim that its spread or price feed is byte-identical to DEMO execution account
 `67206924`. No cross-account normalization or equivalence is invented.
 
@@ -76,24 +76,44 @@ fabricated outcome.
 
 Use the real repository and Common Files paths shown below. Keep the autonomous
 task running; none of these commands addresses Task Scheduler.
-Only Step A is the current next action. Steps B-F are corrected here for later
+Only Step A1 is the current next action. Step A2 follows after the correct
+terminal executable is operator-proven. Steps B-F are corrected here for later
 controlled use; do not run them yet.
 
-### A. Capability and source verification
+### A1. Read-only attachment identity check
+
+This observation form intentionally omits `--terminal-path`. It never accepts
+the attached terminal silently: source verification succeeds only if Python
+attaches to active market-data login `77053345`; every other login fails closed.
 
 ```powershell
 Set-Location "C:\Users\meff4\Documents\TradeMindAI"
 & ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" `
   --mode verify-source `
   --execution-account 67206924 `
-  --market-data-account 37365712 `
+  --market-data-account 77053345 `
   --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI"
 ```
 
 Stop and inspect `SOURCE_VERIFIED`, execution account `67206924`, market-data
-account `37365712`, server, terminal identity, and the read-only operation list
-before proceeding. The active Python MT5 account must be `37365712`, not
+account `77053345`, server, terminal identity, and the read-only operation list.
+The active Python MT5 account must be `77053345`, not
 `67206924`.
+
+### A2. Production source verification with operator-proven terminal path
+
+Replace the placeholder only after identifying the executable belonging to
+active market-data account `77053345`. No executable path is assumed here.
+This explicit-path verification is required before Steps B-F.
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" `
+  --mode verify-source `
+  --execution-account 67206924 `
+  --market-data-account 77053345 `
+  --terminal-path "<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>" `
+  --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI"
+```
 
 ### B. Small read-only acquisition proof
 
@@ -101,7 +121,7 @@ The limit selects the first symbol from the broker export; it is not a
 handwritten symbol allowlist.
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 37365712 --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-08-14T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 1
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2026-08-14T00:00:00Z" --to-utc "2026-08-21T00:00:00Z" --proof-symbol-limit 1
 ```
 
 Stop and inspect the one attempted entry, manifest quality, and the zero-order
@@ -113,7 +133,7 @@ This declared initial coverage window is explicit and may only be changed by
 changing both UTC arguments deliberately.
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 37365712 --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2024-01-01T00:00:00Z" --to-utc "2026-08-21T00:00:00Z"
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode collect --execution-account 67206924 --market-data-account 77053345 --terminal-path "<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --timeframe M5 --from-utc "2024-01-01T00:00:00Z" --to-utc "2026-08-21T00:00:00Z"
 ```
 
 Stop and confirm `total_broker_symbols` matches the real export. Unavailable,
@@ -123,7 +143,7 @@ visible rather than disappearing.
 ### D. Integrity inventory verification
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode verify-inventory --execution-account 67206924 --market-data-account 37365712 --inventory "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_market_data\historical_inventory.json"
+& ".\.venv\Scripts\python.exe" ".\scripts\build_ser8_historical_data_inventory.py" --mode verify-inventory --execution-account 67206924 --market-data-account 77053345 --inventory "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_market_data\historical_inventory.json"
 ```
 
 Stop and require `INVENTORY_VERIFIED` before replay.
@@ -131,7 +151,7 @@ Stop and require `INVENTORY_VERIFIED` before replay.
 ### E. Deterministic isolated replay
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\scripts\replay_ser8_historical_data.py" --execution-account 67206924 --market-data-account 37365712 --historical-inventory "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_market_data\historical_inventory.json" --replay-root "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_replay" --output "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_replay\research_readiness.json"
+& ".\.venv\Scripts\python.exe" ".\scripts\replay_ser8_historical_data.py" --execution-account 67206924 --market-data-account 77053345 --historical-inventory "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_market_data\historical_inventory.json" --replay-root "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_replay" --output "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_replay\research_readiness.json"
 ```
 
 Stop and inspect per-symbol candidate/outcome counts and readiness reasons. No
@@ -140,7 +160,7 @@ hypothesis is created and no final holdout is touched.
 ### F. Read-only discovery rerun
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\scripts\discover_ser8_symbol_universe.py" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --execution-account 67206924 --market-data-account 37365712 --data-root "C:\Users\meff4\Documents\TradeMindAI\data" --historical-inventory "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_replay\research_readiness.json"
+& ".\.venv\Scripts\python.exe" ".\scripts\discover_ser8_symbol_universe.py" --mt5-export-dir "C:\Users\meff4\AppData\Roaming\MetaQuotes\Terminal\Common\Files\TradeMindAI" --execution-account 67206924 --market-data-account 77053345 --data-root "C:\Users\meff4\Documents\TradeMindAI\data" --historical-inventory "C:\Users\meff4\Documents\TradeMindAI\data\ser8_historical_replay\research_readiness.json"
 ```
 
 The real result may legitimately remain zero. Never substitute synthetic test

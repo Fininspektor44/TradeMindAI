@@ -60,6 +60,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from trademind.discovery.hypothesis_registry import HypothesisRegistry  # noqa: E402
+from trademind.ser8_historical_data import (  # noqa: E402
+    SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN,
+    SER8_EXECUTION_ACCOUNT_LOGIN,
+)
 from trademind.ser8_historical_replay import load_verified_research_readiness  # noqa: E402
 from trademind.ser8_symbol_universe import (  # noqa: E402
     EXECUTION_STATUS_DEMO_ACTIVE,
@@ -176,6 +180,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.execution_account != SER8_EXECUTION_ACCOUNT_LOGIN:
+        print(
+            f"--execution-account must be active SER8 account {SER8_EXECUTION_ACCOUNT_LOGIN}",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        args.market_data_account is not None
+        and args.market_data_account != SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN
+    ):
+        print(
+            "--market-data-account must be active SER8 account "
+            f"{SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN}",
+            file=sys.stderr,
+        )
+        return 2
 
     repo_root = REPO_ROOT
     data_root = Path(args.data_root).expanduser() if args.data_root else repo_root / "data"

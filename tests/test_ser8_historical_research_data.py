@@ -53,9 +53,12 @@ from trademind.signal_statistics_provenance import sha256_bytes
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 inventory_cli = importlib.import_module("build_ser8_historical_data_inventory")
+discovery_cli = importlib.import_module("discover_ser8_symbol_universe")
+replay_cli = importlib.import_module("replay_ser8_historical_data")
 
 ACCOUNT = "67206924"
-MARKET_DATA_ACCOUNT = "37365712"
+MARKET_DATA_ACCOUNT = "77053345"
+RETIRED_MARKET_DATA_ACCOUNT = "37365712"
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
 POLICY_PATH = REPO_ROOT / "config" / "research" / "ser8_historical_research_policy_v1.json"
 
@@ -588,11 +591,16 @@ def test_mt5_source_verifies_terminal_account_symbol_and_utc() -> None:
     assert bars[0].time_utc.utcoffset() == timedelta(0)
 
 
-def test_mt5_source_fails_on_wrong_account() -> None:
+@pytest.mark.parametrize("active_login", [RETIRED_MARKET_DATA_ACCOUNT, "1"])
+def test_mt5_source_fails_on_wrong_account(active_login: str) -> None:
     module = SimpleNamespace(
         initialize=lambda *_: True,
         terminal_info=lambda: SimpleNamespace(connected=True, company="Broker"),
-        account_info=lambda: SimpleNamespace(login=1, server="Broker-Demo", company="Broker"),
+        account_info=lambda: SimpleNamespace(
+            login=int(active_login),
+            server="Broker-Demo",
+            company="Broker",
+        ),
         shutdown=lambda: None,
     )
     with pytest.raises(HistoricalDataError) as caught:
@@ -601,6 +609,95 @@ def test_mt5_source_fails_on_wrong_account() -> None:
             module=module,
         ).initialize()
     assert caught.value.code == "MT5_ACCOUNT_MISMATCH"
+
+
+def test_retired_market_data_account_cannot_be_configured_as_fallback() -> None:
+    with pytest.raises(HistoricalDataError) as caught:
+        MetaTrader5HistorySource(
+            market_data_account_login=RETIRED_MARKET_DATA_ACCOUNT,
+            module=SimpleNamespace(),
+        )
+    assert caught.value.code == "SER8_MARKET_DATA_ACCOUNT_NOT_ACTIVE"
+
+
+def test_explicit_terminal_path_is_forwarded_and_verified() -> None:
+    expected_path = Path("C:/Operator-Proven/MT5-77053345/terminal64.exe")
+
+    class PathAwareMT5:
+        def __init__(self) -> None:
+            self.initialize_args: tuple[str, ...] | None = None
+
+        def initialize(self, *args: str) -> bool:
+            self.initialize_args = args
+            return True
+
+        def terminal_info(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                connected=True,
+                company="Broker",
+                name="Active ECN Terminal",
+                path=str(expected_path.parent),
+                trade_allowed=False,
+            )
+
+        def account_info(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                login=int(MARKET_DATA_ACCOUNT),
+                server="Broker-ECN",
+                company="Broker",
+                currency="USD",
+            )
+
+        def version(self) -> tuple[int, int, str]:
+            return (5, 5000, "22 Aug 2026")
+
+        def shutdown(self) -> None:
+            pass
+
+    module = PathAwareMT5()
+    source = MetaTrader5HistorySource(
+        market_data_account_login=MARKET_DATA_ACCOUNT,
+        terminal_path=expected_path,
+        module=module,
+    )
+    proof = source.initialize()
+    assert module.initialize_args == (str(expected_path),)
+    assert proof["market_data_account_login"] == MARKET_DATA_ACCOUNT
+    assert proof["terminal_name"] == "Active ECN Terminal"
+    assert proof["terminal_path"] == str(expected_path.parent)
+
+
+def test_wrong_explicit_terminal_path_or_attached_account_fails_closed() -> None:
+    unavailable = SimpleNamespace(
+        initialize=lambda *_: False,
+        last_error=lambda: (1, "terminal executable unavailable"),
+        shutdown=lambda: None,
+    )
+    with pytest.raises(HistoricalDataError) as path_error:
+        MetaTrader5HistorySource(
+            market_data_account_login=MARKET_DATA_ACCOUNT,
+            terminal_path=Path("C:/Wrong/terminal64.exe"),
+            module=unavailable,
+        ).initialize()
+    assert path_error.value.code == "MT5_INITIALIZE_FAILED"
+
+    retired = SimpleNamespace(
+        initialize=lambda *_: True,
+        terminal_info=lambda: SimpleNamespace(connected=True, company="Broker"),
+        account_info=lambda: SimpleNamespace(
+            login=int(RETIRED_MARKET_DATA_ACCOUNT),
+            server="Broker-Old",
+            company="Broker",
+        ),
+        shutdown=lambda: None,
+    )
+    with pytest.raises(HistoricalDataError) as account_error:
+        MetaTrader5HistorySource(
+            market_data_account_login=MARKET_DATA_ACCOUNT,
+            terminal_path=Path("C:/Retired/terminal64.exe"),
+            module=retired,
+        ).initialize()
+    assert account_error.value.code == "MT5_ACCOUNT_MISMATCH"
 
 
 def test_replay_reuses_production_semantics_and_binds_every_outcome() -> None:
@@ -707,9 +804,32 @@ def test_replay_is_content_addressed_idempotent_and_never_touches_live_runtime(
     )
     assert first["entries"][0]["replay_sha256"] == second["entries"][0]["replay_sha256"]
     assert first["research_ready_count"] == 1
+    assert first["execution_account_login"] == ACCOUNT
+    assert first["market_data_account_login"] == MARKET_DATA_ACCOUNT
     assert not (tmp_path / "live_signal_runtime_v1").exists()
     replay_dir = replay_root / str(first["entries"][0]["replay_sha256"])
-    assert json.loads((replay_dir / "manifest.json").read_text())["live_runtime_artifacts_written"] is False
+    replay_manifest = json.loads((replay_dir / "manifest.json").read_text())
+    assert replay_manifest["live_runtime_artifacts_written"] is False
+    assert replay_manifest["execution_account_login"] == ACCOUNT
+    assert replay_manifest["market_data_account_login"] == MARKET_DATA_ACCOUNT
+    common_args = [
+        "--execution-account",
+        ACCOUNT,
+        "--historical-inventory",
+        str(inventory_path),
+        "--replay-root",
+        str(replay_root),
+        "--output",
+        str(readiness_path),
+        "--policy",
+        str(POLICY_PATH),
+    ]
+    assert replay_cli.main(
+        [*common_args, "--market-data-account", MARKET_DATA_ACCOUNT]
+    ) == 0
+    assert replay_cli.main(
+        [*common_args, "--market-data-account", RETIRED_MARKET_DATA_ACCOUNT]
+    ) == 1
 
 
 def test_discovery_consumes_hash_verified_replay_inventory(tmp_path: Path) -> None:
@@ -744,8 +864,15 @@ def test_discovery_consumes_hash_verified_replay_inventory(tmp_path: Path) -> No
         output_path=readiness_path,
         captured_at=NOW,
     )
-    rows, evidence = load_verified_research_readiness(readiness_path)
-    symbols = _write_universe(tmp_path / "symbols.csv", [_symbol_row("EURUSD")])
+    rows, evidence = load_verified_research_readiness(
+        readiness_path,
+        execution_account_login=ACCOUNT,
+        market_data_account_login=MARKET_DATA_ACCOUNT,
+    )
+    symbols = _write_universe(
+        tmp_path / f"mt5_risk_symbols_utc_{ACCOUNT}.csv",
+        [_symbol_row("EURUSD")],
+    )
     entry = discover_symbol_universe(
         symbols_csv=symbols,
         historical_rows_by_symbol=rows,
@@ -753,6 +880,36 @@ def test_discovery_consumes_hash_verified_replay_inventory(tmp_path: Path) -> No
         now=NOW,
     )[0]
     assert entry.research_status == RESEARCH_STATUS_RESEARCH_READY
+    exit_code = discovery_cli.main(
+        [
+            "--mt5-export-dir",
+            str(symbols.parent),
+            "--execution-account",
+            ACCOUNT,
+            "--market-data-account",
+            MARKET_DATA_ACCOUNT,
+            "--data-root",
+            str(tmp_path / "data"),
+            "--historical-inventory",
+            str(readiness_path),
+        ]
+    )
+    assert exit_code == 0
+    wrong_identity_exit = discovery_cli.main(
+        [
+            "--mt5-export-dir",
+            str(symbols.parent),
+            "--execution-account",
+            ACCOUNT,
+            "--market-data-account",
+            RETIRED_MARKET_DATA_ACCOUNT,
+            "--data-root",
+            str(tmp_path / "data"),
+            "--historical-inventory",
+            str(readiness_path),
+        ]
+    )
+    assert wrong_identity_exit == 2
     tampered = json.loads(readiness_path.read_text())
     tampered["entries"][0]["completed_outcome_count"] = 1
     readiness_path.write_text(json.dumps(tampered), encoding="utf-8")
@@ -814,6 +971,23 @@ def test_new_pipeline_has_no_internet_order_or_lifecycle_mutation_path() -> None
         assert "rpi-v1:sha256:205b5260711f7578a59cef2feea59550b777b3df0956ffd192076b37c4e5866d:0" not in source
 
 
+def test_active_historical_layer_has_no_retired_account_default_or_fallback() -> None:
+    active_paths = [
+        REPO_ROOT / "config" / "research" / "ser8_historical_research_policy_v1.json",
+        REPO_ROOT / "docs" / "SER8_MULTISYMBOL_HISTORICAL_RESEARCH_DATA_V1.md",
+        REPO_ROOT / "scripts" / "build_ser8_historical_data_inventory.py",
+        REPO_ROOT / "scripts" / "replay_ser8_historical_data.py",
+        REPO_ROOT / "scripts" / "discover_ser8_symbol_universe.py",
+        REPO_ROOT / "src" / "trademind" / "fx_research.py",
+        REPO_ROOT / "src" / "trademind" / "fx_signal_adapter.py",
+        REPO_ROOT / "src" / "trademind" / "ser8_historical_data.py",
+        REPO_ROOT / "src" / "trademind" / "ser8_historical_replay.py",
+        REPO_ROOT / "src" / "trademind" / "ser8_symbol_universe.py",
+    ]
+    for path in active_paths:
+        assert RETIRED_MARKET_DATA_ACCOUNT not in path.read_text(encoding="utf-8"), path
+
+
 def test_dataset_verifier_detects_tampered_bar(tmp_path: Path) -> None:
     manifest, bars_bytes = _manifest(_bars(4))
     dataset_dir, _, _ = publish_dataset(tmp_path, manifest, bars_bytes)
@@ -861,13 +1035,15 @@ def test_windows_runbook_uses_real_paths_and_stepwise_commands() -> None:
     )
     assert "C:\\Users\\meff4\\Documents\\TradeMindAI" in text
     assert "C:\\Users\\meff4\\AppData\\Roaming\\MetaQuotes\\Terminal\\Common\\Files\\TradeMindAI" in text
-    for step in ("### A.", "### B.", "### C.", "### D.", "### E.", "### F."):
+    for step in ("### A1.", "### A2.", "### B.", "### C.", "### D.", "### E.", "### F."):
         assert step in text
     assert "proof-symbol-limit 1" in text
     assert "--mode verify-inventory" in text
     assert "--historical-inventory" in text
-    assert text.count("--execution-account 67206924") == 6
-    assert text.count("--market-data-account 37365712") == 6
+    assert text.count("--execution-account 67206924") == 7
+    assert text.count("--market-data-account 77053345") == 7
+    assert text.count("--terminal-path \"<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>\"") == 3
+    assert RETIRED_MARKET_DATA_ACCOUNT not in text
     assert "--mode verify-source --account" not in text
     assert "do not run them yet" in text
     assert ".\\data\\mt5" not in text

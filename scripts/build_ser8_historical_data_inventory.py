@@ -25,6 +25,7 @@ from trademind.ser8_historical_data import (  # noqa: E402
     parse_utc,
     publish_dataset,
     source_proof_result,
+    validate_active_account_contract,
     verify_dataset,
     verify_inventory_account_identities,
     write_inventory_artifacts,
@@ -311,6 +312,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     source = None
     try:
+        validate_active_account_contract(
+            execution_account_login=args.execution_account,
+            market_data_account_login=args.market_data_account,
+        )
         if args.mode == "verify-source":
             _require_export(args)
             # Universe validation is part of capability proof, not merely MT5 initialization.

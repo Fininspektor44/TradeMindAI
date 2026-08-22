@@ -37,6 +37,8 @@ INVENTORY_SCHEMA_VERSION = "ser8-historical-data-inventory-v1"
 SOURCE_PROOF_SCHEMA_VERSION = "ser8-mt5-history-source-proof-v1"
 COLLECTOR_VERSION = "1.0.0"
 SOURCE_TYPE = "MT5_PYTHON_COPY_RATES_RANGE"
+SER8_EXECUTION_ACCOUNT_LOGIN = "67206924"
+SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN = "77053345"
 READ_ONLY_MT5_OPERATIONS = (
     "initialize",
     "terminal_info",
@@ -72,6 +74,26 @@ class HistoricalDataError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def validate_active_account_contract(
+    *,
+    execution_account_login: str,
+    market_data_account_login: str,
+) -> tuple[str, str]:
+    execution_account = str(execution_account_login).strip()
+    market_data_account = str(market_data_account_login).strip()
+    if execution_account != SER8_EXECUTION_ACCOUNT_LOGIN:
+        raise HistoricalDataError(
+            "SER8_EXECUTION_ACCOUNT_NOT_ACTIVE",
+            f"active SER8 execution account must be {SER8_EXECUTION_ACCOUNT_LOGIN}",
+        )
+    if market_data_account != SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN:
+        raise HistoricalDataError(
+            "SER8_MARKET_DATA_ACCOUNT_NOT_ACTIVE",
+            f"active SER8 market-data account must be {SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN}",
+        )
+    return execution_account, market_data_account
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +249,11 @@ def load_broker_universe(symbols_csv: Path, *, account_login: str) -> tuple[Brok
         raise HistoricalDataError("BROKER_UNIVERSE_EMPTY", "broker universe contains no rows")
 
     expected_login = str(account_login).strip()
+    if expected_login != SER8_EXECUTION_ACCOUNT_LOGIN:
+        raise HistoricalDataError(
+            "SER8_EXECUTION_ACCOUNT_NOT_ACTIVE",
+            f"active SER8 execution account must be {SER8_EXECUTION_ACCOUNT_LOGIN}",
+        )
     by_symbol: dict[str, BrokerSymbolV1] = {}
     row_fingerprints: dict[str, bytes] = {}
     for row in raw_rows:
@@ -318,10 +345,10 @@ class MetaTrader5HistorySource:
         module: Any | None = None,
     ) -> None:
         self.market_data_account_login = str(market_data_account_login).strip()
-        if not self.market_data_account_login:
+        if self.market_data_account_login != SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN:
             raise HistoricalDataError(
-                "MARKET_DATA_ACCOUNT_REQUIRED",
-                "market-data account login is required",
+                "SER8_MARKET_DATA_ACCOUNT_NOT_ACTIVE",
+                f"active SER8 market-data account must be {SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN}",
             )
         self.terminal_path = terminal_path
         self._mt5 = module
@@ -604,8 +631,10 @@ def build_dataset_manifest(
 ) -> tuple[dict[str, object], bytes]:
     execution_account = str(execution_account_login).strip()
     market_data_account = str(source_proof.get("market_data_account_login") or "").strip()
-    if not execution_account:
-        raise HistoricalDataError("EXECUTION_ACCOUNT_REQUIRED", "execution account login is required")
+    validate_active_account_contract(
+        execution_account_login=execution_account,
+        market_data_account_login=market_data_account,
+    )
     if broker_symbol.source_row.get("account_login") != execution_account:
         raise HistoricalDataError(
             "BROKER_UNIVERSE_ACCOUNT_MISMATCH",
@@ -820,6 +849,10 @@ def verify_dataset(dataset_dir: Path) -> dict[str, object]:
     ):
         if not manifest.get(key):
             raise HistoricalDataError("DATASET_ACCOUNT_IDENTITY_MISSING", f"manifest is missing {key}")
+    validate_active_account_contract(
+        execution_account_login=str(manifest.get("execution_account_login") or ""),
+        market_data_account_login=str(manifest.get("market_data_account_login") or ""),
+    )
     source_proof = manifest.get("source_proof")
     if not isinstance(source_proof, dict) or (
         source_proof.get("market_data_account_login") != manifest.get("market_data_account_login")
@@ -874,11 +907,10 @@ def verify_inventory(payload: Mapping[str, object]) -> None:
     execution_account = str(payload.get("execution_account_login") or "").strip()
     market_data_account = str(payload.get("market_data_account_login") or "").strip()
     universe_source = str(payload.get("execution_universe_source") or "").strip()
-    if not execution_account or not market_data_account:
-        raise HistoricalDataError(
-            "INVENTORY_ACCOUNT_IDENTITY_MISSING",
-            "historical inventory must bind execution and market-data account identities",
-        )
+    validate_active_account_contract(
+        execution_account_login=execution_account,
+        market_data_account_login=market_data_account,
+    )
     expected_source = f"mt5_risk_symbols_utc_{execution_account}.csv"
     if Path(universe_source).name != expected_source:
         raise HistoricalDataError(
@@ -990,6 +1022,10 @@ def source_proof_result(
     execution_universe_source: str,
 ) -> dict[str, object]:
     market_data_account_login = str(proof.get("market_data_account_login") or "")
+    execution_account_login, market_data_account_login = validate_active_account_contract(
+        execution_account_login=execution_account_login,
+        market_data_account_login=market_data_account_login,
+    )
     return {
         "status": "SOURCE_VERIFIED",
         "execution_account_login": str(execution_account_login),
@@ -1016,6 +1052,8 @@ __all__ = [
     "DATASET_SCHEMA_VERSION",
     "INVENTORY_SCHEMA_VERSION",
     "READ_ONLY_MT5_OPERATIONS",
+    "SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN",
+    "SER8_EXECUTION_ACCOUNT_LOGIN",
     "BrokerSymbolV1",
     "HistoricalBarV1",
     "HistoricalDataError",
@@ -1033,6 +1071,7 @@ __all__ = [
     "publish_dataset",
     "source_proof_result",
     "validate_historical_bars",
+    "validate_active_account_contract",
     "verify_dataset",
     "verify_inventory",
     "verify_inventory_account_identities",
