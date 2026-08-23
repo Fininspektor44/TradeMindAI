@@ -1263,13 +1263,13 @@ def test_windows_runbook_uses_real_paths_and_stepwise_commands() -> None:
     )
     assert "C:\\Users\\meff4\\Documents\\TradeMindAI" in text
     assert "C:\\Users\\meff4\\AppData\\Roaming\\MetaQuotes\\Terminal\\Common\\Files\\TradeMindAI" in text
-    for step in ("### A1.", "### A2.", "### B.", "### C.", "### D.", "### E.", "### F."):
+    for step in ("### A1.", "### A2.", "### B.", "### C.", "### D.", "### E.", "### F.", "### G."):
         assert step in text
     assert "proof-symbol-limit 1" in text
     assert "--mode verify-inventory" in text
     assert "--historical-inventory" in text
-    assert text.count("--execution-account 67206924") == 9
-    assert text.count("--market-data-account 77053345") == 9
+    assert text.count("--execution-account 67206924") == 10
+    assert text.count("--market-data-account 77053345") == 10
     assert text.count("--terminal-path \"<OPERATOR-PROVEN-77053345-TERMINAL64.EXE>\"") == 2
     assert text.count(
         '--terminal-path "C:\\Program Files\\RoboForex MT5 Terminal\\terminal64.exe"'

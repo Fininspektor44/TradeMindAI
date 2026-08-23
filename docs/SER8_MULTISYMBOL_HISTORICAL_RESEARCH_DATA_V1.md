@@ -374,3 +374,42 @@ hypothesis is created and no final holdout is touched.
 
 The real result may legitimately remain zero. Never substitute synthetic test
 counts for the Windows inventory or replay result.
+
+## Cross-symbol historical screening (SCREENING ONLY)
+
+`ser8_historical_multisymbol_screening.py` is a pure, additive aggregation and
+ranking layer over the replay engine's already-published, hash-verified
+`candidates.jsonl` / `outcomes.jsonl` artifacts. It re-runs no signal or bar
+logic, changes no dataset or replay identity, and reuses
+`build_research_readiness_inventory` / `create_replay` unmodified. For every
+`HISTORICAL_DATA_READY` symbol (selected verbatim from the historical
+inventory's own `status` field) it reports trade count, win rate, gross
+profit/loss, net R, profit factor, expectancy, average winner/loser, payoff
+ratio, max drawdown, SER8's existing cost-adjusted `net_r` versus a
+reconstructed pre-cost value, and a descriptive chronological-stability split
+across consecutive windows. A symbol without a valid replay (ineligible trade
+mode, unverifiable artifact, or zero outcomes) still appears in the report
+with an explicit rejection reason -- no symbol is ever silently dropped.
+
+Ranking (`SCREENING_RANKING_POLICY_VERSION = "ser8-screening-ranking-v1"`) is
+a fixed, equal-weight, never-tuned-to-outcomes ordinal composite across
+expectancy, profit factor, drawdown, and stability rank positions. It is
+screening evidence only: a high rank never implies hypothesis acceptance,
+execution authority, or holdout consumption. The module never imports or
+references the protected hypothesis/holdout lifecycle
+(`HypothesisRegistry`, `HoldoutSealStore`, `trademind.discovery.*`), and never
+widens, mutates, or recreates the already-accepted EURUSD hypothesis.
+
+### G. Deterministic multisymbol screening run
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\scripts\run_ser8_historical_multisymbol_screening.py" --execution-account 67206924 --market-data-account 77053345
+```
+
+Prints a compact `=== TRADEMIND REPORT ===` block and writes the full,
+hash-verified report to
+`data\ser8_historical_screening\screening_report.json`. Pass `--json` to
+print the full report instead of the compact form. Stop and inspect
+`POSITIVE_EXPECTANCY` / `NEGATIVE_EXPECTANCY` / `NOT_RANKED` counts: every one
+of the 28 `HISTORICAL_DATA_READY` symbols must be accounted for across those
+three buckets, and none may be missing from `entries`.
