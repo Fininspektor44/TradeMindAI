@@ -23,6 +23,7 @@ import pytest
 
 from trademind.ser8_historical_data import (
     HistoricalBarV1,
+    HistoricalDataError,
     INVENTORY_SCHEMA_VERSION,
     READ_ONLY_MT5_OPERATIONS,
     build_canonical_execution_universe,
@@ -35,9 +36,11 @@ from trademind.ser8_historical_multisymbol_screening import (
     STATUS_INSUFFICIENT_SAMPLE,
     STATUS_NO_COMPLETED_OUTCOMES,
     STATUS_REPLAY_UNAVAILABLE,
+    STATUS_REPLAY_VERIFICATION_FAILED,
     STATUS_SCREENED,
     TIER_SCREENED_NEGATIVE,
     TIER_SCREENED_POSITIVE,
+    _resolve_candidate_direction,
     build_multisymbol_screening_report,
     build_symbol_screening_entry,
     compact_report_lines,
@@ -208,8 +211,33 @@ def _outcome(signal_id: str, *, completed_at: str, net_r: float, outcome: str, a
     }
 
 
-def _candidate(signal_id: str, *, action: str) -> dict[str, object]:
-    return {"signal_id": signal_id, "action": action}
+def _candidate(
+    signal_id: str,
+    *,
+    action: str,
+    confirmation_action: str | None = None,
+    similarity_action: str | None = None,
+) -> dict[str, object]:
+    """Build a candidate row shaped like the real, authoritative schema:
+    there is no top-level ``candidate["action"]`` -- the direction lives at
+    ``plan.action`` (the only structurally-validated field), and is
+    normally echoed verbatim into ``market_features.confirmation.action``
+    and ``similarity_dimensions.action`` by the real candidate-building
+    code. The two optional overrides let tests construct a deliberately
+    contradictory/corrupted artifact for the fail-closed consistency check.
+    """
+    return {
+        "signal_id": signal_id,
+        "plan": {"action": action},
+        "market_features": {
+            "confirmation": {
+                "action": action if confirmation_action is None else confirmation_action
+            }
+        },
+        "similarity_dimensions": {
+            "action": action if similarity_action is None else similarity_action
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +348,159 @@ def test_chronological_stability_detects_degradation() -> None:
     assert stability["windows"][1]["expectancy_r"] == pytest.approx(-1.0)
     assert stability["first_to_last_expectancy_delta_r"] == pytest.approx(-2.0)
     assert stability["degraded"] is True
+
+
+# ---------------------------------------------------------------------------
+# Candidate direction resolution (SER8 SCREENING DIRECTION COUNTS FIX V1)
+#
+# Real candidates have no top-level "action" field; the authoritative
+# direction lives at plan.action, which trademind.signal_intelligence.
+# TradePlan validates at construction time. These tests prove the resolver
+# reads plan.action, fails closed (never an empty string) when it is
+# missing/invalid, and fails closed on a genuine contradiction with an
+# embedded echo field, without touching net_r/expectancy/profit_factor/
+# drawdown or ranking determinism.
+# ---------------------------------------------------------------------------
+
+
+def test_plan_action_buy_resolves_to_buy() -> None:
+    assert _resolve_candidate_direction(_candidate("s0", action="BUY")) == "BUY"
+
+
+def test_plan_action_sell_resolves_to_sell() -> None:
+    assert _resolve_candidate_direction(_candidate("s0", action="SELL")) == "SELL"
+
+
+def test_mixed_directions_increment_long_and_short_counts_correctly() -> None:
+    candidates = [_candidate(f"s{i}", action="BUY" if i % 3 else "SELL") for i in range(9)]
+    outcomes = [
+        _outcome(f"s{i}", completed_at=f"2026-01-{i + 1:02d}T00:00:00Z", net_r=0.1, outcome="WIN")
+        for i in range(9)
+    ]
+    metrics = compute_symbol_replay_metrics(candidates=candidates, outcomes=outcomes, cost_r=0.0)
+    expected_sell = sum(1 for i in range(9) if i % 3 == 0)
+    assert metrics["long_count"] == 9 - expected_sell
+    assert metrics["short_count"] == expected_sell
+    assert metrics["long_count"] + metrics["short_count"] == metrics["trade_count"]
+
+
+def test_missing_plan_action_fails_closed_not_empty_string() -> None:
+    broken = {"signal_id": "s0", "plan": {}}
+    with pytest.raises(HistoricalDataError) as excinfo:
+        _resolve_candidate_direction(broken)
+    assert excinfo.value.code == "CANDIDATE_DIRECTION_UNRESOLVED"
+
+    # A whole missing plan key fails closed identically.
+    with pytest.raises(HistoricalDataError):
+        _resolve_candidate_direction({"signal_id": "s0"})
+
+
+def test_invalid_plan_action_fails_closed() -> None:
+    with pytest.raises(HistoricalDataError) as excinfo:
+        _resolve_candidate_direction({"signal_id": "s0", "plan": {"action": "HOLD"}})
+    assert excinfo.value.code == "CANDIDATE_DIRECTION_UNRESOLVED"
+
+
+def test_missing_candidate_direction_aborts_metrics_computation_fail_closed() -> None:
+    # A single unresolvable candidate must not silently miscount as neither
+    # BUY nor SELL -- compute_symbol_replay_metrics fails closed for the
+    # whole batch rather than defaulting the bad row to an empty direction.
+    candidates = [_candidate("s0", action="BUY"), {"signal_id": "s1", "plan": {}}]
+    outcomes = [
+        _outcome("s0", completed_at="2026-01-01T00:00:00Z", net_r=0.1, outcome="WIN"),
+        _outcome("s1", completed_at="2026-01-02T00:00:00Z", net_r=-0.1, outcome="LOSS"),
+    ]
+    with pytest.raises(HistoricalDataError) as excinfo:
+        compute_symbol_replay_metrics(candidates=candidates, outcomes=outcomes, cost_r=0.0)
+    assert excinfo.value.code == "CANDIDATE_DIRECTION_UNRESOLVED"
+
+
+def test_contradictory_embedded_direction_fails_closed() -> None:
+    contradictory = _candidate("s0", action="BUY", confirmation_action="SELL")
+    with pytest.raises(HistoricalDataError) as excinfo:
+        _resolve_candidate_direction(contradictory)
+    assert excinfo.value.code == "CANDIDATE_DIRECTION_CONTRADICTION"
+
+    contradictory_similarity = _candidate("s0", action="BUY", similarity_action="SELL")
+    with pytest.raises(HistoricalDataError) as excinfo:
+        _resolve_candidate_direction(contradictory_similarity)
+    assert excinfo.value.code == "CANDIDATE_DIRECTION_CONTRADICTION"
+
+
+def test_consistent_embedded_directions_do_not_raise() -> None:
+    # The real candidate-building code always echoes plan.action into both
+    # embedded fields, so the ordinary (non-contradictory) case must pass.
+    assert _resolve_candidate_direction(_candidate("s0", action="SELL")) == "SELL"
+
+
+def test_build_symbol_screening_entry_reports_direction_failure_not_silently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import trademind.ser8_historical_multisymbol_screening as screening_module
+
+    def _fake_load(_replay_dir: Path):
+        candidates = [{"signal_id": "s0", "plan": {}}]
+        outcomes = [_outcome("s0", completed_at="2026-01-01T00:00:00Z", net_r=0.1, outcome="WIN")]
+        manifest = {"shadow_cost_r": 0.0}
+        return candidates, outcomes, manifest
+
+    monkeypatch.setattr(screening_module, "load_verified_replay_rows", _fake_load)
+    entry = build_symbol_screening_entry(
+        readiness_entry={
+            "symbol": "BADUSD", "asset_class": "FX", "broker_trade_mode": "FULL",
+            "risk_model_supported": True, "historical_rows": 5000,
+            "accepted_historical_data": True, "dataset_sha256": "a" * 64, "dataset_dir": "/tmp/x",
+            "replay_sha256": "b" * 64, "replay_dir": "/tmp/fake-replay-dir",
+            "candidate_count": 1, "completed_outcome_count": 1,
+            "research_minimum": 300, "research_ready": False,
+            "readiness_reason": "below research minimum",
+        }
+    )
+    # The symbol still appears in the report (never silently dropped), with
+    # an explicit rejection reason -- never a fabricated/zeroed metrics row.
+    assert entry["symbol"] == "BADUSD"
+    assert entry["screening_status"] == STATUS_REPLAY_VERIFICATION_FAILED
+    assert "no valid plan.action" in entry["rejection_reason"]
+    assert entry["metrics"] is None
+
+
+def test_direction_fix_leaves_net_r_expectancy_profit_factor_drawdown_unchanged() -> None:
+    # The direction resolver only affects long_count/short_count; every
+    # other statistic is derived solely from outcomes/net_r and must be
+    # identical regardless of which (consistent) direction each trade used.
+    outcomes = [
+        _outcome("s0", completed_at="2026-01-01T00:00:00Z", net_r=1.0, outcome="WIN"),
+        _outcome("s1", completed_at="2026-01-02T00:00:00Z", net_r=-0.5, outcome="LOSS"),
+        _outcome("s2", completed_at="2026-01-03T00:00:00Z", net_r=0.3, outcome="WIN"),
+    ]
+    all_buy = [_candidate(f"s{i}", action="BUY") for i in range(3)]
+    all_sell = [_candidate(f"s{i}", action="SELL") for i in range(3)]
+    metrics_buy = compute_symbol_replay_metrics(candidates=all_buy, outcomes=outcomes, cost_r=0.05)
+    metrics_sell = compute_symbol_replay_metrics(candidates=all_sell, outcomes=outcomes, cost_r=0.05)
+    for key in (
+        "net_r_total", "expectancy_r", "profit_factor", "max_drawdown_r",
+        "gross_profit_r", "gross_loss_r", "average_winner_r", "average_loser_r",
+        "payoff_ratio", "net_r_total_before_cost", "expectancy_r_before_cost",
+        "profitable_only_before_costs", "chronological_stability",
+    ):
+        assert metrics_buy[key] == metrics_sell[key]
+    assert metrics_buy["long_count"] == 3 and metrics_buy["short_count"] == 0
+    assert metrics_sell["short_count"] == 3 and metrics_sell["long_count"] == 0
+
+
+def test_ranking_remains_deterministic_after_direction_fix() -> None:
+    # Ranking never consumes direction/long_count/short_count at all, so it
+    # must remain deterministic and unaffected by this fix.
+    entries = [
+        _screened("AAA", expectancy=0.10, profit_factor=2.0, drawdown=1.0, delta=-0.01),
+        _screened("BBB", expectancy=-0.05, profit_factor=0.5, drawdown=3.0, delta=-0.2),
+        _screened("CCC", expectancy=0.20, profit_factor=3.0, drawdown=0.5, delta=0.01),
+    ]
+    forward, _ = rank_symbol_screening_entries(entries)
+    backward, _ = rank_symbol_screening_entries(list(reversed(entries)))
+    assert forward == backward
+    again, _ = rank_symbol_screening_entries(entries)
+    assert forward == again
 
 
 # ---------------------------------------------------------------------------
@@ -485,8 +666,15 @@ def test_full_report_reuses_real_replay_engine_and_includes_every_ready_symbol(
 
     # EURUSD: real replay through the unmodified engine, >=300 outcomes -> SCREENED.
     assert by_symbol["EURUSD"]["screening_status"] == STATUS_SCREENED
-    assert by_symbol["EURUSD"]["metrics"]["trade_count"] >= 300
+    eurusd_metrics = by_symbol["EURUSD"]["metrics"]
+    assert eurusd_metrics["trade_count"] >= 300
     assert by_symbol["EURUSD"]["signal_count"] > 0
+    # Every real candidate's plan.action is BUY or SELL (TradePlan enforces
+    # this at construction), so long_count/short_count must fully account for
+    # every trade -- proving the real plan.action-based resolver actually
+    # populates direction counts instead of the previous BUY=0/SELL=0 defect.
+    assert eurusd_metrics["long_count"] + eurusd_metrics["short_count"] == eurusd_metrics["trade_count"]
+    assert eurusd_metrics["long_count"] > 0
 
     # AUDNZD: below the 103-row acquisition floor is impossible here (bars
     # accepted), but 120 rows is far below the 300-outcome research minimum

@@ -132,6 +132,77 @@ def _chronological_stability(
     }
 
 
+_VALID_CANDIDATE_DIRECTIONS = frozenset({"BUY", "SELL"})
+
+
+def _direction_field(value: object) -> str | None:
+    """Normalize one embedded direction-like field for comparison; ``None``
+    when the field is absent or not a recognizable direction string."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().upper()
+    return normalized if normalized in _VALID_CANDIDATE_DIRECTIONS else None
+
+
+def _resolve_candidate_direction(candidate_row: Mapping[str, object]) -> str:
+    """Resolve one candidate's authoritative BUY/SELL direction.
+
+    ``plan.action`` (``trademind.signal_intelligence.TradePlan.action``) is
+    the sole structurally-validated direction field -- ``TradePlan.__post_init__``
+    rejects any value outside ``{BUY, SELL}`` at candidate-construction time --
+    so it is the authoritative source: it is the action attached to the
+    actual replay execution plan. There is no top-level ``candidate["action"]``
+    field; reading one (as this module previously did) silently resolves to
+    an empty string for every real candidate, which is the exact defect this
+    resolver fixes.
+
+    ``market_features.confirmation.action`` and ``similarity_dimensions.action``
+    are, by construction (``trademind.fx_signal_adapter`` derives all three
+    from one shared local ``action`` value within a single call), byte-identical
+    echoes of ``plan.action`` in every candidate the existing engine produces.
+    They are consulted here only as a defensive consistency check against a
+    corrupted or hand-crafted artifact -- never as an independent source of
+    truth, and never preferred over ``plan.action``.
+
+    Fails closed (raises ``HistoricalDataError``) rather than silently
+    defaulting to an empty string or miscounting the trade: when
+    ``plan.action`` is missing or is not exactly ``BUY``/``SELL``, and when
+    any present embedded field contradicts ``plan.action``.
+    """
+    plan = candidate_row.get("plan")
+    plan_action = _direction_field(plan.get("action")) if isinstance(plan, Mapping) else None
+    if plan_action is None:
+        raise HistoricalDataError(
+            "CANDIDATE_DIRECTION_UNRESOLVED",
+            f"candidate {candidate_row.get('signal_id')!r} has no valid plan.action",
+        )
+
+    market_features = candidate_row.get("market_features")
+    confirmation = market_features.get("confirmation") if isinstance(market_features, Mapping) else None
+    embedded_fields = {
+        "market_features.confirmation.action": (
+            _direction_field(confirmation.get("action")) if isinstance(confirmation, Mapping) else None
+        ),
+        "similarity_dimensions.action": _direction_field(
+            (candidate_row.get("similarity_dimensions") or {}).get("action")
+            if isinstance(candidate_row.get("similarity_dimensions"), Mapping)
+            else None
+        ),
+    }
+    for path, value in embedded_fields.items():
+        if value is not None and value != plan_action:
+            raise HistoricalDataError(
+                "CANDIDATE_DIRECTION_CONTRADICTION",
+                f"candidate {candidate_row.get('signal_id')!r}: plan.action="
+                f"{plan_action!r} contradicts {path}={value!r}",
+            )
+    return plan_action
+
+
+def _build_action_by_signal(candidates: Sequence[Mapping[str, object]]) -> dict[str, str]:
+    return {str(row.get("signal_id")): _resolve_candidate_direction(row) for row in candidates}
+
+
 def compute_symbol_replay_metrics(
     *,
     candidates: Sequence[Mapping[str, object]],
@@ -147,10 +218,13 @@ def compute_symbol_replay_metrics(
     metric (``trademind.signal_shadow._net_r``, subtracting ``cost_r``); this
     function only aggregates it and reconstructs the pre-cost value for
     comparison, it never recomputes or overrides it.
+
+    Long/short direction is resolved per candidate via
+    ``_resolve_candidate_direction`` (authoritative ``plan.action``, fails
+    closed on a missing/invalid/contradictory direction) -- never a
+    nonexistent top-level ``candidate["action"]``.
     """
-    action_by_signal = {
-        str(row.get("signal_id")): str(row.get("action") or "") for row in candidates
-    }
+    action_by_signal = _build_action_by_signal(candidates)
     ordered = sorted(outcomes, key=lambda row: (str(row["completed_at"]), str(row["signal_id"])))
 
     long_count = sum(1 for row in ordered if action_by_signal.get(str(row["signal_id"])) == "BUY")
@@ -289,12 +363,23 @@ def build_symbol_screening_entry(
         }
 
     cost_r = float(replay_manifest.get("shadow_cost_r", 0.0))
-    metrics = compute_symbol_replay_metrics(
-        candidates=candidates,
-        outcomes=outcomes,
-        cost_r=cost_r,
-        stability_window_count=stability_window_count,
-    )
+    try:
+        metrics = compute_symbol_replay_metrics(
+            candidates=candidates,
+            outcomes=outcomes,
+            cost_r=cost_r,
+            stability_window_count=stability_window_count,
+        )
+    except HistoricalDataError as exc:
+        # A candidate's direction could not be resolved or contradicts
+        # itself (see _resolve_candidate_direction) -- fail closed rather
+        # than silently reporting wrong/zeroed BUY/SELL counts.
+        return {
+            **base,
+            "screening_status": STATUS_REPLAY_VERIFICATION_FAILED,
+            "rejection_reason": str(exc),
+            "metrics": None,
+        }
     research_ready = readiness_entry.get("research_ready") is True
     return {
         **base,
