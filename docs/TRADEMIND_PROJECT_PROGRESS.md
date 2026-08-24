@@ -63,7 +63,38 @@ evidence.
   behavior; no PnL/ranking/acquisition changes. Pushed. Full project gate:
   2439 passed, 0 failed.
 
+### Real Windows screening result (post-270904fc)
+
+28/28 screened, 0 positive expectancy, 28 negative expectancy. Typical
+profile: win rate ~53-58%, average winner ~+0.46R to +0.52R, average loser
+~-0.78R to -0.84R, payoff ~0.55-0.63, PF < 1 on every symbol -- consistent
+with an asymmetric-fill pattern (winners often exit on the initial MARKET
+allocation alone; losers more often have one or both LIMIT add-ons filled
+before hitting stop).
+
+## Execution geometry A/B experiment (SCREENING ONLY)
+
+Additive, read-only counterfactual layer testing whether the existing
+MARKET+LIMIT+LIMIT basket geometry is the structural cause of the negative
+expectancy above. Re-evaluates the SAME already-published replay candidates
+against the SAME already-published bars under four variants
+(`CONTROL_BASKET`, `MARKET_ONLY_SAME_TARGET`, `MARKET_ONLY_1_5R`,
+`MARKET_ONLY_2_0R`) using the existing, unmodified
+`trademind.signal_shadow.evaluate_shadow_candidate` and the existing
+`compute_symbol_replay_metrics` aggregation -- no signals regenerated, no
+historical reacquisition, no evaluator semantics changed.
+`CONTROL_BASKET` must exactly reproduce the already-published replay
+outcomes before any variant is interpreted for a symbol; if it cannot, that
+symbol fails closed and is reported, never dropped.
+
+- `83cccd4` -- Add SER8 Execution Geometry Experiment: new module
+  `ser8_execution_geometry_experiment.py` + CLI
+  `run_ser8_execution_geometry_experiment.py`. Pushed. Full project gate:
+  2457 passed, 0 failed. Implementation/tests only (Mac has no real
+  historical datasets); real 28-symbol run pending on Windows.
+
 ## NEXT ACTION
 
-Windows pull the final pushed state and rerun the 28-symbol screening from
-existing replay artifacts only; no historical reacquisition / MT5 calls.
+Windows pull the experiment commit and run the real four-variant experiment
+over the existing 28-symbol historical datasets only; no historical
+reacquisition, no MT5 calls.
