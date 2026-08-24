@@ -58,17 +58,12 @@ always 0/0. The authoritative field is `plan.action`
 structurally-validated direction field, confirmed via real NZDCAD candidate
 evidence.
 
-- `ae4f5cd` -- Fix SER8 Screening Direction Counts: candidate direction now
-  resolved from `plan.action`, with `market_features.confirmation.action`
-  and `similarity_dimensions.action` consulted only as a defensive
-  consistency check (fails closed on missing/invalid/contradictory
-  direction, never a silent empty string). No change to net_r, expectancy,
-  profit factor, drawdown, cost model, or ranking formula. Not pushed yet.
+- `270904fc` -- Fix SER8 Screening Direction Counts: candidate direction
+  resolved from `plan.action`, defensive consistency checks, fail-closed
+  behavior; no PnL/ranking/acquisition changes. Pushed. Full project gate:
+  2439 passed, 0 failed.
 
 ## NEXT ACTION
 
-Recompute the screening aggregation from the existing, already-published
-replay artifacts (no historical reacquisition, no MT5 calls) using the
-corrected direction resolver, then perform loss-cause analysis across the
-28 screened symbols to determine which (if any) warrant an independent
-hypothesis-validation lifecycle next.
+Windows pull the final pushed state and rerun the 28-symbol screening from
+existing replay artifacts only; no historical reacquisition / MT5 calls.
