@@ -87,14 +87,65 @@ historical reacquisition, no evaluator semantics changed.
 outcomes before any variant is interpreted for a symbol; if it cannot, that
 symbol fails closed and is reported, never dropped.
 
-- `83cccd4` -- Add SER8 Execution Geometry Experiment: new module
+- `661ee12` -- Add SER8 Execution Geometry Experiment: new module
   `ser8_execution_geometry_experiment.py` + CLI
   `run_ser8_execution_geometry_experiment.py`. Pushed. Full project gate:
   2457 passed, 0 failed. Implementation/tests only (Mac has no real
   historical datasets); real 28-symbol run pending on Windows.
 
+### Real Windows run: failed at final report serialization, not a strategy verdict
+
+The real 28-symbol x 4-variant computation was launched on Windows against
+the existing 28 `HISTORICAL_DATA_READY` FX historical datasets. The worker
+process was observed active and consuming CPU/RAM for the duration of the
+run -- i.e. every symbol's four-variant evaluation genuinely executed. The
+run then terminated at the FINAL report-serialization step (after every
+symbol had already been fully evaluated), with:
+
+```
+{"error": "payload exceeds maximum canonical JSON bytes 262144",
+ "error_code": "EXPERIMENT_FAILED",
+ "status": "FAILED"}
+```
+
+No `experiment_report.json` was written. **No experiment result -- positive
+or negative -- may be interpreted from that failed run**; nothing about the
+execution-geometry variants' effect on expectancy is known from it, because
+the report that would have carried those numbers never reached disk.
+
+Root cause (confirmed from code, see
+`trademind.ser8_execution_geometry_checkpoint` and
+`trademind.ser8_execution_geometry_experiment`): the final report hash was
+computed via `canonical_json_bytes(payload)` with no explicit `budget=`,
+which defaulted to `DEFAULT_JSON_SAFETY_BUDGET`'s module-wide
+`max_canonical_bytes = 262_144` -- a ceiling sized for much smaller
+artifacts, not a 28-symbol x 4-variant experiment report. This is a
+**report-artifact-capacity failure**, not evidence that execution-geometry
+evaluation itself failed, and not a strategy verdict of any kind.
+
+This commit ("Harden SER8 Geometry Experiment Reporting") fixes it: a new
+named, finite, artifact-specific `EXECUTION_GEOMETRY_REPORT_JSON_BUDGET`
+(never changes `DEFAULT_JSON_SAFETY_BUDGET`) is used consistently for report
+serialization, hash creation, hash verification, writing, and loading; and
+new per-symbol resume checkpoints
+(`trademind.ser8_execution_geometry_checkpoint`) are atomically written
+after one symbol's four variants are fully evaluated AND its CONTROL
+reproduction gate is resolved, reused only on an exact identity match
+(schema/version, symbol, dataset/replay/candidate/outcome evidence
+identity, shadow parameters, `stability_window_count`, and variant
+definitions) and otherwise recomputed -- never a silent partial trust.
+Checkpointing does not change the final report content or hash: a fresh
+run and a resumed run over identical evidence produce the identical
+`experiment_report_sha256`. No trading logic, signal generation,
+candidate population, shadow evaluator semantics, CONTROL reproduction
+semantics, cost model, or ranking/metrics were touched --
+`build_symbol_geometry_experiment` itself is unmodified. Full project
+gate: 2479 passed, 0 failed.
+
 ## NEXT ACTION
 
-Windows pull the experiment commit and run the real four-variant experiment
-over the existing 28-symbol historical datasets only; no historical
-reacquisition, no MT5 calls.
+Windows pull this hardening commit and rerun the real 28-symbol x 4-variant
+execution-geometry experiment over the existing historical datasets only
+(no historical reacquisition, no MT5 calls), with checkpoint/resume active
+by default so any future interruption after the expensive per-symbol
+evaluation work no longer loses it.

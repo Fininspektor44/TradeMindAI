@@ -48,6 +48,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from trademind.ser8_execution_geometry_checkpoint import (
+    EXECUTION_GEOMETRY_REPORT_JSON_BUDGET,
+    build_symbol_checkpoint_identity,
+    checkpoint_path_for,
+    load_verified_symbol_checkpoint,
+    write_symbol_checkpoint,
+)
 from trademind.ser8_historical_data import (
     HistoricalBarV1,
     HistoricalDataError,
@@ -443,15 +450,51 @@ def build_multisymbol_geometry_experiment_report(
     readiness_payload: Mapping[str, object],
     stability_window_count: int = DEFAULT_STABILITY_WINDOW_COUNT,
     captured_at: datetime,
+    checkpoint_dir: Path | None = None,
+    resume: bool = True,
+    resume_report: dict[str, list[str]] | None = None,
 ) -> dict[str, object]:
     """Build the full, deterministic, hash-verified four-variant execution-
     geometry experiment report across every HISTORICAL_DATA_READY symbol.
     Symbol selection is read verbatim from the historical inventory's own
     authoritative status field -- never re-derived -- exactly matching
     trademind.ser8_historical_multisymbol_screening.
-    build_multisymbol_screening_report's convention."""
+    build_multisymbol_screening_report's convention.
+
+    ``checkpoint_dir`` (optional): when supplied, one already-fully-
+    evaluated symbol (four variants evaluated AND its CONTROL reproduction
+    gate resolved) is atomically persisted per symbol under this
+    experiment-owned directory (never the authoritative historical-dataset
+    or replay directories -- see
+    trademind.ser8_execution_geometry_checkpoint). When omitted (the
+    default), behavior is IDENTICAL to before checkpointing existed: no
+    checkpoint is read or written, and every symbol is computed exactly as
+    build_symbol_geometry_experiment always has.
+
+    ``resume`` (default True): when a checkpoint_dir is supplied, an
+    existing checkpoint for a symbol is reused ONLY when its identity/hash
+    verifies EXACTLY against this run's own inputs for that symbol
+    (dataset, replay/candidate/outcome evidence, shadow parameters,
+    stability_window_count, and variant definitions -- see
+    build_symbol_checkpoint_identity). Any missing, corrupt, tampered,
+    stale, or identity-mismatched checkpoint is never accepted and that
+    symbol is simply recomputed and (re)checkpointed. Passing
+    ``resume=False`` forces recomputation of every symbol while still
+    writing fresh checkpoints for the next run.
+
+    ``resume_report`` (optional): when supplied, this caller-owned dict is
+    populated in place with ``"resumed"`` and ``"recomputed"`` symbol lists
+    for CLI/output visibility. It is NEVER read from, never influences the
+    computation, and is NOT part of the returned report payload or its
+    hash -- a fresh run and a resumed run over identical evidence produce
+    byte-identical report content and the identical
+    ``experiment_report_sha256``, regardless of what is recorded here.
+    """
     if stability_window_count < 1:
         raise ValueError("stability_window_count must be a positive integer")
+    if resume_report is not None:
+        resume_report.setdefault("resumed", [])
+        resume_report.setdefault("recomputed", [])
     ready_symbols = sorted(
         {
             str(entry["symbol"])
@@ -502,12 +545,37 @@ def build_multisymbol_geometry_experiment_report(
             continue
         _candidates_raw, published_outcome_rows, replay_manifest = load_verified_replay_rows(Path(replay_dir))
         candidates = load_candidates(Path(replay_dir) / "candidates.jsonl")
-        verify_dataset(Path(dataset_dir))
+        dataset_manifest = verify_dataset(Path(dataset_dir))
         bars = load_canonical_bars(Path(dataset_dir) / "bars.csv")
         max_bars = int(replay_manifest["shadow_max_bars"])
         cost_r = float(replay_manifest["shadow_cost_r"])
-        symbol_reports.append(
-            build_symbol_geometry_experiment(
+
+        symbol_report: dict[str, object] | None = None
+        checkpoint_identity: dict[str, object] | None = None
+        checkpoint_file: Path | None = None
+        if checkpoint_dir is not None:
+            checkpoint_identity = build_symbol_checkpoint_identity(
+                experiment_schema_version=EXPERIMENT_SCHEMA_VERSION,
+                symbol=symbol,
+                dataset_sha256=str(dataset_manifest.get("dataset_sha256")),
+                replay_sha256=replay_manifest.get("replay_sha256"),
+                candidates_sha256=replay_manifest.get("candidates_sha256"),
+                outcomes_sha256=replay_manifest.get("outcomes_sha256"),
+                shadow_max_bars=max_bars,
+                shadow_cost_r=cost_r,
+                stability_window_count=stability_window_count,
+                variants=ALL_VARIANTS,
+            )
+            checkpoint_file = checkpoint_path_for(checkpoint_dir, symbol)
+            if resume:
+                symbol_report = load_verified_symbol_checkpoint(
+                    checkpoint_file, expected_identity=checkpoint_identity
+                )
+                if symbol_report is not None and resume_report is not None:
+                    resume_report["resumed"].append(symbol)
+
+        if symbol_report is None:
+            symbol_report = build_symbol_geometry_experiment(
                 symbol=symbol,
                 candidates=candidates,
                 published_outcome_rows=published_outcome_rows,
@@ -516,7 +584,14 @@ def build_multisymbol_geometry_experiment_report(
                 cost_r=cost_r,
                 stability_window_count=stability_window_count,
             )
-        )
+            if checkpoint_dir is not None and checkpoint_file is not None and checkpoint_identity is not None:
+                write_symbol_checkpoint(
+                    checkpoint_file, identity=checkpoint_identity, symbol_report=symbol_report
+                )
+            if resume_report is not None:
+                resume_report["recomputed"].append(symbol)
+
+        symbol_reports.append(symbol_report)
 
     experiment_valid = bool(symbol_reports) and all(
         item["control_reproduction_verified"] for item in symbol_reports
@@ -540,8 +615,22 @@ def build_multisymbol_geometry_experiment_report(
         "hypotheses_accepted": 0,
         "protected_holdout_accessed": False,
     }
+    # Report canonical serialization + hash creation: this artifact-specific,
+    # named, finite EXECUTION_GEOMETRY_REPORT_JSON_BUDGET is used
+    # consistently for hash creation here, hash verification in
+    # verify_multisymbol_geometry_experiment_report, writing in
+    # write_multisymbol_geometry_experiment_report, and loading in
+    # load_verified_multisymbol_geometry_experiment_report -- never the bare
+    # DEFAULT_JSON_SAFETY_BUDGET, which every other canonical_json_bytes
+    # caller in the codebase keeps unchanged. See
+    # trademind.ser8_execution_geometry_checkpoint for the sizing
+    # derivation. The experiment's semantic hash remains fully
+    # deterministic: only the budget's capacity ceiling changed, not the
+    # payload content or the hashing formula.
     payload["experiment_report_sha256"] = _sha256_hex(
-        _EXPERIMENT_HASH_DOMAIN + b"\x00" + canonical_json_bytes(payload)
+        _EXPERIMENT_HASH_DOMAIN
+        + b"\x00"
+        + canonical_json_bytes(payload, budget=EXECUTION_GEOMETRY_REPORT_JSON_BUDGET)
     )
     return payload
 
@@ -553,7 +642,11 @@ def _sha256_hex(value: bytes) -> str:
 def verify_multisymbol_geometry_experiment_report(payload: Mapping[str, object]) -> None:
     semantic = dict(payload)
     supplied = semantic.pop("experiment_report_sha256", None)
-    expected = _sha256_hex(_EXPERIMENT_HASH_DOMAIN + b"\x00" + canonical_json_bytes(semantic))
+    expected = _sha256_hex(
+        _EXPERIMENT_HASH_DOMAIN
+        + b"\x00"
+        + canonical_json_bytes(semantic, budget=EXECUTION_GEOMETRY_REPORT_JSON_BUDGET)
+    )
     if not isinstance(supplied, str) or supplied != expected:
         raise HistoricalDataError("EXPERIMENT_REPORT_HASH_MISMATCH", "experiment report hash mismatch")
     if payload.get("schema_version") != EXPERIMENT_SCHEMA_VERSION:
@@ -573,7 +666,10 @@ def write_multisymbol_geometry_experiment_report(path: Path, payload: Mapping[st
     verify_multisymbol_geometry_experiment_report(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    _write_synced(temporary, canonical_json_bytes(dict(payload)) + b"\n")
+    _write_synced(
+        temporary,
+        canonical_json_bytes(dict(payload), budget=EXECUTION_GEOMETRY_REPORT_JSON_BUDGET) + b"\n",
+    )
     temporary.replace(path)
     return path
 
@@ -620,6 +716,7 @@ def compact_report_lines(payload: Mapping[str, object], *, experiment_report_pat
 __all__ = [
     "EXPERIMENT_SCHEMA_VERSION",
     "DEFAULT_STABILITY_WINDOW_COUNT",
+    "EXECUTION_GEOMETRY_REPORT_JSON_BUDGET",
     "VARIANT_CONTROL",
     "VARIANT_MARKET_SAME_TARGET",
     "VARIANT_MARKET_1_5R",

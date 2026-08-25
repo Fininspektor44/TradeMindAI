@@ -81,6 +81,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of consecutive chronological windows for stability reporting",
     )
     parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=REPO_ROOT / "data" / "ser8_execution_geometry_experiment" / "checkpoints",
+        help=(
+            "Experiment-owned directory for per-symbol resume checkpoints "
+            "(never the authoritative historical-dataset or replay "
+            "directories). A symbol's checkpoint is written only after its "
+            "four variants are fully evaluated and its CONTROL reproduction "
+            "gate is resolved."
+        ),
+    )
+    parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help=(
+            "Disable per-symbol checkpointing entirely (neither read nor "
+            "write). Every symbol is always recomputed, exactly as before "
+            "checkpointing existed."
+        ),
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help=(
+            "Do not reuse any existing checkpoint (every symbol is "
+            "recomputed), but still WRITE fresh checkpoints for the next "
+            "run unless --no-checkpoint is also given. Resuming from a "
+            "verified checkpoint is the default because a checkpoint is "
+            "never reused unless its identity/hash verifies exactly against "
+            "this run's own inputs -- there is no unverifiable-reuse case "
+            "for this flag to guard against."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print the full experiment report as JSON instead of the compact report",
@@ -90,6 +124,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    checkpoint_dir = None if args.no_checkpoint else args.checkpoint_dir.expanduser().resolve()
+    resume = not args.no_resume
+    resume_report: dict[str, list[str]] = {"resumed": [], "recomputed": []}
     try:
         policy = load_research_policy(args.policy.expanduser().resolve())
         historical_inventory_path = args.historical_inventory.expanduser().resolve()
@@ -112,12 +149,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             readiness_payload=readiness_payload,
             stability_window_count=args.stability_window_count,
             captured_at=captured_at,
+            checkpoint_dir=checkpoint_dir,
+            resume=resume,
+            resume_report=resume_report,
         )
         experiment_output = args.experiment_output.expanduser().resolve()
         write_multisymbol_geometry_experiment_report(experiment_output, report)
     except (HistoricalDataError, OSError, ValueError, TypeError) as exc:
         code = exc.code if isinstance(exc, HistoricalDataError) else "EXPERIMENT_FAILED"
         print(json.dumps({"status": "FAILED", "error_code": code, "error": str(exc)}, sort_keys=True))
+        # Even on failure, report which symbols already have a
+        # fully-evaluated checkpoint on disk -- if any exist, the NEXT run
+        # (default resume=True) will not have to redo that expensive work.
+        if checkpoint_dir is not None:
+            print(
+                json.dumps(
+                    {
+                        "checkpoint_dir": str(checkpoint_dir),
+                        "resume_enabled": resume,
+                        "resumed_symbols_this_run": sorted(resume_report["resumed"]),
+                        "recomputed_symbols_this_run": sorted(resume_report["recomputed"]),
+                    },
+                    sort_keys=True,
+                )
+            )
         return 1
 
     if args.json:
@@ -125,6 +180,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         for line in compact_report_lines(report, experiment_report_path=str(experiment_output)):
             print(line)
+    # Resume behavior is always reported explicitly, outside the hashed
+    # report contract (compact_report_lines' own "=== ... ===" contract is
+    # unchanged) -- so a resumed run is never mistaken for a fresh one.
+    print(f"CHECKPOINT_DIR: {checkpoint_dir if checkpoint_dir is not None else '(disabled)'}")
+    print(f"CHECKPOINT_RESUME_ENABLED: {resume if checkpoint_dir is not None else False}")
+    print(f"CHECKPOINT_RESUMED_SYMBOLS: {len(resume_report['resumed'])} {sorted(resume_report['resumed'])}")
+    print(f"CHECKPOINT_RECOMPUTED_SYMBOLS: {len(resume_report['recomputed'])} {sorted(resume_report['recomputed'])}")
     return 0 if report["experiment_valid"] else 1
 
 
