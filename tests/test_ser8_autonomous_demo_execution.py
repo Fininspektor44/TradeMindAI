@@ -503,21 +503,41 @@ def test_broken_deals_export_never_masks_a_genuine_execution_complete(tmp_path: 
 
 
 # ---------------------------------------------------------------------------
-# 7: valid three-leg MARKET+LIMIT+LIMIT.
+# 7: legacy three-leg MARKET+LIMIT+LIMIT is now REFUSED at the worker.
+#
+# CORE_8 MARKET_ONLY EXECUTION POLICY V1 replaced the previous "three-leg
+# plan executes all legs" contract: supervised demo execution is MARKET entry
+# only, so a legacy multi-leg journaled candidate can never be executed
+# through the worker again. It must fail closed with zero broker contact.
+#
+# The multi-leg orchestration machinery itself is NOT removed and NOT
+# weakened -- it remains fully exercised at the executor level in
+# tests/test_ser8_mt5_demo_order_send.py (send/resume_plan across
+# MARKET+LIMIT+LIMIT plans, partial sends, UNKNOWN legs, pending
+# reconciliation), where multi-leg is still a legitimate shape. Only the
+# WORKER path is narrowed by this policy.
 # ---------------------------------------------------------------------------
 
 
-def test_valid_three_leg_plan_executes_all_legs(tmp_path: Path, monkeypatch) -> None:
+def test_legacy_three_leg_plan_is_refused_by_core8_market_only_policy(
+    tmp_path: Path, monkeypatch
+) -> None:
     chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-multi-1")
     fake = _success_transport()
     monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
 
     summary = worker_module.run_one_cycle(_worker_args(chain))
-    assert summary.cycle_status == "EXECUTION_COMPLETE"
-    assert summary.legs_total == 3
-    assert summary.filled == 3
-    assert summary.broker_sends_this_cycle == 3
-    assert len(fake.calls) == 3
+    assert summary.cycle_status == "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+    assert summary.candidate_status == "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+    assert "MARKET_ONLY" in summary.risk_block_reason
+    # Nothing was sized, authorized, claimed, planned, or sent.
+    assert summary.risk_state == "-"
+    assert summary.authorization_id == "-"
+    assert summary.claim_id == "-"
+    assert summary.execution_plan_id == "-"
+    assert summary.legs_total == 0
+    assert summary.broker_sends_this_cycle == 0
+    assert len(fake.calls) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -544,65 +564,60 @@ def test_already_processed_candidate_never_resent_across_ten_ticks(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
-# 10: process restart mid-multi-leg-send -- UNKNOWN leg #2 must never be
-# resent, and the worker must never touch this candidate again.
+# 10: a legacy multi-leg candidate can no longer reach the transport at all.
+#
+# The original scenario here (leg #1 FILLED, leg #2 UNKNOWN, leg #3 never
+# attempted, across a process restart) requires a >=2-leg plan, which
+# CORE_8 MARKET_ONLY makes unreachable through the worker: the candidate is
+# refused before any leg is ever attempted, so the strongest possible form
+# of "never resends" now holds -- nothing is ever sent in the first place,
+# on this or any subsequent tick.
+#
+# The UNKNOWN-leg-blocks-every-later-leg invariant itself is NOT lost: it is
+# exercised directly against the executor in
+# tests/test_ser8_mt5_demo_order_send.py, which still runs real multi-leg
+# send/resume_plan flows including UNKNOWN legs. Those tests are unchanged.
 # ---------------------------------------------------------------------------
 
 
-def test_restart_after_unknown_leg_never_resends(tmp_path: Path, monkeypatch) -> None:
+def test_restart_with_legacy_multi_leg_candidate_never_sends_anything(
+    tmp_path: Path, monkeypatch
+) -> None:
     chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-multi-crash")
 
-    call_count = {"n": 0}
-
     def _flaky_result_factory(request):
-        call_count["n"] += 1
-        if request.entry_index == 2:
-            raise RuntimeError("simulated transport crash on leg #2")
-        return DemoOrderTransportResult(
-            claim_id=request.claim_id, demo_account_id=request.demo_account_id, symbol=request.symbol,
-            retcode=10009, retcode_description="TRADE_RETCODE_DONE", order_ticket="1", deal_ticket="2",
-            position_ticket="3", filled_volume=request.volume, filled_price=request.price or 2000.0,
-        )
+        # Must never be reached: the policy refuses this candidate before
+        # any transport call is made. Raising here makes any regression
+        # that lets a leg through loudly visible.
+        raise AssertionError("transport was reached for a non-MARKET_ONLY plan")
 
     fake = FakeDemoOrderTransport(result_factory=_flaky_result_factory)
     monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
 
-    first = worker_module.run_one_cycle(_worker_args(chain))
-    # Leg #1 fills, leg #2 goes UNKNOWN (transport raised), the plan
-    # processing stops there (never attempts leg #3) -- aggregate is
-    # PENDING_RECONCILIATION, which this single-leg-unaware worker path
-    # surfaces as a fail-closed status, never a crash.
-    assert first.cycle_status in ("EXECUTION_PENDING_RECONCILIATION", "FAIL_CLOSED_SEND_DENIED")
-    calls_after_first = len(fake.calls)
-    assert calls_after_first == 2  # leg #1 (sent) + leg #2 (attempted, UNKNOWN) -- leg #3 never touched.
-
-    # "Restart": a brand new run_one_cycle call, simulating a fresh
-    # process. The plan already exists for this candidate, and leg #3 has
-    # no send attempt yet -- the worker attempts a genuine resume through
-    # resume_plan(), which re-verifies the SAME invariants and finds leg
-    # #2 is still UNKNOWN -- blocking leg #3 from ever being attempted,
-    # exactly like the original send() call would. Zero broker sends;
-    # never re-authorize, re-claim, or resend an already-attempted leg.
-    second = worker_module.run_one_cycle(_worker_args(chain))
-    assert second.cycle_status == "EXECUTION_PENDING_RECONCILIATION"
-    assert second.broker_sends_this_cycle == 0
-    assert len(fake.calls) == calls_after_first  # no new transport calls at all.
-
-    third = worker_module.run_one_cycle(_worker_args(chain))
-    assert third.cycle_status == "EXECUTION_PENDING_RECONCILIATION"
-    assert third.broker_sends_this_cycle == 0
-    assert len(fake.calls) == calls_after_first
+    # Repeated scheduler ticks, simulating restarts: always refused, always
+    # zero broker sends, forever.
+    for _ in range(3):
+        summary = worker_module.run_one_cycle(_worker_args(chain))
+        assert summary.cycle_status == "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+        assert summary.broker_sends_this_cycle == 0
+        assert summary.execution_plan_id == "-"
+    assert len(fake.calls) == 0
 
 
-def test_worker_resumes_genuinely_unattempted_legs_after_partial_send(tmp_path: Path, monkeypatch) -> None:
-    """Scenario A end-to-end through the worker: a plan with leg #1
-    FILLED and legs #2/#3 never attempted at all (a genuine crash
-    strictly between leg #1 and leg #2, never reachable from a single
-    send() call) is safely resumed -- leg #1 is never resent, legs #2/#3
-    are each sent exactly once, across multiple scheduler ticks."""
-    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-resume-a")
-    pipeline, claim, decision, candidate = _full_real_claim(chain, multi_leg=True)
-    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+def test_worker_resumes_a_genuinely_unattempted_market_only_leg(tmp_path: Path, monkeypatch) -> None:
+    """Scenario A end-to-end through the worker, rebuilt as a valid
+    single-leg CORE_8 MARKET_ONLY plan: a process that crashed strictly
+    AFTER the plan was persisted but BEFORE its only leg was ever
+    attempted. The plan exists, its one MARKET leg has no attempt row, so
+    the worker safely resumes it through resume_plan() -- sending that leg
+    exactly once, and never again on any later tick.
+
+    This is the real, still-reachable crash window under MARKET_ONLY: a
+    plan is always persisted before any leg is attempted, so "plan exists,
+    leg unattempted" is a genuine durable state even with a single leg."""
+    chain = _prepared_chain(tmp_path, signal_id="sig-resume-a")
+    pipeline, claim, decision, candidate = _full_real_claim(chain)
+    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={})
 
     fake = _success_transport()
     monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
@@ -610,10 +625,11 @@ def test_worker_resumes_genuinely_unattempted_legs_after_partial_send(tmp_path: 
     summary = worker_module.run_one_cycle(_worker_args(chain))
     assert summary.cycle_status == "EXECUTION_RESUMED"
     assert summary.candidate_status == "RESUMABLE"
-    assert summary.broker_sends_this_cycle == 2
-    assert {req.entry_index for req in fake.calls} == {2, 3}
-    assert summary.filled == 3
-    assert summary.legs_total == 3
+    assert summary.broker_sends_this_cycle == 1
+    assert {req.entry_index for req in fake.calls} == {1}
+    assert {req.order_type for req in fake.calls} == {"MARKET"}
+    assert summary.filled == 1
+    assert summary.legs_total == 1
 
     # Multiple further scheduler ticks: the plan is now fully attempted --
     # ALREADY_PROCESSED, zero further sends, forever.
@@ -621,7 +637,7 @@ def test_worker_resumes_genuinely_unattempted_legs_after_partial_send(tmp_path: 
         again = worker_module.run_one_cycle(_worker_args(chain))
         assert again.cycle_status == "ALREADY_PROCESSED"
         assert again.broker_sends_this_cycle == 0
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 1
 
 
 def test_worker_dry_run_reports_resumable_without_ever_sending(tmp_path: Path, monkeypatch) -> None:
@@ -629,9 +645,9 @@ def test_worker_dry_run_reports_resumable_without_ever_sending(tmp_path: Path, m
     operation) -- an existing plan with unattempted legs is reported as
     DRY_RUN_WOULD_RESUME, with zero broker sends, and a subsequent REAL
     cycle still correctly resumes it afterward."""
-    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-resume-dryrun")
-    pipeline, claim, decision, candidate = _full_real_claim(chain, multi_leg=True)
-    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+    chain = _prepared_chain(tmp_path, signal_id="sig-resume-dryrun")
+    pipeline, claim, decision, candidate = _full_real_claim(chain)
+    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={})
 
     fake = _success_transport()
     monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
@@ -643,8 +659,8 @@ def test_worker_dry_run_reports_resumable_without_ever_sending(tmp_path: Path, m
 
     real_summary = worker_module.run_one_cycle(_worker_args(chain))
     assert real_summary.cycle_status == "EXECUTION_RESUMED"
-    assert real_summary.broker_sends_this_cycle == 2
-    assert {req.entry_index for req in fake.calls} == {2, 3}
+    assert real_summary.broker_sends_this_cycle == 1
+    assert {req.entry_index for req in fake.calls} == {1}
 
 
 def test_worker_reports_resume_window_expired_zero_sends(tmp_path: Path, monkeypatch) -> None:
@@ -653,9 +669,9 @@ def test_worker_reports_resume_window_expired_zero_sends(tmp_path: Path, monkeyp
     RESUME_WINDOW_EXPIRED explicitly (never a generic denial), with
     execution_plan_id/claim_id/resume_until/unattempted_legs all still
     populated for the operator, and zero broker sends."""
-    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-resume-expired")
-    pipeline, claim, decision, candidate = _full_real_claim(chain, multi_leg=True)
-    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+    chain = _prepared_chain(tmp_path, signal_id="sig-resume-expired")
+    pipeline, claim, decision, candidate = _full_real_claim(chain)
+    _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={})
 
     fake = _success_transport()
     monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
@@ -668,7 +684,7 @@ def test_worker_reports_resume_window_expired_zero_sends(tmp_path: Path, monkeyp
     assert summary.execution_plan_id != "-"
     assert summary.claim_id != "-"
     assert summary.resume_until != "-"
-    assert summary.unattempted_legs == 2
+    assert summary.unattempted_legs == 1
 
     # Every further tick -- still expired, still zero sends, forever.
     for _ in range(3):
@@ -684,12 +700,18 @@ def test_worker_reports_tampered_resume_authority_fails_closed(tmp_path: Path, m
     also recomputing resume_authority_hash to match) is caught by the
     worker's own get_plan_for_candidate read -- reported as a clean,
     explicit FAIL_CLOSED_PLAN_INTEGRITY cycle_status, never an uncaught
-    crash, and zero broker sends."""
+    crash, and zero broker sends.
+
+    DIAGNOSTIC PRECEDENCE: persisted-plan integrity is verified BEFORE the
+    CORE_8 MARKET_ONLY geometry gate, so a tampered plan reports its own,
+    most specific reason rather than being masked by the more generic
+    policy block. Both fail closed with zero broker contact; this asserts
+    which reason the operator actually sees."""
     import sqlite3
 
-    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-resume-tampered")
-    pipeline, claim, decision, candidate = _full_real_claim(chain, multi_leg=True)
-    plan = _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+    chain = _prepared_chain(tmp_path, signal_id="sig-resume-tampered")
+    pipeline, claim, decision, candidate = _full_real_claim(chain)
+    plan = _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={})
 
     db = sqlite3.connect(chain.db_path)
     row = db.execute(
@@ -712,6 +734,46 @@ def test_worker_reports_tampered_resume_authority_fails_closed(tmp_path: Path, m
     assert summary.broker_sends_this_cycle == 0
     assert len(fake.calls) == 0
     assert "integrity" in summary.risk_block_reason.lower()
+
+
+def test_plan_integrity_diagnostic_wins_over_core8_policy_block(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Both faults present at once -- a tampered persisted plan AND a
+    legacy multi-leg (non-MARKET_ONLY) candidate. The worker must report
+    the MORE SPECIFIC failure, FAIL_CLOSED_PLAN_INTEGRITY, not the generic
+    CORE8_MARKET_ONLY_POLICY_BLOCKED. This is the direct regression guard
+    for the check ordering; either ordering fails closed with zero broker
+    contact, but only this one tells the operator what is actually wrong."""
+    import sqlite3
+
+    chain = _prepared_chain(tmp_path, multi_leg=True, signal_id="sig-tampered-multi")
+    pipeline, claim, decision, candidate = _full_real_claim(chain)
+    plan = _seed_partial_plan(pipeline, claim, decision, candidate, attempted_states={1: "FILLED"})
+    assert len(plan.legs) == 3, "fixture must be the legacy multi-leg shape"
+
+    db = sqlite3.connect(chain.db_path)
+    row = db.execute(
+        "SELECT payload_json FROM ser8_mt5_demo_order_plans WHERE plan_id=?", (plan.plan_id,)
+    ).fetchone()
+    payload = json.loads(row[0])
+    payload["resume_until"] = (datetime.fromisoformat(payload["resume_until"]) + timedelta(hours=1)).isoformat()
+    db.execute(
+        "UPDATE ser8_mt5_demo_order_plans SET payload_json=? WHERE plan_id=?",
+        (json.dumps(payload, sort_keys=True), plan.plan_id),
+    )
+    db.commit()
+    db.close()
+
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+
+    summary = worker_module.run_one_cycle(_worker_args(chain))
+    assert summary.cycle_status == "FAIL_CLOSED_PLAN_INTEGRITY"
+    assert summary.cycle_status != "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+    assert "integrity" in summary.risk_block_reason.lower()
+    assert summary.broker_sends_this_cycle == 0
+    assert len(fake.calls) == 0
 
 
 # ---------------------------------------------------------------------------

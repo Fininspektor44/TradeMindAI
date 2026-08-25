@@ -233,6 +233,10 @@ from trademind.ser8_mt5_execution_reconciliation import (  # noqa: E402
     inventory_active_pending_orders,
     load_order_history,
 )
+from trademind.ser8_core8_market_only_policy import (  # noqa: E402
+    SER8Core8PolicyError,
+    verify_core8_market_only_execution,
+)
 from trademind.ser8_research_risk_gate import (  # noqa: E402
     SER8ResearchRiskGateError,
     evaluate_ser8_research_risk_gate,
@@ -697,6 +701,47 @@ def _run_cycle_for_hypothesis(
         summary.cycle_status = "FAIL_CLOSED_PLAN_INTEGRITY"
         summary.risk_block_reason = str(exc)
         return summary
+
+    # CORE_8 MARKET_ONLY EXECUTION POLICY V1 -- verified on the selected
+    # candidate before any risk evaluation, authorization, claim, or broker
+    # send can occur. Everything above this point is strictly read-only
+    # (control construction, broker-history observation, and the read-only
+    # get_plan_for_candidate accessor), so nothing has been sent, sized, or
+    # authorized by the time this gate runs.
+    #
+    # DELIBERATELY ORDERED AFTER THE PLAN-INTEGRITY CHECK: a tampered
+    # persisted plan must report its own, most specific fail-closed
+    # diagnostic (FAIL_CLOSED_PLAN_INTEGRITY) rather than being masked by a
+    # more generic policy block. Both outcomes fail closed with zero broker
+    # contact; this ordering only decides which reason is reported, and the
+    # more precise one wins.
+    #
+    # This is a VERIFY-ONLY gate: it never reshapes the candidate. CORE_8
+    # candidates are born MARKET_ONLY in fx_signal_adapter._build_plan,
+    # before SignalCandidate.signal_id is derived, so the journaled
+    # candidate already carries the correct one-MARKET-leg plan and one
+    # traceable identity. Reshaping a journaled candidate here would mint a
+    # signal_id absent from candidates.jsonl and break that lineage.
+    #
+    # Fails closed two ways, both owned by the single policy module
+    # trademind.ser8_core8_market_only_policy:
+    #   * a symbol outside the eight researched CORE_8 symbols ends the
+    #     cycle here -- it never reaches the risk gate, so it can never
+    #     obtain an authorization, a claim, or an order;
+    #   * an older journaled CORE_8 candidate still carrying the legacy
+    #     MARKET+LIMIT+LIMIT geometry is refused rather than executed, so
+    #     only candidates generated under this policy can ever trade.
+    try:
+        verify_core8_market_only_execution(
+            symbol=candidate.symbol,
+            order_types=[entry.order_type for entry in candidate.plan.entries],
+        )
+    except SER8Core8PolicyError as exc:
+        summary.candidate_status = "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+        summary.cycle_status = "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+        summary.risk_block_reason = str(exc)
+        return summary
+
     if plan is not None:
         summary.claim_id = plan.claim_id
         summary.execution_plan_id = plan.plan_id
@@ -765,6 +810,27 @@ def _run_cycle_for_hypothesis(
             summary.risk_block_reason = (
                 f"execution plan {plan.plan_id} exists but no claim was ever persisted for "
                 f"authorization_id {plan.authorization_id!r}; cannot safely resume"
+            )
+            return summary
+
+        # CORE_8 MARKET_ONLY applies to RESUME too, and this is not
+        # redundant: resume_plan rebuilds its legs exclusively from the
+        # already-persisted plan, so a plan created BEFORE this policy
+        # existed could still carry a non-CORE_8 symbol or LIMIT add-on
+        # legs. Verified against the persisted plan's own frozen leg data,
+        # so such a legacy plan fails closed here instead of quietly
+        # sending LIMIT orders. A human must review it.
+        try:
+            verify_core8_market_only_execution(
+                symbol=plan.symbol,
+                order_types=[leg.order_type for leg in plan.legs],
+            )
+        except SER8Core8PolicyError as exc:
+            summary.candidate_status = "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+            summary.cycle_status = "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+            summary.risk_block_reason = (
+                f"persisted execution plan {plan.plan_id} violates CORE_8 MARKET_ONLY policy "
+                f"and will not be resumed: {exc}"
             )
             return summary
 
@@ -933,6 +999,26 @@ def _run_cycle_for_hypothesis(
     summary.pending_expires_at = ",".join(
         leg.expires_at for leg in planned.legs if leg.expires_at is not None
     ) or "-"
+
+    # CORE_8 MARKET_ONLY defense in depth -- re-verified against the ACTUAL
+    # sized RiskDecision.orders the executor is about to send, immediately
+    # before the first real broker transport is even constructed. The
+    # upstream candidate-level policy call already guaranteed this, but the
+    # Risk Manager (correctly, as the sole sizing authority) is free to
+    # decide how many legs it sizes, so the leg shape that actually reaches
+    # MT5 is verified here rather than assumed. Costs one comparison and
+    # closes the gap between "the plan we asked to be sized" and "the plan
+    # being sent".
+    try:
+        verify_core8_market_only_execution(
+            symbol=candidate.symbol,
+            order_types=[order.order_type for order in result.decision.orders],
+        )
+    except SER8Core8PolicyError as exc:
+        summary.candidate_status = "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+        summary.cycle_status = "CORE8_MARKET_ONLY_POLICY_BLOCKED"
+        summary.risk_block_reason = str(exc)
+        return summary
 
     common_files_dir = Path(args.common_files_dir).expanduser()
     real_transport = FileBridgeDemoOrderTransport(

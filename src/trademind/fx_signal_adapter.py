@@ -17,6 +17,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from trademind.ser8_core8_market_only_policy import (
+    SER8Core8PolicyError,
+    is_core8_symbol,
+    market_only_plan,
+)
 from trademind.signal_evidence import similarity_dimensions, similarity_key
 from trademind.signal_intelligence import EntryOrder, SignalCandidate, TradePlan
 
@@ -169,6 +174,39 @@ def _build_plan(row: Mapping[str, Any], action: str) -> tuple[TradePlan, dict[st
         invalidation=invalidation,
         target_rationale=target_reasons,
     )
+
+    # CORE_8 MARKET_ONLY EXECUTION POLICY V1.
+    #
+    # The eight researched CORE_8 symbols are operationalized MARKET_ONLY:
+    # exactly one MARKET entry at allocation 1.0, no LIMIT add-ons. Applied
+    # HERE, while the plan is still being built, so the resulting plan is
+    # the one SignalCandidate.signal_id is derived from -- the candidate is
+    # BORN market-only and is journaled normally, with a single, traceable
+    # identity. Nothing downstream ever reshapes a journaled candidate (that
+    # would mint a signal_id absent from candidates.jsonl).
+    #
+    # The basket geometry above is computed FIRST and left completely
+    # untouched, so `stop` and the PRIMARY target (`target_one`) keep exactly
+    # the researched semantics -- market_only_plan preserves both
+    # byte-for-byte and only drops the LIMIT legs and the secondary target.
+    # This reproduces the already-validated MARKET_ONLY_SAME_TARGET variant
+    # (equivalence is asserted in tests). The secondary target was never sent
+    # to the broker in any case: the executor uses plan.targets[0] only.
+    #
+    # Non-CORE_8 symbols keep the existing MARKET+LIMIT+LIMIT geometry
+    # completely unchanged. This affects only newly generated candidates; no
+    # existing candidates.jsonl or replay artifact is read, rewritten, or
+    # mutated by this module.
+    if is_core8_symbol(_text(row, "symbol").upper()):
+        try:
+            plan = market_only_plan(plan)
+        except SER8Core8PolicyError as exc:
+            # Surfaced as ValueError so this row is skipped by the SAME
+            # existing "skip an unbuildable row" contract every other
+            # geometry failure in this function already uses -- never a
+            # crash, and never a silently adjusted geometry.
+            raise ValueError(f"CORE_8 MARKET_ONLY geometry unavailable: {exc}") from exc
+
     geometry = {
         "protected_low": protected_low,
         "protected_high": protected_high,

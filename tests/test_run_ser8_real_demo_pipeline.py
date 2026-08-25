@@ -94,7 +94,12 @@ _HOLDOUT_METRIC = "row_count"
 _KEY_ID = "ser8-real-demo-pipeline-test-key-v1"
 _KEY_ENV = "SER8_REAL_DEMO_PIPELINE_TEST_HOLDOUT_KEY"
 _ACCOUNT = "67206924"
-_SYMBOL = "XAUUSD"
+# CORE_8 MARKET_ONLY EXECUTION POLICY V1: the supervised demo execution
+# path now fails closed for every non-CORE_8 symbol, so these fixtures use
+# a real CORE_8 symbol. Only the instrument NAME changed -- every synthetic
+# price, digit count, and volume below is unchanged, so each assertion
+# still exercises exactly what it did before.
+_SYMBOL = "USDJPY"
 
 
 def _code_provenance() -> CodeProvenance:
@@ -265,7 +270,7 @@ def _full_real_chain(
     from trademind.discovery.manifest import DatasetArtifact as DatasetArtifactV1
 
     dataset_file = work_dir / "spec_dataset.csv"
-    dataset_file.write_text("time,symbol,close\n1,XAUUSD,2000.0\n", encoding="utf-8")
+    dataset_file.write_text("time,symbol,close\n1,USDJPY,2000.0\n", encoding="utf-8")
     v1_dataset = DatasetArtifactV1.from_path(dataset_file)
     spec = spec_control.create_specification(
         accepted.intake_id, reviewer_id="operator:spec-reviewer", test_family=_TEST_FAMILY,

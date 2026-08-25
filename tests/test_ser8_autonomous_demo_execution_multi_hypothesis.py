@@ -33,7 +33,7 @@ from trademind.discovery.hypothesis_tradeable_scope import AllowedActionScope  #
 from trademind.ser8_mt5_demo_order_send import DemoOrderTransportResult, FakeDemoOrderTransport  # noqa: E402
 
 _ACCOUNT = fixtures._ACCOUNT
-_SYMBOL_A = fixtures._SYMBOL  # "XAUUSD"
+_SYMBOL_A = fixtures._SYMBOL  # CORE_8: "USDJPY"
 _SYMBOL_B = "EURJPY"
 
 
