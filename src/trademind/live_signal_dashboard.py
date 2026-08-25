@@ -143,9 +143,7 @@ def _candidate_market(candidate: SignalCandidate) -> dict[str, Any]:
             "tick_rate_ratio": volume.get("tick_rate_ratio_20"),
         },
         "momentum": {
-            "ema_fast": momentum.get("ema_fast"),
-            "ema_slow": momentum.get("ema_slow"),
-            "rsi": momentum.get("rsi"),
+            "impulse_atr": momentum.get("impulse_atr"),
             "body_efficiency": momentum.get("body_efficiency_ratio_20"),
         },
         "volatility": {
@@ -306,7 +304,7 @@ def _market_table(candidate: Mapping[str, Any]) -> str:
         ("Ликвидность", f"BSL sweep {int(bool(liquidity.get('bsl_sweep')))}; SSL sweep {int(bool(liquidity.get('ssl_sweep')))}"),
         ("Fibonacci", f"retracement {_fmt(fibonacci.get('retracement'))}; OTE {_fmt(fibonacci.get('ote_low'))}–{_fmt(fibonacci.get('ote_high'))}"),
         ("Объёмы", f"RVOL {_fmt(volume.get('rvol_20'), 2)}; percentile {_fmt(volume.get('percentile'), 1)}; imbalance {_fmt(volume.get('imbalance'))}"),
-        ("Импульс", f"RSI {_fmt(momentum.get('rsi'), 1)}; body efficiency {_fmt(momentum.get('body_efficiency'), 2)}"),
+        ("Импульс", f"impulse/ATR {_fmt(momentum.get('impulse_atr'), 2)}; body efficiency {_fmt(momentum.get('body_efficiency'), 2)}"),
         ("Волатильность", f"ATR {_fmt(volatility.get('atr'), 6)}; spread/ATR {_fmt(volatility.get('spread_cost_atr'), 3)}"),
         ("Подтверждение", f"FVG {confirmation.get('fvg', '—')}; size {_fmt(confirmation.get('fvg_size_atr'), 3)} ATR"),
         ("Сессия", _text(market.get("session")) or "—"),

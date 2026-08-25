@@ -28,6 +28,7 @@ from trademind.live_signal_runtime import closed_volume_rows, run_live_runtime
 from trademind.signal_passport_factory import FactoryRun
 from trademind.signal_to_risk_bridge import BridgeRun
 from trademind.volume import VolumeCollectSummary
+from test_smc_ote import _synthetic_rows
 
 NOW = datetime(2026, 8, 5, 12, 6, tzinfo=timezone.utc)
 
@@ -117,6 +118,18 @@ def _volume_row(index: int, *, symbol: str = "EURUSD") -> dict[str, str]:
     }
 
 
+def _ote_rows(symbol: str) -> list[dict[str, str]]:
+    return [
+        {
+            **row,
+            "schema_version": "1.4",
+            "symbol": symbol,
+            "bar_seconds": "300",
+        }
+        for row in _synthetic_rows()
+    ]
+
+
 def _write_canonical_csv(path: Path, rows: list[dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(_CANONICAL_VOLUME_FIELDS))
@@ -165,10 +178,10 @@ def test_frozen_prospective_symbols_are_exactly_the_three_candidates() -> None:
 
 def test_ustechcash_is_covered_end_to_end(tmp_path: Path) -> None:
     path = tmp_path / "volume.csv"
-    rows_in = [_volume_row(index, symbol=".USTECHCASH") for index in range(50)]
+    rows_in = _ote_rows(".USTECHCASH")
     _write_canonical_csv(path, rows_in)
     loaded, _ = load_volume_rows(path)
-    assert len(loaded) == 50
+    assert len(loaded) == len(rows_in)
     observations = build_fx_observations(loaded)
     assert observations
     assert all(obs["symbol"] == ".USTECHCASH" for obs in observations)
@@ -176,10 +189,10 @@ def test_ustechcash_is_covered_end_to_end(tmp_path: Path) -> None:
 
 def test_us30cash_is_covered_end_to_end(tmp_path: Path) -> None:
     path = tmp_path / "volume.csv"
-    rows_in = [_volume_row(index, symbol=".US30CASH") for index in range(50)]
+    rows_in = _ote_rows(".US30CASH")
     _write_canonical_csv(path, rows_in)
     loaded, _ = load_volume_rows(path)
-    assert len(loaded) == 50
+    assert len(loaded) == len(rows_in)
     observations = build_fx_observations(loaded)
     assert observations
     assert all(obs["symbol"] == ".US30CASH" for obs in observations)
@@ -187,10 +200,10 @@ def test_us30cash_is_covered_end_to_end(tmp_path: Path) -> None:
 
 def test_xagusd_is_covered_end_to_end(tmp_path: Path) -> None:
     path = tmp_path / "volume.csv"
-    rows_in = [_volume_row(index, symbol="XAGUSD") for index in range(50)]
+    rows_in = _ote_rows("XAGUSD")
     _write_canonical_csv(path, rows_in)
     loaded, _ = load_volume_rows(path)
-    assert len(loaded) == 50
+    assert len(loaded) == len(rows_in)
     observations = build_fx_observations(loaded)
     assert observations
     assert all(obs["symbol"] == "XAGUSD" for obs in observations)
@@ -345,16 +358,16 @@ def test_run_live_runtime_reports_no_missing_symbols_when_all_present(
 
 
 def test_observation_field_schema_is_unchanged_for_a_frozen_symbol() -> None:
-    rows_in = [_volume_row(index, symbol=".US30CASH") for index in range(50)]
+    rows_in = _ote_rows(".US30CASH")
     observations = build_fx_observations(rows_in)
     assert observations
     assert set(observations[0].keys()) == set(_OBSERVATION_FIELDS)
 
 
 def test_observation_field_schema_identical_for_fx_and_frozen_symbol() -> None:
-    fx_observations = build_fx_observations([_volume_row(i, symbol="EURUSD") for i in range(50)])
+    fx_observations = build_fx_observations(_ote_rows("EURUSD"))
     frozen_observations = build_fx_observations(
-        [_volume_row(i, symbol="XAGUSD") for i in range(50)]
+        _ote_rows("XAGUSD")
     )
     assert set(fx_observations[0].keys()) == set(frozen_observations[0].keys())
 
@@ -442,9 +455,7 @@ def test_build_fx_observations_is_deterministic_across_repeated_calls() -> None:
 
 
 def test_build_fx_observations_symbol_output_order_matches_universe_order() -> None:
-    rows = [_volume_row(index, symbol="XAGUSD") for index in range(50)] + [
-        _volume_row(index, symbol="EURUSD") for index in range(50)
-    ]
+    rows = _ote_rows("XAGUSD") + _ote_rows("EURUSD")
     observations = build_fx_observations(rows)
     symbols_in_output_order = list(dict.fromkeys(obs["symbol"] for obs in observations))
     # EURUSD precedes XAGUSD in LIVE_OBSERVATION_SYMBOLS, regardless of input order.

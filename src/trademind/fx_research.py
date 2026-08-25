@@ -17,10 +17,9 @@ from trademind.action_validation import (
     validate_action_rows,
 )
 from trademind.market.models import Candle
-from trademind.signals import SignalEngine
-from trademind.structure import MarketStructureEngine, StructureObservation
+from trademind.ote_engine import build_ote_signals
 
-SCHEMA_VERSION = "1.4.2"
+SCHEMA_VERSION = "1.5.1"
 FX_MAJORS = (
     "EURUSD",
     "GBPUSD",
@@ -67,17 +66,41 @@ _OBSERVATION_FIELDS = (
     "timeframe",
     "session",
     "action",
+    "signal_source",
+    "ote_signal_id",
+    "variant",
+    "fib_ratio",
     "score",
-    "confidence",
     "entry_price",
     "bar_open",
     "bar_high",
     "bar_low",
-    "ema_fast",
-    "ema_slow",
-    "rsi",
     "atr",
     "signal_reasons",
+    "setup_break",
+    "setup_start_time",
+    "setup_end_time",
+    "setup_age_bars",
+    "anchor_price",
+    "impulse_extreme",
+    "impulse_range",
+    "impulse_atr",
+    "fib_618",
+    "fib_705",
+    "fib_790",
+    "stop_price",
+    "target_price",
+    "risk_price",
+    "reward_price",
+    "rr",
+    "stop_buffer",
+    "h1_bias",
+    "h4_bias",
+    "h1_aligned",
+    "h4_aligned",
+    "liquidity_sweep",
+    "fvg_aligned",
+    "confirmation",
     "structure_version",
     "internal_bias",
     "internal_reference_high",
@@ -328,32 +351,6 @@ def _ratio_to_previous(rows: list[dict[str, str]], index: int, key: str) -> floa
     return _float(rows[index], key) / mean if mean > 0 else 0.0
 
 
-def _structure_fields(structure: StructureObservation) -> dict[str, str]:
-    return {
-        "structure_version": structure.version,
-        "internal_bias": structure.internal_bias.value,
-        "internal_reference_high": _number(structure.internal_reference_high),
-        "internal_reference_low": _number(structure.internal_reference_low),
-        "internal_break": structure.internal_break.value,
-        "swing_bias": structure.swing_bias.value,
-        "swing_reference_high": _number(structure.swing_reference_high),
-        "swing_reference_low": _number(structure.swing_reference_low),
-        "swing_break": structure.swing_break.value,
-        "liquidity_reference_high": _number(structure.liquidity_reference_high),
-        "liquidity_reference_low": _number(structure.liquidity_reference_low),
-        "bsl_sweep": "1" if structure.bsl_sweep else "0",
-        "ssl_sweep": "1" if structure.ssl_sweep else "0",
-        "bsl_sweep_depth": _number(structure.bsl_sweep_depth),
-        "ssl_sweep_depth": _number(structure.ssl_sweep_depth),
-        "bsl_sweep_depth_atr": _number(structure.bsl_sweep_depth_atr),
-        "ssl_sweep_depth_atr": _number(structure.ssl_sweep_depth_atr),
-        "fvg_direction": structure.fvg_direction.value,
-        "fvg_size": _number(structure.fvg_size),
-        "fvg_size_atr": _number(structure.fvg_size_atr),
-        "structure_event_count": str(structure.event_count),
-    }
-
-
 def _research_labels(row: dict[str, str]) -> set[str]:
     labels = set(feature_labels(row))
     action = row["action"]
@@ -405,7 +402,7 @@ def _apply_forward_outcomes(
     index: int,
 ) -> None:
     action = observation["action"]
-    entry = candles[index].close
+    entry = _float(observation, "entry_price")
     atr = _float(observation, "atr")
     spread_cost = _float(observation, "spread_cost")
 
@@ -448,12 +445,12 @@ def build_fx_observations(
     symbols: tuple[str, ...] | None = None,
     include_forward_outcomes: bool = True,
 ) -> list[dict[str, str]]:
-    """Build deterministic, research-only observations from canonical bars.
+    """Build candidate-source rows exclusively from authoritative OTE signals.
 
-    The default symbol scope and forward-outcome behavior are unchanged for
-    the production live runtime. Historical replay must pass an explicit
-    broker-derived symbol tuple and disables the legacy observation-level
-    forward labels so candidate construction cannot receive future fields.
+    Bars that do not produce a signal in ``build_ote_signals`` produce no row.
+    Consequently neither research nor live callers can manufacture a
+    directional candidate from volatility, structure observations, or market
+    metadata alone.
     """
     selected_symbols = tuple(
         dict.fromkeys(symbol.strip().upper() for symbol in (symbols or LIVE_OBSERVATION_SYMBOLS))
@@ -463,48 +460,88 @@ def build_fx_observations(
         if row.get("symbol", "").upper() in selected_symbols:
             by_symbol[row["symbol"].upper()].append(row)
 
-    signal_engine = SignalEngine()
-    structure_engine = MarketStructureEngine()
-    minimum = max(signal_engine.minimum_candles, structure_engine.minimum_candles)
+    selected_rows = [
+        row
+        for symbol in selected_symbols
+        for row in sorted(by_symbol.get(symbol, []), key=lambda item: _integer(item, "time"))
+    ]
+    signals = build_ote_signals(
+        selected_rows,
+        server_utc_offset_hours=server_utc_offset_hours,
+    )
     output: list[dict[str, str]] = []
+    rows_by_symbol = {
+        symbol: sorted(by_symbol.get(symbol, []), key=lambda item: _integer(item, "time"))
+        for symbol in selected_symbols
+    }
+    candles_by_symbol = {
+        symbol: [_candle(row, server_utc_offset_hours) for row in rows]
+        for symbol, rows in rows_by_symbol.items()
+    }
+    source_by_key = {
+        (row["symbol"].upper(), _integer(row, "time")): (index, row)
+        for symbol in selected_symbols
+        for index, row in enumerate(rows_by_symbol[symbol])
+    }
 
-    for symbol in selected_symbols:
-        rows = sorted(by_symbol.get(symbol, []), key=lambda item: _integer(item, "time"))
-        candles = [_candle(row, server_utc_offset_hours) for row in rows]
-        for index in range(minimum - 1, len(rows)):
-            start = max(0, index - 59)
-            history = candles[start : index + 1]
-            result = signal_engine.analyze(history)
-            structure = structure_engine.analyze(history, atr=result.atr)
-            source = rows[index]
-            signal_time = candles[index].time
-            point = _float(source, "point")
-            spread_points = _float(source, "spread_mean_points")
-            spread_cost = spread_points * point
+    for signal in signals:
+        symbol = signal["symbol"].upper()
+        source_epoch = _integer(signal, "source_bar_time")
+        located = source_by_key.get((symbol, source_epoch))
+        if located is None:
+            continue
+        index, source = located
+        rows = rows_by_symbol[symbol]
+        candles = candles_by_symbol[symbol]
+        signal_time = candles[index].time + timedelta(
+            seconds=max(1, _integer(source, "bar_seconds") or 300)
+        )
+        point = _float(source, "point")
+        spread_points = _float(source, "spread_mean_points")
+        spread_cost = spread_points * point
+        action = signal["action"]
+        aligned_sweep = signal.get("liquidity_sweep", "0")
+        fvg_direction = (
+            ("BULLISH" if action == "BUY" else "BEARISH")
+            if signal.get("fvg_aligned") == "1"
+            else "NONE"
+        )
 
-            observation = {field: "" for field in _OBSERVATION_FIELDS}
-            observation.update(
-                {
+        observation = {field: "" for field in _OBSERVATION_FIELDS}
+        observation.update({key: value for key, value in signal.items() if key in observation})
+        observation.update(
+            {
                     "schema_version": SCHEMA_VERSION,
-                    "observation_id": f"{symbol}:M5:{_integer(source, 'time')}",
+                    "observation_id": signal["signal_id"],
+                    "ote_signal_id": signal["signal_id"],
+                    "signal_source": "trademind.ote_engine.build_ote_signals",
                     "signal_time": signal_time.isoformat(),
-                    "source_bar_time": str(_integer(source, "time")),
+                    "source_bar_time": str(source_epoch),
                     "server_utc_offset_hours": str(server_utc_offset_hours),
                     "symbol": symbol,
                     "timeframe": "M5",
                     "session": session_for_time(signal_time),
-                    "action": result.action.value,
-                    "score": str(result.score),
-                    "confidence": str(result.confidence),
-                    "entry_price": _number(candles[index].close),
+                    "action": action,
+                    "entry_price": signal["entry_price"],
                     "bar_open": _number(candles[index].open),
                     "bar_high": _number(candles[index].high),
                     "bar_low": _number(candles[index].low),
-                    "ema_fast": _number(result.ema_fast),
-                    "ema_slow": _number(result.ema_slow),
-                    "rsi": _number(result.rsi),
-                    "atr": _number(result.atr),
-                    "signal_reasons": " | ".join(result.reasons),
+                    "atr": signal["atr"],
+                    "signal_reasons": signal["reasons"],
+                    "structure_version": "OTE_STRUCTURE_V1",
+                    "internal_bias": signal.get("h1_bias", ""),
+                    "internal_reference_high": signal.get("impulse_extreme", "") if action == "BUY" else "",
+                    "internal_reference_low": signal.get("impulse_extreme", "") if action == "SELL" else "",
+                    "internal_break": signal.get("setup_break", ""),
+                    "swing_bias": signal.get("h4_bias", ""),
+                    "swing_reference_high": signal.get("impulse_extreme", "") if action == "BUY" else signal.get("anchor_price", ""),
+                    "swing_reference_low": signal.get("anchor_price", "") if action == "BUY" else signal.get("impulse_extreme", ""),
+                    "swing_break": signal.get("setup_break", ""),
+                    "liquidity_reference_high": signal.get("anchor_price", "") if action == "SELL" else signal.get("impulse_extreme", ""),
+                    "liquidity_reference_low": signal.get("anchor_price", "") if action == "BUY" else signal.get("impulse_extreme", ""),
+                    "bsl_sweep": aligned_sweep if action == "SELL" else "0",
+                    "ssl_sweep": aligned_sweep if action == "BUY" else "0",
+                    "fvg_direction": fvg_direction,
                     "bar_tick_volume": str(_integer(source, "bar_tick_volume")),
                     "tick_count": str(_integer(source, "tick_count")),
                     "tick_rate_per_sec": _number(_float(source, "tick_rate_per_sec")),
@@ -537,7 +574,7 @@ def build_fx_observations(
                     "point": _number(point),
                     "spread_cost": _number(spread_cost),
                     "spread_cost_atr": _number(
-                        spread_cost / result.atr if result.atr > 0 else None
+                        spread_cost / _float(signal, "atr") if _float(signal, "atr") > 0 else None
                     ),
                     "realized_abs_move_points": _number(
                         _float(source, "realized_abs_move_points")
@@ -557,11 +594,10 @@ def build_fx_observations(
                     "tick_copy_status": source.get("tick_copy_status", "").upper(),
                 }
             )
-            observation.update(_structure_fields(structure))
-            observation["labels"] = "|".join(sorted(_research_labels(observation)))
-            if include_forward_outcomes:
-                _apply_forward_outcomes(observation, candles, index)
-            output.append(observation)
+        observation["labels"] = "|".join(sorted(_research_labels(observation)))
+        if include_forward_outcomes:
+            _apply_forward_outcomes(observation, candles, index)
+        output.append(observation)
 
     output.sort(key=lambda row: (row["signal_time"], row["symbol"]))
     return output
@@ -759,7 +795,7 @@ def main() -> int:
         print(f"FX research failed: {exc}")
         return 1
 
-    print("TradeMind v1.4.2 FX research stream")
+    print("TradeMind v1.5.1 SMC/OTE FX research stream")
     print(f"Canonical source rows: {summary.source_rows}")
     print(f"Healthy FX M5 rows: {summary.fx_rows}")
     print(f"Research observations: {summary.observations}")

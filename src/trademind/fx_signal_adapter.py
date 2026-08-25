@@ -1,8 +1,9 @@
 """Adapt existing FX research observations into v1.16 shadow signal candidates.
 
-The adapter reuses the market data already collected by TradeMind: structure,
-liquidity, FVG, Fibonacci/OTE, volume, momentum, ATR, spread and session. It
-creates deterministic candidate passports before any evidence gate is applied.
+The adapter accepts only rows emitted by the existing SMC/OTE engine and reuses
+their structure, liquidity, FVG, Fibonacci/OTE, volume, impulse, ATR, spread
+and session evidence. It creates deterministic candidate passports before any
+evidence gate is applied.
 It does not use grid robots as signal sources and does not publish or trade.
 """
 
@@ -22,6 +23,7 @@ from trademind.signal_intelligence import EntryOrder, SignalCandidate, TradePlan
 ADAPTER_VERSION = "1.16.0"
 VALID_ACTIONS = {"BUY", "SELL"}
 FIB_OTE_LEVELS = (0.618, 0.705, 0.790)
+AUTHORITATIVE_SIGNAL_SOURCE = "trademind.ote_engine.build_ote_signals"
 
 
 def _text(row: Mapping[str, Any], *keys: str) -> str:
@@ -76,6 +78,14 @@ def _market_geometry(row: Mapping[str, Any], action: str) -> tuple[float, float,
     if entry is None or entry <= 0 or atr is None or atr <= 0:
         raise ValueError("entry_price and ATR are required")
 
+    anchor = _number(row, "anchor_price")
+    extreme = _number(row, "impulse_extreme")
+    if anchor is not None and extreme is not None:
+        protected_low = min(anchor, extreme)
+        protected_high = max(anchor, extreme)
+        if protected_low > 0 and protected_low < protected_high:
+            return entry, protected_low, protected_high
+
     lows = (
         _number(row, "swing_reference_low"),
         _number(row, "internal_reference_low"),
@@ -108,7 +118,7 @@ def _build_plan(row: Mapping[str, Any], action: str) -> tuple[TradePlan, dict[st
         EntryOrder(
             price=entry,
             allocation=0.50,
-            rationale="Market confirmation entry from the research signal close",
+            rationale="Market entry from the authoritative SMC/OTE signal",
             order_type="MARKET",
         )
     ]
@@ -177,10 +187,10 @@ def _factor_scores(
     action: str,
     geometry: Mapping[str, float],
 ) -> tuple[dict[str, float], dict[str, tuple[str, ...]]]:
-    swing_bias = _text(row, "swing_bias")
-    internal_bias = _text(row, "internal_bias")
-    swing_break = _text(row, "swing_break")
-    internal_break = _text(row, "internal_break")
+    swing_bias = _text(row, "h4_bias", "swing_bias")
+    internal_bias = _text(row, "h1_bias", "internal_bias")
+    swing_break = _text(row, "setup_break", "swing_break")
+    internal_break = _text(row, "setup_break", "internal_break")
     structure_parts = (
         0.30 * _aligned(action, swing_bias)
         + 0.25 * _aligned(action, internal_bias)
@@ -188,7 +198,7 @@ def _factor_scores(
         + 0.20 * _aligned(action, internal_break)
     )
 
-    aligned_sweep = _truthy(row, "ssl_sweep") if action == "BUY" else _truthy(row, "bsl_sweep")
+    aligned_sweep = _truthy(row, "liquidity_sweep")
     sweep_depth = (
         _number(row, "ssl_sweep_depth_atr")
         if action == "BUY"
@@ -215,20 +225,8 @@ def _factor_scores(
         + 0.25 * pressure_aligned
     )
 
-    ema_fast = _number(row, "ema_fast")
-    ema_slow = _number(row, "ema_slow")
-    ema_aligned = False
-    if ema_fast is not None and ema_slow is not None:
-        ema_aligned = ema_fast > ema_slow if action == "BUY" else ema_fast < ema_slow
-    body_efficiency = _number(row, "body_efficiency_ratio_20") or 0.0
-    signal_confidence = (_number(row, "confidence") or 0.0) / 100.0
-    if signal_confidence <= 0:
-        signal_confidence = (_number(row, "score") or 0.0) / 100.0
-    momentum_score = (
-        0.35 * ema_aligned
-        + 0.35 * _clamp(body_efficiency / 1.50)
-        + 0.30 * _clamp(signal_confidence)
-    )
+    impulse_atr = _number(row, "impulse_atr") or 0.0
+    momentum_score = 1.0 if impulse_atr >= 1.5 else 0.0
 
     atr = _number(row, "atr") or 0.0
     spread_cost_atr = _number(row, "spread_cost_atr") or 1.0
@@ -286,8 +284,7 @@ def _factor_scores(
             f"pressure_aligned={int(pressure_aligned)}",
         ),
         "momentum": (
-            f"ema_aligned={int(ema_aligned)}",
-            f"body_efficiency={body_efficiency:.3f}",
+            f"ote_impulse_atr={impulse_atr:.3f}",
         ),
         "volatility": (
             f"atr={atr:.8f}",
@@ -345,13 +342,9 @@ def _market_features(
             "tick_rate_ratio_20": _number(row, "tick_rate_ratio_20") or 0.0,
         },
         "momentum": {
-            "ema_fast": _number(row, "ema_fast"),
-            "ema_slow": _number(row, "ema_slow"),
-            "rsi": _number(row, "rsi"),
+            "impulse_atr": _number(row, "impulse_atr") or 0.0,
             "body_efficiency_ratio_20": _number(row, "body_efficiency_ratio_20") or 0.0,
             "range_efficiency_ratio_20": _number(row, "range_efficiency_ratio_20") or 0.0,
-            "source_score": _number(row, "score") or 0.0,
-            "source_confidence": _number(row, "confidence") or 0.0,
         },
         "volatility": {
             "atr": _number(row, "atr") or 0.0,
@@ -396,6 +389,8 @@ def _market_features(
 
 
 def _setup_family(row: Mapping[str, Any], action: str, geometry: Mapping[str, float]) -> str:
+    if _text(row, "signal_source") == AUTHORITATIVE_SIGNAL_SOURCE:
+        return "SMC_OTE_PIVOT_BREAK"
     aligned_sweep = _truthy(row, "ssl_sweep") if action == "BUY" else _truthy(row, "bsl_sweep")
     fvg_aligned = _aligned(action, _text(row, "fvg_direction"))
     retracement = geometry["current_retracement"]
@@ -414,6 +409,10 @@ def build_candidate(
     *,
     provenance: tuple[str, ...] | None = None,
 ) -> SignalCandidate:
+    if _text(row, "signal_source") != AUTHORITATIVE_SIGNAL_SOURCE:
+        raise ValueError("row is not from the authoritative OTE signal source")
+    if not _text(row, "ote_signal_id", "signal_id") or not _text(row, "variant"):
+        raise ValueError("authoritative OTE signal identity is incomplete")
     action = _text(row, "action").upper()
     if action not in VALID_ACTIONS:
         raise ValueError("observation action is not BUY/SELL")
@@ -442,8 +441,8 @@ def build_candidate(
         factor_scores=scores,
         factor_reasons=reasons,
         provenance=provenance or (
-            "FX_RESEARCH_V1_4_2",
-            "SMC_STRUCTURE_ENGINE",
+            "FX_OTE_SIGNAL_SOURCE_V1",
+            "OTE_ENGINE_BUILD_OTE_SIGNALS",
             "TICK_VOLUME_COLLECTOR",
             f"FX_SIGNAL_ADAPTER_{ADAPTER_VERSION}",
         ),

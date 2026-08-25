@@ -282,9 +282,8 @@ def _market_html(candidate: Mapping[str, Any]) -> str:
     <p><span>Tick-rate ratio</span><b>{_market_value(volume.get('tick_rate_ratio'), 2)}</b></p>
   </section>
   <section><small>Market State</small><h4>Импульс и ATR</h4>
-    <p><span>RSI</span><b>{_market_value(momentum.get('rsi'), 1)}</b></p>
-    <p><span>EMA fast</span><b>{_market_value(momentum.get('ema_fast'), 5)}</b></p>
-    <p><span>EMA slow</span><b>{_market_value(momentum.get('ema_slow'), 5)}</b></p>
+    <p><span>Impulse / ATR</span><b>{_market_value(momentum.get('impulse_atr'), 2)}</b></p>
+    <p><span>Body efficiency</span><b>{_market_value(momentum.get('body_efficiency_ratio_20'), 2)}</b></p>
     <p><span>ATR</span><b>{_market_value(volatility.get('atr'), 5)}</b></p>
     <p><span>Spread / ATR</span><b>{_market_value(volatility.get('spread_cost_atr'), 3)}</b></p>
   </section>

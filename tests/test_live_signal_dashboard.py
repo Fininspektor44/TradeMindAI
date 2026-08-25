@@ -65,9 +65,7 @@ def _candidate() -> SignalCandidate:
                 "tick_rate_ratio_20": 1.4,
             },
             "momentum": {
-                "ema_fast": 1.101,
-                "ema_slow": 1.100,
-                "rsi": 58.0,
+                "impulse_atr": 1.8,
                 "body_efficiency_ratio_20": 1.3,
             },
             "volatility": {

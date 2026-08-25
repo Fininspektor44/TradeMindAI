@@ -21,8 +21,8 @@ signals, or write to live candidate/outcome journals.
    closed, and merged bars pass integrity validation are canonical `bars.csv`
    plus `manifest.json` atomically published under
    `data/ser8_historical_market_data/<dataset_sha256>/`.
-4. `replay_ser8_historical_data.py` reuses the production `SignalEngine`,
-   `MarketStructureEngine`, FX candidate adapter, and conservative shadow
+4. `replay_ser8_historical_data.py` reuses the authoritative
+   `ote_engine.build_ote_signals`, FX candidate adapter, and conservative shadow
    outcome evaluator. It writes only below `data/ser8_historical_replay/`.
 5. `discover_ser8_symbol_universe.py --historical-inventory ...` consumes the
    hash-verified replay readiness inventory. A legacy `symbol,rows` CSV proves

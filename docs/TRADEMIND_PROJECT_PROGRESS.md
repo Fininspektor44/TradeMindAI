@@ -4,6 +4,54 @@ Concise, running log of the SER8 historical-data/research pipeline's
 authoritative state. Not a replacement for the detailed design docs in
 this directory -- links only, no raw logs duplicated here.
 
+## SMC/OTE signal architecture: ACTIVE
+
+The Claude repository audit confirmed the root cause: the retired
+`SignalEngine` supplied both primary FX direction and secondary candidate
+scoring inputs through EMA/RSI-derived action, confidence, and source-score
+fields. That contaminated both historical replay and the live FX candidate
+path.
+
+The legacy container and its models are retired and deleted. The sole
+authoritative FX directional source is now
+`trademind.ote_engine.build_ote_signals`. Its confirmed-pivot close-break,
+minimum-impulse, OTE geometry, confirmation, structure/FVG, and liquidity
+semantics are unchanged. A bar population with no valid OTE signal emits no
+observation and no candidate. Market structure and ATR cannot manufacture a
+direction.
+
+Verified architecture chains:
+
+- Historical M5 bars -> `build_ote_signals` -> SMC/OTE BUY/SELL -> candidate
+  -> conservative replay.
+- Live closed FX M5 bars -> `build_ote_signals` -> candidate -> existing
+  evidence, passport, risk, and execution-authorization chain.
+
+ATR remains deterministic volatility/risk normalization with zero independent
+directional authority. Its implementation lives in the neutral
+`trademind.volatility` utility.
+
+The previous 28-symbol screening and 28x4 execution-geometry result layers are
+**SUPERSEDED / INVALID FOR THE TARGET SIGNAL ARCHITECTURE** because their
+candidate populations came from the removed EMA/RSI architecture. Their
+candidates, outcomes, rankings, and conclusions must not be reused. Replay
+manifests now carry `SMC_OTE_BUILD_OTE_SIGNALS_V1`; verification rejects old
+manifests as superseded. Geometry evaluation fails closed when a corrected
+candidate/outcome population is absent.
+
+Raw broker historical datasets remain preserved and the acquisition layer
+remains closed/frozen. No MT5 reacquisition is authorized. The protected
+holdout was not accessed. The accepted EURUSD hypothesis
+`rpi-v1:sha256:205b5260711f7578a59cef2feea59550b777b3df0956ffd192076b37c4e5866d:0`
+remains unchanged, unconsumed, and outside this cleanup.
+
+Historical documentation exception: this section is the sole current
+documentation location that names EMA/RSI, only to record removal and
+supersession of the legacy architecture.
+
+Cleanup verification on macOS: focused architecture tests 29 passed; related
+runtime/replay/UI tests 144 passed; full project gate 2481 passed, 0 failed.
+
 ## Historical acquisition layer: CLOSED
 
 Full C3 Windows verification passed on the authoritative source commit.
@@ -29,7 +77,7 @@ modify chunk acquisition, coverage discovery, or dataset identity. See
   (MT5-only, verified `last_error()` Success) pre-history sentinel
   classification, closing the acquisition layer. Pushed.
 
-## Multi-symbol historical screening (SCREENING ONLY)
+## Multi-symbol historical screening: SUPERSEDED / INVALID
 
 Additive aggregation/ranking layer over the existing, unmodified replay
 engine (`create_replay` / `build_research_readiness_inventory`). Never a
@@ -72,7 +120,7 @@ with an asymmetric-fill pattern (winners often exit on the initial MARKET
 allocation alone; losers more often have one or both LIMIT add-ons filled
 before hitting stop).
 
-## Execution geometry A/B experiment (SCREENING ONLY)
+## Execution geometry A/B experiment: SUPERSEDED / INVALID
 
 Additive, read-only counterfactual layer testing whether the existing
 MARKET+LIMIT+LIMIT basket geometry is the structural cause of the negative
@@ -144,8 +192,9 @@ gate: 2479 passed, 0 failed.
 
 ## NEXT ACTION
 
-Windows pull this hardening commit and rerun the real 28-symbol x 4-variant
-execution-geometry experiment over the existing historical datasets only
-(no historical reacquisition, no MT5 calls), with checkpoint/resume active
-by default so any future interruption after the expensive per-symbol
-evaluation work no longer loses it.
+Run a corrected 28-symbol historical replay from the preserved raw broker M5
+datasets through `ote_engine.build_ote_signals`, then build a new screening
+candidate/outcome population. Do not reacquire data, call MT5, access the
+protected holdout, consume the accepted EURUSD hypothesis, or reuse any
+candidate/outcome artifact from the superseded result layers. A new execution-
+geometry experiment may be considered only after that corrected replay exists.

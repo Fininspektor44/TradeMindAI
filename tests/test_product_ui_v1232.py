@@ -16,8 +16,7 @@ def _candidate() -> dict[str, object]:
         "state": "PENDING_GATE",
         "setup_family": "MULTIFACTOR_MARKET_SETUP",
         "scenario": (
-            "EMA fast is below EMA slow | Price is below EMA slow | "
-            "RSI confirms bearish momentum | Latest candle closed higher; "
+            "valid SMC impulse and OTE geometry | H1 aligned | BULLISH_BOS; "
             "ALL_SIGNALS, LOW_SPREAD, NORMAL_VOLUME, STRUCTURE_CONFLICT"
         ),
         "quality_score": None,
@@ -69,7 +68,7 @@ def _candidate() -> dict[str, object]:
                 "imbalance": -0.01,
                 "tick_rate_ratio": 0.83,
             },
-            "momentum": {"rsi": 35.4, "ema_fast": 0.58732, "ema_slow": 0.58745},
+            "momentum": {"impulse_atr": 1.7, "body_efficiency_ratio_20": 1.1},
             "volatility": {"atr": 0.00021, "spread_cost_atr": 0.079},
             "confirmation": {"fvg": "NONE"},
         },
@@ -125,16 +124,15 @@ def _payload(candidate: dict[str, object]) -> dict[str, object]:
     }
 
 
-def test_translates_research_sentence_and_internal_codes() -> None:
+def test_translates_ote_sentence_and_internal_codes() -> None:
     translated = translate_explanation(
-        "EMA fast is below EMA slow | Price is below EMA slow | "
-        "RSI confirms bearish momentum; ALL_SIGNALS, LOW_SPREAD, "
+        "valid SMC impulse and OTE geometry | H1 aligned | BULLISH_BOS; "
+        "ALL_SIGNALS, LOW_SPREAD, "
         "NORMAL_VOLUME, STRUCTURE_CONFLICT"
     )
 
-    assert "Быстрая EMA ниже медленной" in translated
-    assert "Цена находится ниже медленной EMA" in translated
-    assert "RSI подтверждает медвежий импульс" in translated
+    assert "OTE" in translated
+    assert "BULLISH" not in translated
     assert "основные сигнальные условия соблюдены" in translated
     assert "конфликт структуры" in translated
     assert "STRUCTURE_CONFLICT" not in translated
@@ -155,12 +153,12 @@ def test_render_hides_english_explanations_and_raw_codes() -> None:
     candidate = _localize_candidate(_candidate())
     page = render(_payload(candidate))
 
-    assert "Быстрая EMA ниже медленной" in page
+    assert "OTE" in page
     assert "Старший уклон" in page
     assert "Съём ликвидности снизу" in page
     assert "Фильтр публикации" in page
     assert "Данные о корреляции портфеля пока не подключены" in page
-    assert "EMA fast is below EMA slow" not in page
+    assert "BULLISH_BOS" not in page
     assert "STRUCTURE_CONFLICT" not in page
     assert "Swing bias" not in page
     assert "Publication gate" not in page

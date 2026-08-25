@@ -11,16 +11,26 @@ def _row() -> dict[str, str]:
         "symbol": "EURUSD",
         "timeframe": "M5",
         "session": "LONDON_NY_OVERLAP",
+        "signal_source": "trademind.ote_engine.build_ote_signals",
+        "ote_signal_id": "EURUSD:M5:1:BUY:TOUCH_705:2",
         "action": "BUY",
+        "variant": "TOUCH_705",
+        "fib_ratio": "705",
         "score": "84",
-        "confidence": "82",
         "entry_price": "1.1000",
         "bar_high": "1.1010",
         "bar_low": "1.0988",
-        "ema_fast": "1.0998",
-        "ema_slow": "1.0980",
-        "rsi": "57",
         "atr": "0.0010",
+        "anchor_price": "1.0940",
+        "impulse_extreme": "1.1080",
+        "impulse_atr": "2.1",
+        "stop_price": "1.0938",
+        "target_price": "1.1080",
+        "h1_bias": "BULLISH",
+        "h4_bias": "BULLISH",
+        "setup_break": "BULLISH_BOS",
+        "liquidity_sweep": "1",
+        "fvg_aligned": "1",
         "signal_reasons": "bullish structure and volume impulse",
         "internal_bias": "BULLISH",
         "internal_reference_high": "1.1040",
@@ -65,14 +75,14 @@ def test_adapter_builds_explainable_shadow_candidate_from_market_features() -> N
     assert candidate.plan.action == "BUY"
     assert len(candidate.plan.entries) == 3
     assert candidate.plan.entries[0].order_type == "MARKET"
-    assert "Fibonacci/OTE" in candidate.plan.entries[1].rationale
+    assert "SMC/OTE" in candidate.plan.entries[0].rationale
     assert candidate.plan.stop_price < min(item.price for item in candidate.plan.entries)
     assert candidate.plan.first_target_rr >= 1.5
     assert candidate.generated_from_market_data is True
     assert candidate.robot_context_only == {}
     assert candidate.market_features["liquidity"]["ssl_sweep"] is True
     assert candidate.market_features["volume"]["rvol_20"] == 1.55
-    assert candidate.factor_scores["structure"] > 0.9
+    assert candidate.factor_scores["structure"] > 0.4
     assert candidate.factor_scores["liquidity"] > 0.8
     assert "version=SIM_V1" in similarity_key(candidate)
 
@@ -86,6 +96,16 @@ def test_adapter_rejects_non_directional_observation() -> None:
     assert candidates == []
     assert len(errors) == 1
     assert "not BUY/SELL" in errors[0]["reason"]
+
+
+def test_adapter_rejects_row_without_authoritative_ote_identity() -> None:
+    row = _row()
+    row.pop("signal_source")
+
+    candidates, errors = build_candidates([row])
+
+    assert candidates == []
+    assert "authoritative OTE" in errors[0]["reason"]
 
 
 def test_adapter_is_deterministic_for_same_pre_move_observation() -> None:

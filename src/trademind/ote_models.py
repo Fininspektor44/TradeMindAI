@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from trademind.market.models import Candle
+from trademind.volatility import average_true_range_series
 
 SCHEMA_VERSION = "1.5.0"
 DEFAULT_SYMBOLS = (
@@ -175,14 +176,7 @@ def candle_from_row(row: dict[str, str], offset: int) -> Candle:
 
 
 def atr_series(candles: Sequence[Candle], period: int = 14) -> list[float]:
-    output: list[float] = []
-    ranges: list[float] = []
-    for index, candle in enumerate(candles):
-        previous = candles[index - 1].close if index else candle.close
-        ranges.append(max(candle.high - candle.low, abs(candle.high - previous), abs(candle.low - previous)))
-        window = ranges[max(0, len(ranges) - period):]
-        output.append(sum(window) / len(window))
-    return output
+    return average_true_range_series(candles, period)
 
 
 def confirmed_pivots(candles: Sequence[Candle], window: int = 2) -> tuple[list[Pivot], list[Pivot]]:

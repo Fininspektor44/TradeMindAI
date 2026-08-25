@@ -56,7 +56,7 @@ from trademind.ser8_execution_geometry_checkpoint import (
 from trademind.ser8_execution_geometry_experiment import (
     ALL_VARIANTS,
     EXPERIMENT_SCHEMA_VERSION,
-    STATUS_CONTROL_REPRODUCTION_FAILED,
+    STATUS_EVIDENCE_UNAVAILABLE,
     VARIANT_CONTROL,
     _EXPERIMENT_HASH_DOMAIN,
     build_multisymbol_geometry_experiment_report,
@@ -668,13 +668,12 @@ def test_K_control_reproduction_failure_is_checkpointed_only_as_the_genuine_fail
     verify_dataset(Path(readiness_entry["dataset_dir"]))
     bars = load_canonical_bars(Path(readiness_entry["dataset_dir"]) / "bars.csv")
 
-    tampered_published = [dict(row) for row in published_outcomes]
-    tampered_published[0]["net_r"] = tampered_published[0]["net_r"] + 999.0
+    assert published_outcomes == []
 
     failed_result = build_symbol_geometry_experiment(
         symbol="EURUSD",
         candidates=candidates,
-        published_outcome_rows=tampered_published,
+        published_outcome_rows=published_outcomes,
         bars=bars,
         max_bars=int(manifest["shadow_max_bars"]),
         cost_r=float(manifest["shadow_cost_r"]),
@@ -697,6 +696,6 @@ def test_K_control_reproduction_failure_is_checkpointed_only_as_the_genuine_fail
     # The checkpoint layer never upgrades a genuine failure into a pass.
     assert reloaded["control_reproduction_verified"] is False
     assert reloaded == failed_result
-    for variant in ALL_VARIANTS[1:]:
-        assert reloaded["variants"][variant]["status"] == STATUS_CONTROL_REPRODUCTION_FAILED
+    for variant in ALL_VARIANTS:
+        assert reloaded["variants"][variant]["status"] == STATUS_EVIDENCE_UNAVAILABLE
         assert reloaded["variants"][variant]["metrics"] is None

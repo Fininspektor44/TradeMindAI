@@ -241,9 +241,6 @@ def _market_features(row: Mapping[str, Any], action: str) -> dict[str, dict[str,
         "momentum": {
             "h1_return_pct": h1_return,
             "m15_return_pct": m15_return,
-            "ema_fast": None,
-            "ema_slow": None,
-            "rsi": None,
         },
         "volatility": {
             "atr": None,

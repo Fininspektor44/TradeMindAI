@@ -664,22 +664,17 @@ def test_full_report_reuses_real_replay_engine_and_includes_every_ready_symbol(
     by_symbol = {entry["symbol"]: entry for entry in report["entries"]}
     assert set(by_symbol) == {"EURUSD", "AUDNZD", "GBPCHF"}
 
-    # EURUSD: real replay through the unmodified engine, >=300 outcomes -> SCREENED.
-    assert by_symbol["EURUSD"]["screening_status"] == STATUS_SCREENED
+    # The old trending fixture does not contain a valid OTE pivot-break setup;
+    # it must not be converted into a candidate by volatility or structure.
+    assert by_symbol["EURUSD"]["screening_status"] == STATUS_NO_COMPLETED_OUTCOMES
     eurusd_metrics = by_symbol["EURUSD"]["metrics"]
-    assert eurusd_metrics["trade_count"] >= 300
-    assert by_symbol["EURUSD"]["signal_count"] > 0
-    # Every real candidate's plan.action is BUY or SELL (TradePlan enforces
-    # this at construction), so long_count/short_count must fully account for
-    # every trade -- proving the real plan.action-based resolver actually
-    # populates direction counts instead of the previous BUY=0/SELL=0 defect.
-    assert eurusd_metrics["long_count"] + eurusd_metrics["short_count"] == eurusd_metrics["trade_count"]
-    assert eurusd_metrics["long_count"] > 0
+    assert eurusd_metrics is None
+    assert by_symbol["EURUSD"]["signal_count"] == 0
 
     # AUDNZD: below the 103-row acquisition floor is impossible here (bars
     # accepted), but 120 rows is far below the 300-outcome research minimum
     # -> real replay runs but is not research-ready.
-    assert by_symbol["AUDNZD"]["screening_status"] == STATUS_INSUFFICIENT_SAMPLE
+    assert by_symbol["AUDNZD"]["screening_status"] == STATUS_NO_COMPLETED_OUTCOMES
     assert by_symbol["AUDNZD"]["rejection_reason"]
 
     # GBPCHF: HISTORICAL_DATA_READY but LONGONLY trade mode falls outside the

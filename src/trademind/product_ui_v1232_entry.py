@@ -11,8 +11,6 @@ from typing import Any, Mapping, Sequence
 from trademind import product_ui_v1232 as ui
 
 PRESERVED_MARKET_TERMS = {
-    "EMA": "EMA",
-    "RSI": "RSI",
     "ATR": "ATR",
     "FVG": "FVG",
     "OTE": "OTE",

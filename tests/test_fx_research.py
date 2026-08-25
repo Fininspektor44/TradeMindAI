@@ -11,6 +11,7 @@ from trademind.fx_research import (
     session_for_time,
     validate_fx_observations,
 )
+from test_smc_ote import _synthetic_rows
 
 
 def _volume_row(index: int, *, symbol: str = "EURUSD") -> dict[str, str]:
@@ -68,24 +69,28 @@ def test_session_boundaries_are_stable_utc() -> None:
     assert session_for_time(day.replace(hour=21)) == "OFF_HOURS"
 
 
-def test_fx_observations_use_existing_engines_and_charge_spread() -> None:
-    rows = [_volume_row(index) for index in range(50)]
+def test_fx_observations_are_ote_only_and_charge_spread() -> None:
+    rows = _synthetic_rows()
 
     observations = build_fx_observations(rows)
 
-    assert len(observations) == 20
+    assert observations
+    assert {row["action"] for row in observations} == {"BUY", "SELL"}
+    assert all(
+        row["signal_source"] == "trademind.ote_engine.build_ote_signals"
+        for row in observations
+    )
     first = observations[0]
     assert first["symbol"] == "EURUSD"
-    assert first["action"] == "BUY"
     assert "ALL_SIGNALS" in first["labels"].split("|")
-    assert "HIGH_RVOL" in first["labels"].split("|")
-    assert first["outcome_3"] == "WIN"
+    assert first["outcome_3"] in {"WIN", "LOSS", "FLAT"}
 
     entry = float(first["entry_price"])
     future_close = float(first["exit_price_3"])
     spread_cost = float(first["spread_cost"])
     assert float(first["net_move_3"]) == pytest.approx(
-        (future_close - entry) - spread_cost
+        (1.0 if first["action"] == "BUY" else -1.0) * (future_close - entry)
+        - spread_cost
     )
 
 

@@ -1,7 +1,7 @@
 """Deterministic, read-only cross-symbol SCREENING report for SER8.
 
-SCREENING ONLY. Applying the existing SignalEngine / MarketStructureEngine /
-FX candidate adapter / conservative shadow evaluator to a broader FX universe
+SCREENING ONLY. Applying the historical candidate population and conservative
+shadow evaluator to a broader FX universe
 is generalization evidence, not acceptance. This module never creates,
 matches, or accepts a hypothesis; never reads or consumes a protected final
 holdout; and never grants any symbol execution authority. The already
@@ -12,7 +12,7 @@ is never touched, widened, or recreated by anything here.
 Every metric in this report is derived exclusively from the ALREADY-computed,
 content-addressed, atomically-published ``candidates.jsonl``/``outcomes.jsonl``
 replay artifacts that ``trademind.ser8_historical_replay.create_replay``
-produces. This module never touches raw bars, never re-runs SignalEngine or
+produces. This module never touches raw bars, never regenerates signals or
 the shadow evaluator, and never changes dataset or replay identity — it is a
 pure, additive AGGREGATION and RANKING layer over already-verified evidence.
 
@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path

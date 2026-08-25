@@ -18,8 +18,8 @@ bars under four execution-geometry variants:
   MARKET_ONLY_2_0R          -- one MARKET entry, same stop, target
                                 recomputed at 2.0R from the market entry.
 
-This module NEVER regenerates signals -- trademind.signals.SignalEngine and
-trademind.fx_signal_adapter.build_candidate are never called here; every
+This module NEVER regenerates signals -- the authoritative signal builder and
+candidate adapter are never called here; every
 candidate is loaded verbatim from the already-published, hash-verified
 candidates.jsonl. It NEVER re-runs historical acquisition, NEVER calls MT5
 or a broker, NEVER reads or writes the protected hypothesis/holdout
@@ -318,6 +318,25 @@ def build_symbol_geometry_experiment(
     replay outcomes. If CONTROL cannot reproduce them, every other variant
     is reported as CONTROL_REPRODUCTION_FAILED with metrics=None -- never
     interpreted, never fabricated."""
+    if not candidates or not published_outcome_rows:
+        detail = "corrected SMC/OTE candidate and outcome population is unavailable"
+        return {
+            "symbol": symbol,
+            "control_reproduction_verified": False,
+            "control_reproduction_detail": detail,
+            "variants": {
+                variant: {
+                    "symbol": symbol,
+                    "variant": variant,
+                    "candidate_count": len(candidates),
+                    "status": STATUS_EVIDENCE_UNAVAILABLE,
+                    "metrics": None,
+                    "comparative": None,
+                }
+                for variant in ALL_VARIANTS
+            },
+        }
+
     control_candidate_rows, control_outcome_rows, control_skipped = evaluate_variant_for_symbol(
         candidates=candidates, bars=bars, variant=VARIANT_CONTROL, max_bars=max_bars, cost_r=cost_r
     )

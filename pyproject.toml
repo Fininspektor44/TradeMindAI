@@ -75,7 +75,7 @@ trademind-mt5-prospective-monitor = "trademind.mt5_prospective_monitor:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["trademind", "trademind.market", "trademind.signals", "trademind.structure", "trademind.orchestrator", "trademind.discovery"]
+packages = ["trademind", "trademind.market", "trademind.structure", "trademind.orchestrator", "trademind.discovery"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

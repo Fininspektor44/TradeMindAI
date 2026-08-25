@@ -94,8 +94,8 @@ A broken or stale symbol does not block analysis of the remaining healthy symbol
 
 1. Configuration and logging
 2. Mock market-data provider
-3. EMA, RSI and ATR signal engine
-4. BUY / SELL / WAIT scoring
+3. SMC/OTE directional signal source with ATR volatility normalization
+4. Fail-closed BUY / SELL candidate generation
 5. MT5 CSV candle provider
 6. Read-only MQL5 candle exporters
 7. Hidden Windows live watchers and automatic startup

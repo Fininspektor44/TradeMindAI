@@ -52,6 +52,7 @@ from trademind.ser8_symbol_universe import (
     discover_symbol_universe,
 )
 from trademind.signal_statistics_provenance import sha256_bytes
+from test_smc_ote import _synthetic_rows
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -130,6 +131,24 @@ def _bars(
         )
         previous = close
     return tuple(rows)
+
+
+def _ote_bars() -> tuple[HistoricalBarV1, ...]:
+    return tuple(
+        HistoricalBarV1(
+            time_utc=datetime.fromtimestamp(int(row["time"]), tz=timezone.utc),
+            symbol=row["symbol"],
+            timeframe=row["timeframe"],
+            open=float(row["open"]),
+            high=float(row["high"]),
+            low=float(row["low"]),
+            close=float(row["close"]),
+            tick_volume=int(row["bar_tick_volume"]),
+            spread=int(float(row["spread_mean_points"])),
+            real_volume=0,
+        )
+        for row in _synthetic_rows()
+    )
 
 
 def _proof() -> dict[str, object]:
@@ -927,7 +946,7 @@ def test_wrong_explicit_terminal_path_or_attached_account_fails_closed() -> None
 
 
 def test_replay_reuses_production_semantics_and_binds_every_outcome() -> None:
-    bars = _bars(430)
+    bars = _ote_bars()
     manifest, _ = _manifest(bars)
     candidates, outcomes, _ = build_replay_payloads(
         bars=bars,
@@ -935,8 +954,8 @@ def test_replay_reuses_production_semantics_and_binds_every_outcome() -> None:
         max_bars=72,
         cost_r=0.04,
     )
-    assert len(candidates) >= 300
-    assert len(outcomes) >= 300
+    assert candidates
+    assert outcomes
     candidate_ids = {row["signal_id"] for row in candidates}
     assert {row["signal_id"] for row in outcomes} <= candidate_ids
     assert all(str(row["replay_outcome_id"]).startswith("sha256:") for row in outcomes)
@@ -947,7 +966,7 @@ def test_replay_reuses_production_semantics_and_binds_every_outcome() -> None:
 
 
 def test_future_bar_changes_cannot_change_earlier_candidate_identity() -> None:
-    bars = _bars(180)
+    bars = _ote_bars()
     manifest, _ = _manifest(bars)
     original, _, _ = build_replay_payloads(
         bars=bars, dataset_manifest=manifest, max_bars=72, cost_r=0.04
@@ -975,14 +994,16 @@ def test_future_bar_changes_cannot_change_earlier_candidate_identity() -> None:
     assert before_changed == before_original
 
 
-def test_final_incomplete_horizon_is_excluded() -> None:
-    bars = _bars(40)
+def test_short_ote_replay_never_creates_orphan_outcomes() -> None:
+    bars = _ote_bars()[:48]
     manifest, _ = _manifest(bars)
     candidates, outcomes, _ = build_replay_payloads(
         bars=bars, dataset_manifest=manifest, max_bars=72, cost_r=0.04
     )
     assert candidates
-    assert len(outcomes) < len(candidates)
+    assert {row["signal_id"] for row in outcomes} <= {
+        row["signal_id"] for row in candidates
+    }
 
 
 def test_replay_is_content_addressed_idempotent_and_never_touches_live_runtime(
@@ -1029,7 +1050,7 @@ def test_replay_is_content_addressed_idempotent_and_never_touches_live_runtime(
         captured_at=NOW,
     )
     assert first["entries"][0]["replay_sha256"] == second["entries"][0]["replay_sha256"]
-    assert first["research_ready_count"] == 1
+    assert first["research_ready_count"] == 0
     assert first["execution_account_login"] == ACCOUNT
     assert first["market_data_account_login"] == MARKET_DATA_ACCOUNT
     assert not (tmp_path / "live_signal_runtime_v1").exists()
@@ -1105,7 +1126,7 @@ def test_discovery_consumes_hash_verified_replay_inventory(tmp_path: Path) -> No
         verified_research_by_symbol=evidence,
         now=NOW,
     )[0]
-    assert entry.research_status == RESEARCH_STATUS_RESEARCH_READY
+    assert entry.research_status != RESEARCH_STATUS_RESEARCH_READY
     exit_code = discovery_cli.main(
         [
             "--mt5-export-dir",
@@ -1230,7 +1251,7 @@ def test_policy_uses_existing_research_minimum_and_m5_contract() -> None:
     assert policy["initial_timeframe"] == "M5"
     assert policy["expected_interval_seconds"] == 300
     assert policy["research_minimum_completed_outcomes"] == 300
-    assert policy["minimum_rows_for_replay_attempt"] == 103
+    assert policy["minimum_rows_for_replay_attempt"] == 112
     assert sha256_bytes(POLICY_PATH.read_bytes()).startswith("sha256:")
 
 

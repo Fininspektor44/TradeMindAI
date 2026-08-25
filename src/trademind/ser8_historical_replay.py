@@ -23,8 +23,8 @@ from typing import Mapping, Sequence
 
 import trademind.fx_research as fx_research_module
 import trademind.fx_signal_adapter as fx_adapter_module
+import trademind.ote_engine as ote_engine_module
 import trademind.signal_shadow as shadow_module
-import trademind.signals.engine as signal_engine_module
 import trademind.structure.engine as structure_engine_module
 from trademind.fx_research import build_fx_observations, validate_fx_observations
 from trademind.fx_signal_adapter import ADAPTER_VERSION, build_candidate
@@ -40,13 +40,13 @@ from trademind.signal_evidence import similarity_dimensions, similarity_key
 from trademind.signal_intelligence import candidate_from_dict
 from trademind.signal_shadow import Bar, evaluate_shadow_candidate
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
-from trademind.signals import SignalEngine
 from trademind.structure import MarketStructureEngine
 
 REPLAY_SCHEMA_VERSION = "ser8-historical-replay-v1"
 READINESS_SCHEMA_VERSION = "ser8-historical-research-readiness-v1"
 POLICY_SCHEMA_VERSION = "ser8-historical-research-policy-v1"
-REPLAY_VERSION = "1.0.0"
+REPLAY_VERSION = "1.1.0"
+SIGNAL_ARCHITECTURE = "SMC_OTE_BUILD_OTE_SIGNALS_V1"
 _REPLAY_HASH_DOMAIN = b"trademind:ser8:historical-replay:v1"
 _READINESS_HASH_DOMAIN = b"trademind:ser8:historical-research-readiness:v1"
 _OUTCOME_HASH_DOMAIN = b"trademind:ser8:historical-replay-outcome:v1"
@@ -116,7 +116,7 @@ def load_research_policy(path: Path) -> dict[str, object]:
             "REPLAY_POLICY_DRIFT",
             "policy research minimum no longer matches fx_research.validate_fx_observations",
         )
-    engine_minimum = max(SignalEngine().minimum_candles, MarketStructureEngine().minimum_candles)
+    engine_minimum = max(40, MarketStructureEngine().minimum_candles)
     expected_attempt_rows = engine_minimum + int(payload.get("shadow_max_bars", 0))
     if payload.get("minimum_rows_for_replay_attempt") != expected_attempt_rows:
         raise HistoricalDataError(
@@ -193,7 +193,7 @@ def code_provenance() -> dict[str, str]:
     modules = {
         "fx_research": fx_research_module,
         "fx_signal_adapter": fx_adapter_module,
-        "signal_engine": signal_engine_module,
+        "ote_engine": ote_engine_module,
         "market_structure_engine": structure_engine_module,
         "signal_shadow": shadow_module,
         "historical_replay": __import__(__name__, fromlist=["unused"]),
@@ -225,7 +225,7 @@ def build_replay_payloads(
     provenance = (
         f"SER8_HISTORICAL_REPLAY_{REPLAY_VERSION}",
         "MT5_COPY_RATES_RANGE_VERIFIED_SOURCE",
-        "FX_RESEARCH_SIGNAL_ENGINE_AND_STRUCTURE",
+        "AUTHORITATIVE_SMC_OTE_BUILD_OTE_SIGNALS",
         f"FX_SIGNAL_ADAPTER_{ADAPTER_VERSION}",
         "MT5_COPY_RATES_MICROSTRUCTURE_UNAVAILABLE_CONSERVATIVE_ZERO_CONTRIBUTION",
     )
@@ -341,6 +341,7 @@ def create_replay(
     provenance = code_provenance()
     identity = {
         "schema_version": REPLAY_SCHEMA_VERSION,
+        "signal_architecture": SIGNAL_ARCHITECTURE,
         "dataset_id": dataset_manifest["dataset_id"],
         "dataset_sha256": dataset_manifest["dataset_sha256"],
         "execution_account_login": dataset_manifest["execution_account_login"],
@@ -437,6 +438,11 @@ def verify_replay(replay_dir: Path) -> dict[str, object]:
         raise HistoricalDataError("REPLAY_MANIFEST_INVALID", f"invalid replay manifest: {replay_dir}") from exc
     if manifest.get("schema_version") != REPLAY_SCHEMA_VERSION:
         raise HistoricalDataError("REPLAY_SCHEMA_INVALID", f"unsupported replay schema: {replay_dir}")
+    if manifest.get("signal_architecture") != SIGNAL_ARCHITECTURE:
+        raise HistoricalDataError(
+            "REPLAY_SIGNAL_ARCHITECTURE_SUPERSEDED",
+            "replay candidate population is invalid for the active SMC/OTE architecture",
+        )
     supplied_manifest_hash = manifest.get("manifest_sha256")
     semantic_manifest = dict(manifest)
     semantic_manifest.pop("manifest_sha256", None)
@@ -449,7 +455,7 @@ def verify_replay(replay_dir: Path) -> dict[str, object]:
     if manifest.get("outcomes_sha256") != sha256_bytes(outcomes_bytes):
         raise HistoricalDataError("REPLAY_OUTCOMES_HASH_MISMATCH", f"outcome hash mismatch: {replay_dir}")
     identity_keys = (
-        "schema_version", "dataset_id", "dataset_sha256", "execution_account_login",
+        "schema_version", "signal_architecture", "dataset_id", "dataset_sha256", "execution_account_login",
         "market_data_account_login", "execution_universe_source", "market_data_source_type",
         "execution_universe_canonical_sha256",
         "execution_universe_canonical_schema_version",

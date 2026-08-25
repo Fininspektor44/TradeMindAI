@@ -12,7 +12,6 @@ import copy
 import csv
 import html
 import json
-import math
 import os
 import re
 from pathlib import Path
@@ -23,12 +22,6 @@ from trademind import product_ui_v1231 as base
 VERSION = "1.23.2"
 
 PHRASE_REPLACEMENTS = {
-    "EMA fast is below EMA slow": "Быстрая EMA ниже медленной",
-    "EMA fast is above EMA slow": "Быстрая EMA выше медленной",
-    "Price is below EMA slow": "Цена находится ниже медленной EMA",
-    "Price is above EMA slow": "Цена находится выше медленной EMA",
-    "RSI confirms bearish momentum": "RSI подтверждает медвежий импульс",
-    "RSI confirms bullish momentum": "RSI подтверждает бычий импульс",
     "Latest candle closed higher": "Последняя свеча закрылась ростом",
     "Latest candle closed lower": "Последняя свеча закрылась снижением",
     "Latest candle closed bullish": "Последняя свеча закрылась ростом",
@@ -129,7 +122,6 @@ METRIC_LABELS = {
     "rvol": "Относительный объём",
     "rvol_20": "Относительный объём за 20 свечей",
     "volume_percentile": "Процентиль объёма",
-    "ema_aligned": "EMA согласованы",
     "body_efficiency": "Эффективность тела свечи",
     "fvg": "FVG",
     "break_confirmed": "Слом структуры подтверждён",
@@ -142,7 +134,6 @@ METRIC_LABELS = {
 
 BOOLEAN_METRICS = {
     "aligned_sweep",
-    "ema_aligned",
     "break_confirmed",
     "spread_ok",
 }
@@ -359,9 +350,8 @@ def _market_html(candidate: Mapping[str, Any]) -> str:
     <p><span>Отношение темпа тиков</span><b>{_market_value(volume.get('tick_rate_ratio'), 2)}</b></p>
   </section>
   <section><small>Состояние рынка</small><h4>Импульс и ATR</h4>
-    <p><span>RSI</span><b>{_market_value(momentum.get('rsi'), 1)}</b></p>
-    <p><span>Быстрая EMA</span><b>{_market_value(momentum.get('ema_fast'), 5)}</b></p>
-    <p><span>Медленная EMA</span><b>{_market_value(momentum.get('ema_slow'), 5)}</b></p>
+    <p><span>Импульс / ATR</span><b>{_market_value(momentum.get('impulse_atr'), 2)}</b></p>
+    <p><span>Эффективность тела</span><b>{_market_value(momentum.get('body_efficiency_ratio_20'), 2)}</b></p>
     <p><span>ATR</span><b>{_market_value(volatility.get('atr'), 5)}</b></p>
     <p><span>Стоимость спреда в ATR</span><b>{_market_value(volatility.get('spread_cost_atr'), 3)}</b></p>
   </section>

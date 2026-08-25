@@ -65,7 +65,7 @@ def _candidate(
                 "imbalance": 0.42,
                 "tick_rate_ratio": 1.4,
             },
-            "momentum": {"rsi": 58.0, "ema_fast": 1.1005, "ema_slow": 1.0995},
+            "momentum": {"impulse_atr": 1.8, "body_efficiency_ratio_20": 1.2},
             "volatility": {"atr": 0.0012, "spread_cost_atr": 0.03},
             "confirmation": {"fvg": "BULLISH"},
         },
