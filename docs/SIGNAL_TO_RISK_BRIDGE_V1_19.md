@@ -61,11 +61,11 @@
 ## Запуск
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v119_signal_to_risk_bridge.ps1" -Login "37365712"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v119_signal_to_risk_bridge.ps1" -Login "67206924"
 ```
 
 Для конкретного паспорта:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v119_signal_to_risk_bridge.ps1" -Login "37365712" -Passport ".\data\signal_intelligence_v1_16\passports\signal.json"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v119_signal_to_risk_bridge.ps1" -Login "67206924" -Passport ".\data\signal_intelligence_v1_16\passports\signal.json"
 ```

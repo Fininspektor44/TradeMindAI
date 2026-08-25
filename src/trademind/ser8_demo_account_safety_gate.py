@@ -28,6 +28,12 @@ closed, before anything is built):
 5. ``claim.account_id`` is present in ``allowlist.account_ids`` by exact
    string match -- no case-folding, no prefix/substring matching, no fuzzy
    comparison.
+6. ``claim.account_id`` is the canonical demo EXECUTION account, verified
+   via ``trademind.mt5_canonical_accounts.verify_execution_account``. This
+   is a separate, non-negotiable question from (5): the allowlist proves an
+   operator approved the account, this proves the account is allowed to
+   execute at all. The MARKET-DATA-ONLY account is refused here even if an
+   operator explicitly allowlists it, as is any obsolete or unknown login.
 
 There is no override, force, or bypass parameter anywhere in this module.
 A denial is always a raised :class:`DemoAccountSafetyGateError`; there is
@@ -56,6 +62,10 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from trademind.mt5_canonical_accounts import (
+    MT5AccountRoleError,
+    verify_execution_account,
+)
 from trademind.ser8_execution_authorization_claim import ExecutionAuthorizationClaimV1
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
 
@@ -227,6 +237,20 @@ def verify_demo_account_authorization(
         raise DemoAccountSafetyGateError(
             f"account {claim.account_id!r} is not an approved demo/paper account"
         )
+
+    # CANONICAL ACCOUNT ROLE ENFORCEMENT: the allowlist check above proves an
+    # operator explicitly approved this account; this proves the account is
+    # permitted to execute AT ALL. Both must hold, and neither substitutes
+    # for the other. An operator who mistakenly allowlists the
+    # MARKET-DATA-ONLY account, an obsolete real login, or any other value is
+    # refused here rather than trusted -- no configuration, environment
+    # variable, or argument can widen this.
+    try:
+        verify_execution_account(claim.account_id)
+    except MT5AccountRoleError as exc:
+        raise DemoAccountSafetyGateError(
+            f"canonical MT5 account role check denied this claim: {exc}"
+        ) from exc
 
     captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     return DemoAccountAuthorizationV1(

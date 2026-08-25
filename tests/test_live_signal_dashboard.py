@@ -114,7 +114,7 @@ def test_dashboard_renders_candidate_gate_and_safety(tmp_path: Path) -> None:
     runtime_status = {
         "state": "RUN_COMPLETE",
         "updated_at": NOW.isoformat(),
-        "account_login": "37365712",
+        "account_login": "77053345",
         "closed_fx_m5_rows": 9100,
         "latest_closed_bar_at": "2026-08-06T03:55:00+00:00",
         "risk_state": None,
@@ -145,13 +145,13 @@ def test_dashboard_renders_candidate_gate_and_safety(tmp_path: Path) -> None:
         },
     )
     _write_json(
-        root / "bridge" / "37365712" / "status.json",
+        root / "bridge" / "77053345" / "status.json",
         {"state": "WAITING_NO_PUBLISHABLE_PASSPORT"},
     )
 
     result = run_live_dashboard(
         runtime_root=root,
-        login="37365712",
+        login="77053345",
         runtime_status=runtime_status,
         now=NOW,
     )
@@ -177,7 +177,7 @@ def test_dashboard_handles_empty_runtime(tmp_path: Path) -> None:
     root.mkdir(parents=True)
     result = run_live_dashboard(
         runtime_root=root,
-        login="37365712",
+        login="77053345",
         runtime_status={"state": "WAITING_SOURCE_EMPTY"},
         now=NOW,
     )

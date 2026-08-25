@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from trademind.mt5_canonical_accounts import MARKET_DATA_ACCOUNT_LOGIN
 from trademind.signal_evidence import load_outcomes
 from trademind.signal_intelligence import SignalCandidate
 from trademind.signal_shadow import load_candidates
@@ -601,7 +602,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=Path("data/live_signal_runtime_v1"),
     )
-    parser.add_argument("--login", default="37365712")
+    # Selects the per-account live bridge workspace
+    # (<runtime-root>/bridge/<login>). Defaults to the canonical MARKET DATA
+    # account -- this dashboard only ever reads market-data/live-signal
+    # evidence, and must never silently fall back to an obsolete account's
+    # workspace.
+    parser.add_argument("--login", default=MARKET_DATA_ACCOUNT_LOGIN)
     parser.add_argument("--candidate-limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--open-dashboard", action="store_true")
     args = parser.parse_args(argv)

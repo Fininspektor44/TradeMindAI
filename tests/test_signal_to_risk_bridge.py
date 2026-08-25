@@ -24,7 +24,7 @@ from trademind.signal_to_risk_bridge import (
 )
 
 NOW = datetime(2026, 8, 5, 18, 30, tzinfo=timezone.utc)
-LOGIN = "37365712"
+LOGIN = "67206924"
 
 
 def _msc(value: datetime) -> int:

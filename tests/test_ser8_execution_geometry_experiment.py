@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -285,7 +286,12 @@ def test_no_forbidden_imports_or_calls_and_no_monkeypatching() -> None:
             "symbol_select", "login",
         }
         assert not called & forbidden_calls
-        assert "37365712" not in source  # retired account never referenced
+        # No MT5 account login of ANY kind is referenced by this research
+        # module. Asserted generically over every login-shaped literal rather
+        # than by naming a specific retired account, so no obsolete real
+        # account number survives anywhere in the repository -- not even as a
+        # negative regression fixture.
+        assert not re.search(r"\b\d{8}\b", source), "no MT5 login literal may appear here"
 
 
 # ---------------------------------------------------------------------------

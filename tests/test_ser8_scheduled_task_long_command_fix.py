@@ -25,6 +25,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from trademind.mt5_canonical_accounts import (
+    DEMO_EXECUTION_ACCOUNT_LOGIN,
+    MARKET_DATA_ACCOUNT_LOGIN,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_v121_live_signal_watch.ps1"
 WATCH_SCRIPT = REPO_ROOT / "scripts" / "run_v121_live_signal_watch.ps1"
@@ -153,12 +158,34 @@ def test_no_second_wrapper_script_introduced() -> None:
 
 
 def test_no_hardcoded_account_specific_paths() -> None:
+    """No ACCOUNT-SPECIFIC WORKSPACE PATH is baked into the registration
+    logic. The -Login parameter default is a canonical account identity, not
+    a path, and the default -RuntimeRoot must stay the shared, generic root:
+    a per-account workspace has to be passed in explicitly, never inherited
+    silently."""
     text = INSTALL_SCRIPT.read_text(encoding="utf-8")
-    # The only login default is the pre-existing 37365712 placeholder,
-    # unchanged by this task -- no new account/runtime-root value is baked
-    # in anywhere in the registration logic itself.
-    assert "77053345" not in text
-    assert "67206924" not in text
+    # No account-suffixed runtime workspace is hardcoded anywhere.
+    assert not re.search(r"live_signal_runtime_ec[nN]_\d+", text)
+    assert not re.search(r"runtime[_-]?root\s*=\s*[\"'][^\"']*\d{8}", text, re.IGNORECASE)
+    # The generic shared runtime root remains the default.
+    assert 'RuntimeRoot = ".\\data\\live_signal_runtime_v1"' in text
+
+
+def test_login_has_no_default_and_must_be_stated_explicitly() -> None:
+    """-Login is MANDATORY with no default anywhere in this installer.
+
+    ``$Login`` selects the per-account risk/account CSV context
+    (mt5_risk_account_utc_<login>.csv and friends), so a silent default
+    could bind the wrong account -- including the MARKET-DATA-ONLY account
+    -- into a risk context by omission. Requiring it explicitly is
+    strictly fail-closed and makes it impossible for an obsolete account
+    to return as a default."""
+    text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    assert re.search(r"\[Parameter\(Mandatory=\$true\)\]\s*\n\s*\[string\]\$Login,", text)
+    assert not re.search(r"\$Login\s*=\s*[\"']", text), "Login must have no default"
+    # Neither canonical account is hardcoded here in any role.
+    assert MARKET_DATA_ACCOUNT_LOGIN not in text
+    assert DEMO_EXECUTION_ACCOUNT_LOGIN not in text
 
 
 # ---------------------------------------------------------------------------

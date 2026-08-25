@@ -12,7 +12,7 @@ from trademind.mt5_risk_adapter import adapt_mt5_exports
 
 
 NOW = datetime(2026, 8, 5, 18, 0, tzinfo=timezone.utc)
-LOGIN = "37365712"
+LOGIN = "67206924"
 
 
 def _msc(value: datetime) -> int:

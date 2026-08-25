@@ -25,6 +25,7 @@ order, a fill, a broker ticket, or execution authorization of any kind.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import io
 import os
 import sqlite3
@@ -79,6 +80,10 @@ from trademind.research_proposal_response import (
     ResearchProposalResponseV1,
 )
 from trademind.risk_manager import RiskProfile
+from trademind.mt5_canonical_accounts import (
+    DEMO_EXECUTION_ACCOUNT_LOGIN,
+    MARKET_DATA_ACCOUNT_LOGIN,
+)
 from trademind.ser8_demo_account_safety_gate import (
     DemoAccountAllowlistV1,
     DemoAccountAuthorizationV1,
@@ -120,7 +125,7 @@ _HOLDOUT_PLAINTEXT = (
 )
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
-LOGIN = "37365712"
+LOGIN = "67206924"
 SYMBOL = "XAUUSD"
 TIMEFRAME = "M5"
 SETUP_FAMILY = "spread_pressure"
@@ -787,6 +792,57 @@ def test_tampered_claim_hash_fails(tmp_path: Path) -> None:
 
     with pytest.raises(DemoAccountSafetyGateError, match="self-consistency verification"):
         verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+
+
+# ---------------------------------------------------------------------------
+# 10: canonical MT5 account role enforcement -- being on the allowlist is
+# NOT by itself authority to execute.
+#
+# These use dataclasses.replace (which re-runs __post_init__ and recomputes
+# claim_hash) rather than object.__setattr__, so the claim under test is
+# GENUINELY self-consistent. That is the point: the role check must reject
+# these on their own merits, not merely because tampering was detected.
+# ---------------------------------------------------------------------------
+
+
+def test_market_data_account_is_refused_even_when_explicitly_allowlisted(
+    tmp_path: Path,
+) -> None:
+    """The MARKET-DATA-ONLY account may never execute. An operator who
+    mistakenly allowlists it -- the most likely hand-wiring mistake -- is
+    still refused: the allowlist proves only that an operator approved the
+    account, never that the account is permitted to execute at all."""
+    context, claim = _claim_case(tmp_path)
+    market_data_claim = dataclasses.replace(claim, account_id=MARKET_DATA_ACCOUNT_LOGIN)
+
+    with pytest.raises(DemoAccountSafetyGateError, match="MARKET DATA ONLY"):
+        verify_demo_account_authorization(
+            market_data_claim, allowlist=_allowlist(MARKET_DATA_ACCOUNT_LOGIN), now=NOW
+        )
+
+
+def test_non_canonical_account_is_refused_even_when_explicitly_allowlisted(
+    tmp_path: Path,
+) -> None:
+    """A synthetic, clearly non-real login stands in for any obsolete or
+    unknown account: allowlisting it is not enough, it still fails closed."""
+    context, claim = _claim_case(tmp_path)
+    other_claim = dataclasses.replace(claim, account_id="99999999")
+
+    with pytest.raises(DemoAccountSafetyGateError, match="canonical MT5 account role"):
+        verify_demo_account_authorization(
+            other_claim, allowlist=_allowlist("99999999"), now=NOW
+        )
+
+
+def test_the_canonical_demo_execution_account_still_passes(tmp_path: Path) -> None:
+    """The one account that may execute is unaffected by the new check."""
+    context, claim = _claim_case(tmp_path)
+    assert claim.account_id == DEMO_EXECUTION_ACCOUNT_LOGIN
+    authorization = verify_demo_account_authorization(
+        claim, allowlist=_allowlist(DEMO_EXECUTION_ACCOUNT_LOGIN), now=NOW
+    )
+    assert authorization.account_id == DEMO_EXECUTION_ACCOUNT_LOGIN
 
 
 # ---------------------------------------------------------------------------

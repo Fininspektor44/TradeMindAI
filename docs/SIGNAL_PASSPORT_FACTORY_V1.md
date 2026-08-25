@@ -60,7 +60,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v120_sign
 ## Полная read-only цепочка с MT5
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v120_signal_pipeline.ps1" -Login "37365712"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v120_signal_pipeline.ps1" -Login "77053345"
 ```
 
 ## Границы безопасности

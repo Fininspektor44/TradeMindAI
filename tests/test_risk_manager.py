@@ -64,7 +64,7 @@ def _candidate(
 
 def _account(**changes: object) -> AccountSnapshot:
     values = {
-        "account_id": "37365712",
+        "account_id": "67206924",
         "venue": "MT5",
         "currency": "USD",
         "captured_at": NOW - timedelta(seconds=10),

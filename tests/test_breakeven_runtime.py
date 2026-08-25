@@ -80,7 +80,7 @@ def test_runtime_orchestrates_shadow_counterfactual_and_report(
         shadow_dir,
         counter_dir,
         status_path,
-        login="37365712",
+        login="77053345",
     )
 
     assert status["state"] == "OK"
@@ -92,7 +92,7 @@ def test_runtime_orchestrates_shadow_counterfactual_and_report(
     assert status["safety"]["read_only"] is True
     assert status["safety"]["orders_enabled"] is False
     assert calls[0] == ("shadow", positions, shadow_dir)
-    assert calls[1][-1] == "37365712"
+    assert calls[1][-1] == "77053345"
     assert calls[2][0] == "report"
     assert json.loads(status_path.read_text(encoding="utf-8"))["schema_version"] == "1.31.1"
 
@@ -134,14 +134,14 @@ def test_runtime_propagates_mapping_warning(tmp_path: Path, monkeypatch) -> None
         tmp_path / "shadow",
         tmp_path / "counter",
         tmp_path / "status.json",
-        login="37365712",
+        login="77053345",
     )
     assert status["state"] == "WARN_AMBIGUOUS_MAPPING"
 
 
 def test_error_status_remains_read_only(tmp_path: Path) -> None:
     path = tmp_path / "status.json"
-    runtime._write_error_status(path, "37365712", ValueError("missing snapshot"))
+    runtime._write_error_status(path, "77053345", ValueError("missing snapshot"))
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["state"] == "ERROR"
     assert payload["error_type"] == "ValueError"

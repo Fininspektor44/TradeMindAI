@@ -36,7 +36,7 @@ def _dashboard(canonical: Path, candidate: dict[str, object]) -> dict[str, objec
         "runtime": {
             "state": "WAITING_NO_NEW_CLOSED_BARS",
             "risk_state": None,
-            "account_login": "37365712",
+            "account_login": "77053345",
             "server_utc_offset_hours": 3,
             "paths": {"canonical_volume": str(canonical)},
         },

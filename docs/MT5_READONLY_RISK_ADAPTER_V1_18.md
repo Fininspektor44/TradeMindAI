@@ -106,19 +106,19 @@ Compile `TradeMind_MT5_Risk_Snapshot_Exporter.mq5` in MetaEditor and attach it t
 
 ## Adapter run
 
-Example for account `37365712` and a BUY plan on EURUSD:
+Example for account `67206924` and a BUY plan on EURUSD:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v118_mt5_risk_adapter.ps1" -Login 37365712 -Symbol EURUSD -Action BUY -RunTests
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_v118_mt5_risk_adapter.ps1" -Login 67206924 -Symbol EURUSD -Action BUY -RunTests
 ```
 
 Output:
 
 ```text
-data\mt5_risk_adapter_v1\37365712\account.json
-data\mt5_risk_adapter_v1\37365712\portfolio.json
-data\mt5_risk_adapter_v1\37365712\instrument_EURUSD.json
-data\mt5_risk_adapter_v1\37365712\status.json
+data\mt5_risk_adapter_v1\67206924\account.json
+data\mt5_risk_adapter_v1\67206924\portfolio.json
+data\mt5_risk_adapter_v1\67206924\instrument_EURUSD.json
+data\mt5_risk_adapter_v1\67206924\status.json
 ```
 
 ## Safety boundary

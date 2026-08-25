@@ -30,7 +30,7 @@ def rows() -> list[dict[str, object]]:
 
 
 def test_summary_stays_collecting_below_sample_threshold() -> None:
-    runtime = {"login": "37365712", "updated_at": "2026-08-07T15:00:00+00:00"}
+    runtime = {"login": "77053345", "updated_at": "2026-08-07T15:00:00+00:00"}
     counter = {
         "completed_baskets": 10,
         "covered_completed_baskets": 9,
@@ -67,7 +67,7 @@ def test_coverage_excludes_baskets_closed_before_monitor_start() -> None:
         },
     ]
     runtime = {
-        "login": "37365712",
+        "login": "77053345",
         "shadow": {"monitor_started_at": "2026-08-07T11:00:00+00:00"},
     }
     counter = {
@@ -85,7 +85,7 @@ def test_coverage_excludes_baskets_closed_before_monitor_start() -> None:
 
 
 def test_summary_becomes_ready_only_with_coverage_and_sample() -> None:
-    runtime = {"login": "37365712"}
+    runtime = {"login": "77053345"}
     counter = {
         "completed_baskets": 40,
         "covered_completed_baskets": 34,
@@ -102,7 +102,7 @@ def test_generate_report_writes_json_and_html(tmp_path: Path) -> None:
         writer.writeheader()
         writer.writerows(rows())
     out = tmp_path / "report"
-    runtime = {"login": "37365712"}
+    runtime = {"login": "77053345"}
     counter = {
         "completed_baskets": 2,
         "covered_completed_baskets": 2,

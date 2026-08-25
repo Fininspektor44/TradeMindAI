@@ -152,7 +152,7 @@ _HOLDOUT_PLAINTEXT = (
 )
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
-LOGIN = "37365712"
+LOGIN = "67206924"
 SYMBOL = "XAUUSD"
 TIMEFRAME = "M5"
 SETUP_FAMILY = "spread_pressure"

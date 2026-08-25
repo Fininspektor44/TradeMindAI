@@ -125,7 +125,7 @@ def write_state(path: Path) -> None:
         "schema_version": "1.28.0",
         "epochs": {
             "winner": epoch(
-                login="37365712",
+                login="77053345",
                 magic="777270003",
                 symbol="EURUSD",
                 side="BUY",
@@ -135,7 +135,7 @@ def write_state(path: Path) -> None:
                 revisited=True,
             ),
             "loser": epoch(
-                login="37365712",
+                login="77053345",
                 magic="777270004",
                 symbol="USDJPY",
                 side="SELL",
@@ -161,7 +161,7 @@ def test_resolver_classifies_winner_cut_and_loss_avoided(tmp_path: Path) -> None
     write_deals(deals)
     write_state(state)
 
-    status = resolver.run_counterfactual(state, deals, out, login="37365712")
+    status = resolver.run_counterfactual(state, deals, out, login="77053345")
     assert status["covered_completed_baskets"] == 2
     assert status["losses_avoided_count"] == 1
     assert status["winners_cut_count"] == 1
@@ -196,7 +196,7 @@ def test_epoch_from_other_login_is_not_used(tmp_path: Path) -> None:
     }
     state.write_text(json.dumps(payload), encoding="utf-8")
 
-    status = resolver.run_counterfactual(state, deals, out, login="37365712")
+    status = resolver.run_counterfactual(state, deals, out, login="77053345")
     assert status["covered_completed_baskets"] == 0
     assert all(
         row["effect_class"] == "NO_SHADOW_COVERAGE"
@@ -212,7 +212,7 @@ def test_trigger_without_revisit_does_not_claim_effect(tmp_path: Path) -> None:
     payload = {
         "epochs": {
             "winner": epoch(
-                login="37365712",
+                login="77053345",
                 magic="777270003",
                 symbol="EURUSD",
                 side="BUY",
@@ -225,7 +225,7 @@ def test_trigger_without_revisit_does_not_claim_effect(tmp_path: Path) -> None:
     }
     state.write_text(json.dumps(payload), encoding="utf-8")
 
-    status = resolver.run_counterfactual(state, deals, out, login="37365712")
+    status = resolver.run_counterfactual(state, deals, out, login="77053345")
     rows = read_report(out / "basket_be_counterfactual.csv")
     eurusd = next(row for row in rows if row["symbol"] == "EURUSD")
     assert eurusd["effect_class"] == "TRIGGERED_NO_REVISIT"
@@ -239,7 +239,7 @@ def test_safety_contract(tmp_path: Path) -> None:
     out = tmp_path / "out"
     write_deals(deals)
     write_state(state)
-    status = resolver.run_counterfactual(state, deals, out, login="37365712")
+    status = resolver.run_counterfactual(state, deals, out, login="77053345")
     assert status["safety"] == {
         "read_only": True,
         "shadow_only": True,

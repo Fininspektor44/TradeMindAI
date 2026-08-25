@@ -163,7 +163,7 @@ def test_render_adds_market_filter_crypto_badge_and_derivatives() -> None:
         {
             "schema_version": "1.24.0",
             "updated_at": "2026-08-06T10:00:00+00:00",
-            "runtime": {"state": "RUN_COMPLETE", "account_login": "37365712"},
+            "runtime": {"state": "RUN_COMPLETE", "account_login": "77053345"},
             "factory": {"state": "WAITING_NO_PUBLISHABLE_PASSPORT"},
             "bridge": {"state": "WAITING_NO_PUBLISHABLE_PASSPORT"},
             "decision": {},

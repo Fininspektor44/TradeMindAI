@@ -287,7 +287,7 @@ def test_run_live_runtime_reports_missing_frozen_symbols_explicitly(
     )
 
     run = run_live_runtime(
-        login="37365712",
+        login="77053345",
         volume_source_dir=tmp_path / "source",
         canonical_volume_path=canonical,
         historical_outcomes_path=historical,
@@ -337,7 +337,7 @@ def test_run_live_runtime_reports_no_missing_symbols_when_all_present(
     )
 
     run = run_live_runtime(
-        login="37365712",
+        login="77053345",
         volume_source_dir=tmp_path / "source",
         canonical_volume_path=canonical,
         historical_outcomes_path=historical,
@@ -412,7 +412,7 @@ def test_run_live_runtime_safety_flags_remain_all_off(monkeypatch, tmp_path: Pat
     )
 
     run = run_live_runtime(
-        login="37365712",
+        login="77053345",
         volume_source_dir=tmp_path / "source",
         canonical_volume_path=canonical,
         historical_outcomes_path=historical,

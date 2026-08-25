@@ -62,7 +62,10 @@ replay_cli = importlib.import_module("replay_ser8_historical_data")
 
 ACCOUNT = "67206924"
 MARKET_DATA_ACCOUNT = "77053345"
-RETIRED_MARKET_DATA_ACCOUNT = "37365712"
+# A deliberately synthetic, non-real placeholder login used ONLY to prove
+# that a non-canonical account fails closed. No obsolete real account
+# number is kept anywhere in this repository, not even as a fixture.
+NON_CANONICAL_ACCOUNT = "99999999"
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
 POLICY_PATH = REPO_ROOT / "config" / "research" / "ser8_historical_research_policy_v1.json"
 
@@ -836,7 +839,7 @@ def test_mt5_source_verifies_terminal_account_symbol_and_utc() -> None:
     assert bars[0].time_utc.utcoffset() == timedelta(0)
 
 
-@pytest.mark.parametrize("active_login", [RETIRED_MARKET_DATA_ACCOUNT, "1"])
+@pytest.mark.parametrize("active_login", [NON_CANONICAL_ACCOUNT, "1"])
 def test_mt5_source_fails_on_wrong_account(active_login: str) -> None:
     module = SimpleNamespace(
         initialize=lambda *_: True,
@@ -859,7 +862,7 @@ def test_mt5_source_fails_on_wrong_account(active_login: str) -> None:
 def test_retired_market_data_account_cannot_be_configured_as_fallback() -> None:
     with pytest.raises(HistoricalDataError) as caught:
         MetaTrader5HistorySource(
-            market_data_account_login=RETIRED_MARKET_DATA_ACCOUNT,
+            market_data_account_login=NON_CANONICAL_ACCOUNT,
             module=SimpleNamespace(),
         )
     assert caught.value.code == "SER8_MARKET_DATA_ACCOUNT_NOT_ACTIVE"
@@ -930,7 +933,7 @@ def test_wrong_explicit_terminal_path_or_attached_account_fails_closed() -> None
         initialize=lambda *_: True,
         terminal_info=lambda: SimpleNamespace(connected=True, company="Broker"),
         account_info=lambda: SimpleNamespace(
-            login=int(RETIRED_MARKET_DATA_ACCOUNT),
+            login=int(NON_CANONICAL_ACCOUNT),
             server="Broker-Old",
             company="Broker",
         ),
@@ -1075,7 +1078,7 @@ def test_replay_is_content_addressed_idempotent_and_never_touches_live_runtime(
         [*common_args, "--market-data-account", MARKET_DATA_ACCOUNT]
     ) == 0
     assert replay_cli.main(
-        [*common_args, "--market-data-account", RETIRED_MARKET_DATA_ACCOUNT]
+        [*common_args, "--market-data-account", NON_CANONICAL_ACCOUNT]
     ) == 1
 
 
@@ -1149,7 +1152,7 @@ def test_discovery_consumes_hash_verified_replay_inventory(tmp_path: Path) -> No
             "--execution-account",
             ACCOUNT,
             "--market-data-account",
-            RETIRED_MARKET_DATA_ACCOUNT,
+            NON_CANONICAL_ACCOUNT,
             "--data-root",
             str(tmp_path / "data"),
             "--historical-inventory",
@@ -1232,7 +1235,7 @@ def test_active_historical_layer_has_no_retired_account_default_or_fallback() ->
         REPO_ROOT / "src" / "trademind" / "ser8_symbol_universe.py",
     ]
     for path in active_paths:
-        assert RETIRED_MARKET_DATA_ACCOUNT not in path.read_text(encoding="utf-8"), path
+        assert NON_CANONICAL_ACCOUNT not in path.read_text(encoding="utf-8"), path
 
 
 def test_dataset_verifier_detects_tampered_bar(tmp_path: Path) -> None:
@@ -1295,7 +1298,7 @@ def test_windows_runbook_uses_real_paths_and_stepwise_commands() -> None:
     assert text.count(
         '--terminal-path "C:\\Program Files\\RoboForex MT5 Terminal\\terminal64.exe"'
     ) == 3
-    assert RETIRED_MARKET_DATA_ACCOUNT not in text
+    assert NON_CANONICAL_ACCOUNT not in text
     assert "--mode verify-source --account" not in text
     assert "C1 is the current next action" in text
     assert ".\\data\\mt5" not in text

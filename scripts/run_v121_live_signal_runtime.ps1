@@ -1,6 +1,10 @@
 param(
-    [Parameter(Mandatory=$false)]
-    [string]$Login = "37365712",
+    # CANONICAL MT5 ACCOUNT ROLES: no default. The operator must state the
+    # account explicitly, so this script can never silently fall back to an
+    # obsolete account or its workspace, and cannot bind the MARKET-DATA-ONLY
+    # account into a risk/account context by omission.
+    [Parameter(Mandatory=$true)]
+    [string]$Login,
 
     [Parameter(Mandatory=$false)]
     [string]$VolumeSourceDir = "",

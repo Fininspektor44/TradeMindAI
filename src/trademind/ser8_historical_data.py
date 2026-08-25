@@ -26,6 +26,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
+from trademind.mt5_canonical_accounts import (
+    DEMO_EXECUTION_ACCOUNT_LOGIN,
+    MARKET_DATA_ACCOUNT_LOGIN,
+)
 from trademind.ser8_symbol_universe import (
     ASSET_CLASS_FX,
     classify_asset_class,
@@ -150,8 +154,12 @@ CHUNK_ACQUISITION_CODE_SHA256 = (
     "sha256:34a3d2633b744942eee35ab72d291bb5205275abfc4c5a38bd122f83e02607da"
 )
 SOURCE_TYPE = "MT5_PYTHON_COPY_RATES_RANGE"
-SER8_EXECUTION_ACCOUNT_LOGIN = "67206924"
-SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN = "77053345"
+# Re-exported from the single canonical source of truth
+# (trademind.mt5_canonical_accounts) rather than redeclared, so this module
+# and every runtime execution path can never drift to two different ideas of
+# which login holds which role.
+SER8_EXECUTION_ACCOUNT_LOGIN = DEMO_EXECUTION_ACCOUNT_LOGIN
+SER8_ACTIVE_MARKET_DATA_ACCOUNT_LOGIN = MARKET_DATA_ACCOUNT_LOGIN
 READ_ONLY_MT5_OPERATIONS = (
     "initialize",
     "terminal_info",
