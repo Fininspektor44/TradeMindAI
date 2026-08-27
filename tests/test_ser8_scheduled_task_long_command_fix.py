@@ -33,6 +33,8 @@ from trademind.mt5_canonical_accounts import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install_v121_live_signal_watch.ps1"
 WATCH_SCRIPT = REPO_ROOT / "scripts" / "run_v121_live_signal_watch.ps1"
+AUTONOMOUS_WRAPPER = REPO_ROOT / "scripts" / "run_ser8_autonomous_demo_execution.ps1"
+AUTONOMOUS_INSTALLER = REPO_ROOT / "scripts" / "install_ser8_autonomous_demo_execution.ps1"
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +297,10 @@ def test_still_exactly_one_watch_wrapper_script() -> None:
         if "run_v121_live_signal_runtime.ps1" in path.read_text(encoding="utf-8")
         and "New-Object System.Threading.Mutex" in path.read_text(encoding="utf-8")
     ]
-    assert watch_wrappers == [WATCH_SCRIPT]
+    assert set(watch_wrappers) == {WATCH_SCRIPT, AUTONOMOUS_WRAPPER}
+    installer = AUTONOMOUS_INSTALLER.read_text(encoding="utf-8")
+    assert "TradeMindAI-v1.21-LiveSignalRuntime" in installer
+    assert "Disable-ScheduledTask" in installer
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,7 @@ $content = Get-Content -Path $sourcePath -Raw -Encoding UTF8
 $requiredSymbols = @(
     "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
     "XAUUSD", "XAGUSD", ".USTECHCash", ".US500Cash", ".US30Cash", "WTI", "BRENT",
-    "BTCUSD", "ETHUSD"
+    "BTCUSD", "ETHUSD", "CHFJPY", "EURJPY", "EURNZD", "GBPAUD", "GBPNZD", "NZDCAD", "NZDCHF"
 )
 foreach ($symbol in $requiredSymbols) {
     if (-not $content.Contains($symbol)) {

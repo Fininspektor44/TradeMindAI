@@ -23,6 +23,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +32,8 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 worker_module = importlib.import_module("run_ser8_autonomous_demo_execution")
+risk_gate_module = importlib.import_module("trademind.ser8_research_risk_gate")
+authorization_module = importlib.import_module("trademind.ser8_execution_authorization")
 import test_run_ser8_real_demo_pipeline as fixtures  # noqa: E402
 
 from trademind.discovery.hypothesis_registry import HypothesisRegistry  # noqa: E402
@@ -45,6 +48,7 @@ from trademind.ser8_execution_authorization import (  # noqa: E402
 from trademind.ser8_execution_authorization_claim import (  # noqa: E402
     SER8ExecutionAuthorizationClaimControl,
 )
+from trademind.ser8_core8_market_only_policy import CORE_8_SYMBOLS_ORDERED  # noqa: E402
 from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
     DEMO_EXECUTOR_MAGIC_NUMBER,
     SCHEMA_VERSION,
@@ -57,8 +61,20 @@ from trademind.ser8_mt5_demo_order_send import (  # noqa: E402
     build_demo_order_execution_plan,
     leg_identity,
 )
-from trademind.ser8_research_risk_gate import evaluate_ser8_research_risk_gate  # noqa: E402
-from trademind.signal_intelligence import candidate_from_dict  # noqa: E402
+from trademind.ser8_research_risk_gate import (  # noqa: E402
+    CORE8_AUTHORITATIVE_OTE_PROVENANCE,
+    CORE8_OPERATIONAL_SETUP_FAMILY,
+    SER8ResearchRiskGateError,
+    evaluate_ser8_research_risk_gate,
+    resolve_core8_operational_route,
+    verify_core8_operational_candidate,
+)
+from trademind.signal_intelligence import (  # noqa: E402
+    EntryOrder,
+    SignalCandidate,
+    TradePlan,
+    candidate_from_dict,
+)
 
 _ACCOUNT = fixtures._ACCOUNT
 _SYMBOL = fixtures._SYMBOL
@@ -183,6 +199,218 @@ def _write_candidate_journal_with_action(data_root: Path, *, signal_id: str, act
     with journal_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
     return journal_path
+
+
+def _core8_operational_candidate(
+    symbol: str,
+    *,
+    observed_at: datetime | None = None,
+    setup_family: str = CORE8_OPERATIONAL_SETUP_FAMILY,
+    provenance: tuple[str, ...] = (CORE8_AUTHORITATIVE_OTE_PROVENANCE,),
+    allocation: float = 1.0,
+    order_type: str = "MARKET",
+) -> SignalCandidate:
+    captured = observed_at or datetime.now(timezone.utc)
+    return SignalCandidate(
+        observed_at=captured,
+        created_at=captured,
+        symbol=symbol,
+        timeframe="M5",
+        setup_family=setup_family,
+        scenario="authoritative OTE operational candidate",
+        plan=TradePlan(
+            action="BUY",
+            entries=(
+                EntryOrder(
+                    price=2000.0,
+                    allocation=allocation,
+                    rationale="authoritative OTE market entry",
+                    order_type=order_type,
+                ),
+            ),
+            stop_price=1990.0,
+            targets=(2020.0,),
+            invalidation="authoritative structural stop",
+            target_rationale=("authoritative primary target",),
+        ),
+        market_features={},
+        factor_scores={},
+        factor_reasons={},
+        provenance=provenance,
+        generated_from_market_data=True,
+        robot_context_only={},
+    )
+
+
+def _write_core8_operational_candidate(data_root: Path, candidate: SignalCandidate) -> Path:
+    candidates_dir = data_root / "live_signal_runtime_v1"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    journal_path = candidates_dir / "candidates.jsonl"
+    journal_path.write_text(json.dumps(candidate.as_dict(), sort_keys=True) + "\n", encoding="utf-8")
+    return journal_path
+
+
+# ---------------------------------------------------------------------------
+# CORE8 operational direct-connect regression contract.
+# ---------------------------------------------------------------------------
+
+
+def test_all_eight_core8_operational_routes_bypass_only_lifecycle_and_use_risk_manager(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fixtures._write_mt5_exports(tmp_path)
+    mt5_dir = tmp_path / "mt5"
+    symbols_csv = mt5_dir / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv"
+    base_symbols = symbols_csv.read_text(encoding="utf-8")
+    profile = fixtures.pipeline_module.profile_from_dict(
+        json.loads(_REAL_SUPERVISED_DEMO_PROFILE.read_text(encoding="utf-8"))
+    )
+    assert profile.maximum_signal_age_seconds == 900
+
+    def _lifecycle_must_not_run(*_args, **_kwargs):
+        raise AssertionError("legacy research lifecycle lookup reached for core8-op route")
+
+    monkeypatch.setattr(risk_gate_module, "present_eligible_artifact", _lifecycle_must_not_run)
+    monkeypatch.setattr(risk_gate_module, "bind_hypothesis_tradeable_scope", _lifecycle_must_not_run)
+    real_evaluate_risk = risk_gate_module.evaluate_risk
+    risk_calls: list[str] = []
+
+    def _record_risk(candidate, **kwargs):
+        risk_calls.append(candidate.symbol)
+        return real_evaluate_risk(candidate, **kwargs)
+
+    monkeypatch.setattr(risk_gate_module, "evaluate_risk", _record_risk)
+    captured = datetime.now(timezone.utc)
+    for symbol in CORE_8_SYMBOLS_ORDERED:
+        symbols_csv.write_text(base_symbols.replace(_SYMBOL, symbol), encoding="utf-8")
+        route = resolve_core8_operational_route(f"core8-op:{symbol}")
+        assert route is not None
+        candidate = _core8_operational_candidate(symbol, observed_at=captured)
+        result = evaluate_ser8_research_risk_gate(
+            None,
+            None,
+            candidate,
+            registry=object(),  # operational branch must never dereference either lifecycle object.
+            final_verdict=object(),
+            login=_ACCOUNT,
+            account_csv=mt5_dir / f"mt5_risk_account_utc_{_ACCOUNT}.csv",
+            positions_csv=mt5_dir / f"mt5_risk_positions_utc_{_ACCOUNT}.csv",
+            symbols_csv=symbols_csv,
+            profile=profile,
+            operational_route=route,
+            now=captured,
+        )
+        assert result.decision.state == "ALLOW"
+        assert result.evidence.research_hypothesis_id == f"core8-op:{symbol}"
+        assert len(result.decision.orders) == 1
+        assert result.decision.orders[0].order_type == "MARKET"
+    assert risk_calls == list(CORE_8_SYMBOLS_ORDERED)
+
+
+def test_core8_operational_candidate_proof_and_market_only_contract_fail_closed() -> None:
+    route = resolve_core8_operational_route("core8-op:USDJPY")
+    assert route is not None
+    candidate = _core8_operational_candidate("USDJPY")
+    original_stop = candidate.plan.stop_price
+    original_primary_target = candidate.plan.targets[0]
+    verify_core8_operational_candidate(route, candidate)
+    assert len(candidate.plan.entries) == 1
+    assert candidate.plan.entries[0].order_type == "MARKET"
+    assert candidate.plan.entries[0].allocation == 1.0
+    assert candidate.plan.stop_price == original_stop
+    assert candidate.plan.targets[0] == original_primary_target
+
+    invalid = (
+        _core8_operational_candidate("EURJPY"),
+        _core8_operational_candidate("USDJPY", setup_family="SMC_OTE_LIQUIDITY_REVERSAL"),
+        _core8_operational_candidate("USDJPY", provenance=("FX_OTE_SIGNAL_SOURCE_V1",)),
+        _core8_operational_candidate("USDJPY", allocation=0.5),
+        _core8_operational_candidate("USDJPY", order_type="LIMIT"),
+    )
+    for bad_candidate in invalid:
+        with pytest.raises(SER8ResearchRiskGateError):
+            verify_core8_operational_candidate(route, bad_candidate)
+
+    with pytest.raises(SER8ResearchRiskGateError):
+        resolve_core8_operational_route("core8-op:EURUSD")
+    with pytest.raises(SER8ResearchRiskGateError):
+        resolve_core8_operational_route("core8-op:eurjpy")
+
+
+def test_core8_operational_stale_candidate_is_blocked_by_unchanged_900_second_risk_limit(
+    tmp_path: Path,
+) -> None:
+    fixtures._write_mt5_exports(tmp_path)
+    captured = datetime.now(timezone.utc)
+    candidate = _core8_operational_candidate(
+        "USDJPY", observed_at=captured - timedelta(seconds=901)
+    )
+    route = resolve_core8_operational_route("core8-op:USDJPY")
+    assert route is not None
+    profile = fixtures.pipeline_module.profile_from_dict(
+        json.loads(_REAL_SUPERVISED_DEMO_PROFILE.read_text(encoding="utf-8"))
+    )
+    assert profile.maximum_signal_age_seconds == 900
+    result = evaluate_ser8_research_risk_gate(
+        None,
+        None,
+        candidate,
+        registry=object(),
+        final_verdict=object(),
+        login=_ACCOUNT,
+        account_csv=tmp_path / "mt5" / f"mt5_risk_account_utc_{_ACCOUNT}.csv",
+        positions_csv=tmp_path / "mt5" / f"mt5_risk_positions_utc_{_ACCOUNT}.csv",
+        symbols_csv=tmp_path / "mt5" / f"mt5_risk_symbols_utc_{_ACCOUNT}.csv",
+        profile=profile,
+        operational_route=route,
+        now=captured,
+    )
+    assert result.decision.state == "BLOCK"
+    assert "SIGNAL_STALE" in {reason.code for reason in result.decision.reasons}
+
+
+def test_core8_operational_worker_executes_end_to_end_without_research_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    chain = fixtures._full_real_chain(tmp_path)  # deliberately remains FROZEN, never ACCEPTED.
+    registry = HypothesisRegistry(chain.db_path)
+    candidate = _core8_operational_candidate("USDJPY")
+    _write_core8_operational_candidate(chain.data_root, candidate)
+    fixtures._write_mt5_exports(chain.data_root)
+
+    def _lifecycle_must_not_run(*_args, **_kwargs):
+        raise AssertionError("legacy lifecycle lookup reached for core8-op route")
+
+    for module in (worker_module, risk_gate_module, authorization_module):
+        monkeypatch.setattr(module, "present_eligible_artifact", _lifecycle_must_not_run)
+        monkeypatch.setattr(module, "bind_hypothesis_tradeable_scope", _lifecycle_must_not_run)
+
+    fake = _success_transport()
+    monkeypatch.setattr(worker_module, "FileBridgeDemoOrderTransport", lambda **kwargs: fake)
+    args = _worker_args(chain, hypothesis_id="core8-op:USDJPY")
+    summary = worker_module.run_one_cycle(args)
+
+    assert summary.cycle_status == "EXECUTION_COMPLETE"
+    assert summary.risk_state == "ALLOW"
+    assert summary.legs_total == 1
+    assert len(fake.calls) == 1
+    request = fake.calls[0]
+    assert request.demo_account_id == _ACCOUNT
+    assert request.symbol == "USDJPY"
+    assert request.order_type == "MARKET"
+    assert request.sl == candidate.plan.stop_price
+    assert request.tp == candidate.plan.targets[0]
+    assert registry.get(chain.hypothesis_id).state.value == "FROZEN"
+    with pytest.raises(Exception):
+        registry.get("core8-op:USDJPY")
+
+
+def test_non_core8_route_still_requires_normal_research_lifecycle(tmp_path: Path) -> None:
+    chain = fixtures._full_real_chain(tmp_path)  # FROZEN is intentionally not execution-eligible.
+    _write_candidate_journal_with_action(chain.data_root, signal_id="legacy-frozen", action="BUY")
+    fixtures._write_mt5_exports(chain.data_root)
+    with pytest.raises(Exception, match="ACCEPTED"):
+        worker_module.run_one_cycle(_worker_args(chain))
 
 
 def _seed_authorization(
@@ -1117,6 +1345,49 @@ def test_lock_file_prevents_overlapping_runs(tmp_path: Path) -> None:
         ]
         exit_code = worker_module.main(argv)
     assert exit_code == 3
+
+
+def test_dead_process_lock_is_recovered_without_weakening_exclusive_create(tmp_path: Path, monkeypatch) -> None:
+    lock_path = tmp_path / "dead-worker.lock"
+    lock_path.write_text("pid=999999 started_at=2026-08-26T10:00:00+00:00\n", encoding="utf-8")
+    monkeypatch.setattr(worker_module._LockFile, "_owner_is_running", staticmethod(lambda _pid: False))
+    with worker_module._LockFile(lock_path):
+        assert f"pid={__import__('os').getpid()}" in lock_path.read_text(encoding="utf-8")
+    assert not lock_path.exists()
+
+
+def test_multi_hypothesis_cycle_refreshes_utc_clock_after_each_transport_wait(monkeypatch) -> None:
+    first = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+    second = first + timedelta(seconds=61)
+    clock = iter((first, second))
+    prepared = SimpleNamespace(
+        pipeline=object(), inputs=object(), deals_csv=Path("deals.csv"), orders_csv=Path("orders.csv")
+    )
+    monkeypatch.setattr(worker_module, "_prepare_cycle_inputs", lambda _args: prepared)
+    monkeypatch.setattr(
+        worker_module,
+        "_resolve_scope_for_ambiguity_check",
+        lambda hypothesis_id, pipeline: (
+            SimpleNamespace(
+                symbol=hypothesis_id, timeframe="M5", setup_family="SMC_OTE_PIVOT_BREAK",
+                allowed_action_scope="BOTH",
+            ),
+            None,
+        ),
+    )
+    monkeypatch.setattr(worker_module, "_utc_now", lambda: next(clock))
+    observed: list[datetime] = []
+
+    def _run(args, hypothesis_id, **kwargs):
+        observed.append(kwargs["now"])
+        return worker_module.CycleSummary(account=args.account)
+
+    monkeypatch.setattr(worker_module, "_run_cycle_for_hypothesis", _run)
+    worker_module.run_one_cycle_for_hypotheses(
+        SimpleNamespace(account="67206924"), ("CHFJPY", "EURJPY")
+    )
+    assert observed == [first, second]
+    assert all(value.tzinfo is timezone.utc for value in observed)
 
 
 # ---------------------------------------------------------------------------

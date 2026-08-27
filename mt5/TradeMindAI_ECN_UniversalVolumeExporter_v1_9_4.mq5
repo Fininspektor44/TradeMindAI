@@ -4,7 +4,7 @@
 #property description "FX, metals, indices, oil and BTC/ETH in one timer-driven collector."
 #property description "It exports closed-bar microstructure and never sends trading orders."
 
-input string          InpCanonicalSymbols = "EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,XAUUSD,XAGUSD,.USTECHCash,.US500Cash,.US30Cash,WTI,BRENT,BTCUSD,ETHUSD";
+input string          InpCanonicalSymbols = "EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,XAUUSD,XAGUSD,.USTECHCash,.US500Cash,.US30Cash,WTI,BRENT,BTCUSD,ETHUSD,CHFJPY,EURJPY,EURNZD,GBPAUD,GBPNZD,NZDCAD,NZDCHF";
 input ENUM_TIMEFRAMES InpTimeframe        = PERIOD_M5;
 input int             InpTimerSeconds     = 10;
 input int             InpBackfillBars     = 288;

@@ -51,6 +51,7 @@ This script:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -78,26 +79,72 @@ class _AlreadyRunningError(RuntimeError):
 
 
 class _LockFile:
-    """A simple, portable exclusive-create lock file. Never "steals" a
-    stale lock automatically (matching this whole system's fail-closed
-    philosophy) -- if a prior process crashed without cleaning up, an
-    operator must confirm no other instance is genuinely running and
-    remove the lock file by hand."""
+    """Portable exclusive-create lock with process-aware crash recovery.
+
+    A live or unverifiable owner is never displaced. A well-formed lock whose
+    PID is provably gone is removed and then re-acquired with the same atomic
+    ``open('x')`` guard, so a crash cannot block automatic reconciliation
+    forever and two contenders still cannot enter together.
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._acquired = False
 
-    def acquire(self) -> None:
+    @staticmethod
+    def _owner_is_running(pid: int) -> bool:
+        if pid <= 0:
+            return True
         try:
-            handle = self.path.open("x", encoding="utf-8")
-        except FileExistsError as exc:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+        return True
+
+    def _remove_dead_owner(self) -> bool:
+        try:
+            content = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise _AlreadyRunningError(f"existing lock file cannot be verified: {self.path}: {exc}") from exc
+        lines = content.splitlines()
+        fields = dict(item.split("=", 1) for item in (lines[0] if lines else "").split() if "=" in item)
+        try:
+            pid = int(fields["pid"])
+            datetime.fromisoformat(fields["started_at"])
+        except (KeyError, TypeError, ValueError) as exc:
             raise _AlreadyRunningError(
-                f"lock file already exists: {self.path} -- another reconciliation process may already be "
-                "running; if you are certain none is, remove this file by hand and retry"
+                f"existing lock file has no verifiable pid/start timestamp: {self.path}; refusing to steal it"
             ) from exc
+        if self._owner_is_running(pid):
+            return False
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+
+    def acquire(self) -> None:
+        for _attempt in range(2):
+            try:
+                handle = self.path.open("x", encoding="utf-8")
+                break
+            except FileExistsError as exc:
+                if not self._remove_dead_owner():
+                    raise _AlreadyRunningError(
+                        f"lock file belongs to a running reconciliation process: {self.path}"
+                    ) from exc
+        else:
+            raise _AlreadyRunningError(
+                f"lock file contention persisted while recovering a dead owner: {self.path}"
+            )
         with handle:
-            handle.write(f"pid={__import__('os').getpid()} started_at={datetime.now(timezone.utc).isoformat()}\n")
+            handle.write(f"pid={os.getpid()} started_at={datetime.now(timezone.utc).isoformat()}\n")
         self._acquired = True
 
     def release(self) -> None:
@@ -114,10 +161,12 @@ class _LockFile:
 
 
 def run_one_cycle(
-    control: SER8DemoOrderSendControl, *, account: str, orders_csv: Path, deals_csv: Path, dry_run: bool
+    control: SER8DemoOrderSendControl, *, account: str, orders_csv: Path, deals_csv: Path,
+    result_csv: Path, dry_run: bool
 ) -> ReconciliationCycleResult:
     result = run_reconciliation_cycle(
-        control, account=account, orders_csv=orders_csv, deals_csv=deals_csv, dry_run=dry_run,
+        control, account=account, orders_csv=orders_csv, deals_csv=deals_csv,
+        result_csv=result_csv, dry_run=dry_run,
     )
     print(("DRY-RUN " if dry_run else "") + "SER8 MT5 RECONCILIATION CYCLE -- " + result.summary_line())
     for outcome in result.outcomes:
@@ -156,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     db_path = Path(args.db).expanduser()
     orders_csv = Path(args.mt5_export_dir).expanduser() / f"mt5_risk_orders_utc_{args.account}.csv"
     deals_csv = Path(args.mt5_export_dir).expanduser() / f"mt5_risk_deals_utc_{args.account}.csv"
+    result_csv = Path(args.mt5_export_dir).expanduser() / f"ser8_demo_order_result_{args.account}.csv"
     lock_path = Path(args.lock_file).expanduser() if args.lock_file else db_path.with_suffix(".reconcile.lock")
 
     registry = HypothesisRegistry(db_path)
@@ -173,7 +223,8 @@ def main(argv: list[str] | None = None) -> int:
         with _LockFile(lock_path):
             if args.once:
                 result = run_one_cycle(
-                    control, account=args.account, orders_csv=orders_csv, deals_csv=deals_csv, dry_run=args.dry_run,
+                    control, account=args.account, orders_csv=orders_csv, deals_csv=deals_csv,
+                    result_csv=result_csv, dry_run=args.dry_run,
                 )
                 return 0 if result.cycle_status == "OK" else 1
             print(
@@ -182,7 +233,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             while True:
                 run_one_cycle(
-                    control, account=args.account, orders_csv=orders_csv, deals_csv=deals_csv, dry_run=args.dry_run,
+                    control, account=args.account, orders_csv=orders_csv, deals_csv=deals_csv,
+                    result_csv=result_csv, dry_run=args.dry_run,
                 )
                 time.sleep(args.poll_interval_seconds)
     except _AlreadyRunningError as exc:

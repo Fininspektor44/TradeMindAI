@@ -18,6 +18,8 @@ from trademind.action_validation import (
 )
 from trademind.market.models import Candle
 from trademind.ote_engine import build_ote_signals
+from trademind.ote_models import load_volume_rows as load_ote_volume_rows
+from trademind.ser8_core8_market_only_policy import CORE_8_SYMBOLS_ORDERED
 
 SCHEMA_VERSION = "1.5.1"
 FX_MAJORS = (
@@ -51,7 +53,9 @@ assert not set(FX_MAJORS) & set(FROZEN_PROSPECTIVE_SYMBOLS), (
 # Additive on top of FX_MAJORS: FX_MAJORS itself is never mutated (it keeps
 # meaning exactly "the seven FX majors" wherever else it's read), and this
 # is the only place the observation-collection gates below are widened.
-LIVE_OBSERVATION_SYMBOLS = FX_MAJORS + FROZEN_PROSPECTIVE_SYMBOLS
+LIVE_OBSERVATION_SYMBOLS = tuple(
+    dict.fromkeys(FX_MAJORS + FROZEN_PROSPECTIVE_SYMBOLS + CORE_8_SYMBOLS_ORDERED)
+)
 
 HORIZONS = (3, 6, 12)
 _VALID_OUTCOMES = {"WIN", "LOSS", "FLAT"}
@@ -267,38 +271,14 @@ def _utc_time(epoch_seconds: int, server_utc_offset_hours: int) -> datetime:
 
 
 def load_volume_rows(path: Path) -> tuple[list[dict[str, str]], int]:
-    """Load canonical v1.4 rows and keep only healthy M5 rows for the live
-    observation symbol universe (FX majors plus the frozen prospective
-    candidates; see ``LIVE_OBSERVATION_SYMBOLS``)."""
-    rows: list[dict[str, str]] = []
-    source_rows = 0
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for raw in csv.DictReader(handle):
-            source_rows += 1
-            row = {key: str(value or "").strip() for key, value in dict(raw).items()}
-            symbol = row.get("symbol", "").upper()
-            if symbol not in LIVE_OBSERVATION_SYMBOLS:
-                continue
-            if row.get("timeframe", "").upper() != "M5":
-                continue
-            if row.get("tick_copy_status", "").upper() != "OK":
-                continue
-            try:
-                if _integer(row, "time") <= 0 or _float(row, "point") <= 0:
-                    continue
-                if _integer(row, "tick_count") <= 0:
-                    continue
-                for key in ("open", "high", "low", "close"):
-                    value = _float(row, key)
-                    if not math.isfinite(value):
-                        raise ValueError(key)
-            except (TypeError, ValueError):
-                continue
-            row["symbol"] = symbol
-            row["timeframe"] = "M5"
-            rows.append(row)
-    rows.sort(key=lambda item: (item["symbol"], _integer(item, "time")))
-    return rows, source_rows
+    """Load healthy canonical M5 volume rows for the live universe.
+
+    ``trademind.ote_models.load_volume_rows(path, symbols)`` is the single
+    authoritative OTE loader.  Keeping this small compatibility wrapper lets
+    the established v1.21/v1.22 runtime continue importing the same public
+    name while removing its former FX-major-only parser/gate.
+    """
+    return load_ote_volume_rows(path, LIVE_OBSERVATION_SYMBOLS)
 
 
 def observed_symbols(path: Path) -> set[str]:

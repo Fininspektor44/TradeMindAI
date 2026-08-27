@@ -186,6 +186,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -290,6 +291,17 @@ class SER8DemoOrderTransportError(SER8DemoOrderSendError):
     """Raised when the transport itself fails (raises, times out, or
     returns something unparseable) -- the attempt is persisted as
     ``result_state="UNKNOWN"`` before this is raised."""
+
+
+class SER8DemoOrderBridgeBusyError(SER8DemoOrderTransportError):
+    """A prior request is still awaiting EA consumption.
+
+    This failure occurs before this request is published, so observability can
+    state ``broker_send_performed=False`` while the reserved leg remains
+    UNKNOWN/one-shot and is never retried automatically.
+    """
+
+    broker_send_performed = False
 
 
 class SER8DemoOrderReconciliationRequiredError(SER8DemoOrderTransportError):
@@ -1169,12 +1181,36 @@ class FileBridgeDemoOrderTransport:
         _validate_pending_expiration(request, now=datetime.now(timezone.utc))
         self.common_files_dir.mkdir(parents=True, exist_ok=True)
         request_path = self._request_path()
-        temporary = request_path.with_suffix(request_path.suffix + ".tmp")
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(REQUEST_CSV_FIELDS))
-            writer.writeheader()
-            writer.writerow(request.to_csv_row())
-        temporary.replace(request_path)
+        temporary = request_path.with_name(
+            f"{request_path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+        )
+        try:
+            with temporary.open("x", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(REQUEST_CSV_FIELDS))
+                writer.writeheader()
+                writer.writerow(request.to_csv_row())
+            try:
+                # Hard-link publication is atomic and NO-CLOBBER on both NTFS
+                # and POSIX: the EA can only see a completely closed file, and
+                # a prior unconsumed request can never be overwritten by a
+                # later candidate after a timeout.
+                os.link(temporary, request_path)
+            except FileExistsError as exc:
+                raise SER8DemoOrderBridgeBusyError(
+                    f"request bridge is busy with an unconsumed request: {request_path}; "
+                    "refusing to overwrite it or publish another broker request"
+                ) from exc
+            except OSError as exc:
+                error = SER8DemoOrderTransportError(
+                    f"request could not be atomically published without clobbering {request_path}: {exc}"
+                )
+                error.broker_send_performed = False
+                raise error from exc
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
         deadline = time.monotonic() + self.timeout_seconds
         result_path = self._result_path()
@@ -1190,21 +1226,32 @@ class FileBridgeDemoOrderTransport:
 
     @staticmethod
     def _read_result(path: Path, *, expected_claim_id: str) -> DemoOrderTransportResult | None:
+        rows = load_demo_order_transport_results(path)
+        matches = [row for row in rows if row.claim_id == expected_claim_id]
+        return matches[-1] if matches else None
+
+
+def load_demo_order_transport_results(path: Path) -> tuple[DemoOrderTransportResult, ...]:
+    """Load every complete executor-result journal row that can be parsed.
+
+    The EA appends durably and a reader may briefly observe the final row while
+    it is still being flushed. Incomplete rows are ignored for this poll and
+    become visible on the next one; earlier complete rows remain available for
+    automatic UNKNOWN reconciliation instead of being overwritten.
+    """
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fields = tuple(reader.fieldnames or ())
+            if any(field not in fields for field in RESULT_CSV_FIELDS):
+                return ()
+            rows = list(reader)
+    except (OSError, UnicodeError, csv.Error):
+        return ()
+    parsed: list[DemoOrderTransportResult] = []
+    for row in rows:
         try:
-            with path.open("r", encoding="utf-8-sig", newline="") as handle:
-                reader = csv.DictReader(handle)
-                rows = list(reader)
-        except (OSError, UnicodeError):
-            return None
-        if not rows:
-            return None
-        row = rows[-1]
-        if row.get("claim_id") != expected_claim_id:
-            # Stale result left over from a previous leg/claim -- ignore
-            # and keep polling; never treat someone else's result as ours.
-            return None
-        try:
-            return DemoOrderTransportResult(
+            parsed.append(DemoOrderTransportResult(
                 claim_id=row["claim_id"],
                 demo_account_id=row["demo_account_id"],
                 symbol=row["symbol"],
@@ -1219,9 +1266,10 @@ class FileBridgeDemoOrderTransport:
                     row.get("broker_send_performed", "").strip().lower() in {"1", "true", "yes"}
                     if row.get("broker_send_performed", "").strip() else None
                 ),
-            )
+            ))
         except (KeyError, ValueError):
-            return None
+            continue
+    return tuple(parsed)
 
 
 def _has_ticket(value: str | None) -> bool:
@@ -2133,7 +2181,11 @@ class SER8DemoOrderSendControl:
             requested_volume=request.volume, requested_price=request.price,
             filled_volume=(evidence.filled_volume if evidence is not None else None),
             filled_price=(evidence.filled_price if evidence is not None else None),
-            broker_send_performed=True,
+            broker_send_performed=(
+                evidence.broker_send_performed
+                if evidence is not None and evidence.broker_send_performed is not None
+                else True
+            ),
         )
 
     def list_leg_ids_for_account(self, demo_account_id: str) -> tuple[str, ...]:
@@ -2604,11 +2656,15 @@ class SER8DemoOrderSendControl:
 
             try:
                 transport_result = self.transport.send(request)
-            except Exception:
+            except Exception as exc:
                 # 12-14: transport failure -- persist UNKNOWN, never
                 # retry, never continue to a later leg while this one's
                 # true outcome is unresolved.
-                receipt = self._finalize(result_state="UNKNOWN", **common_kwargs)
+                receipt = self._finalize(
+                    result_state="UNKNOWN",
+                    broker_send_performed=getattr(exc, "broker_send_performed", None),
+                    **common_kwargs,
+                )
                 leg_receipts.append(receipt)
                 blocked = True
                 continue
@@ -2861,8 +2917,12 @@ class SER8DemoOrderSendControl:
 
             try:
                 transport_result = self.transport.send(request)
-            except Exception:
-                receipt = self._finalize(result_state="UNKNOWN", **common_kwargs)
+            except Exception as exc:
+                receipt = self._finalize(
+                    result_state="UNKNOWN",
+                    broker_send_performed=getattr(exc, "broker_send_performed", None),
+                    **common_kwargs,
+                )
                 leg_receipts.append(receipt)
                 blocked = True
                 continue
@@ -2901,6 +2961,7 @@ __all__ = [
     "DemoOrderTransportResult",
     "FakeDemoOrderTransport",
     "FileBridgeDemoOrderTransport",
+    "SER8DemoOrderBridgeBusyError",
     "SER8DemoOrderAlreadyAttemptedError",
     "SER8DemoOrderPartialExecutionError",
     "SER8DemoOrderPendingError",
@@ -2914,4 +2975,5 @@ __all__ = [
     "build_demo_order_leg_request",
     "build_demo_order_request",
     "leg_identity",
+    "load_demo_order_transport_results",
 ]

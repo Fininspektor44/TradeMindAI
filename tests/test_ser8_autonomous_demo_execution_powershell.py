@@ -225,10 +225,39 @@ def test_both_scripts_braces_and_parens_balanced() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_both_scripts_declare_hypothesis_ids_parameter_defaulting_empty() -> None:
+def test_both_scripts_default_to_exact_core8_operational_routes() -> None:
+    expected = (
+        "core8-op:CHFJPY", "core8-op:EURJPY", "core8-op:EURNZD", "core8-op:GBPAUD",
+        "core8-op:GBPNZD", "core8-op:NZDCAD", "core8-op:NZDCHF", "core8-op:USDJPY",
+    )
     for path in (INSTALL_SCRIPT, WRAPPER_SCRIPT):
         text = path.read_text(encoding="utf-8")
-        assert "[string[]]$HypothesisIds = @()," in text
+        start = text.index("[string[]]$HypothesisIds = @(")
+        block = text[start:text.index("),", start)]
+        assert tuple(re.findall(r'"(core8-op:[A-Z]+)"', block)) == expected
+        assert "core8-op:EURUSD" not in text
+
+
+def test_one_mutex_covers_producer_then_execution_then_reconciliation() -> None:
+    text = WRAPPER_SCRIPT.read_text(encoding="utf-8")
+    producer = text.index('"run_v121_live_signal_runtime.ps1"')
+    execution = text.index("& $python @arguments")
+    reconciliation = text.index('"reconcile_ser8_mt5_execution.py"')
+    assert text.index("try {") < producer < execution < reconciliation < text.index("finally {")
+    assert '[string]$MarketDataAccount = "77053345"' in text
+    assert '[string]$Account = "67206924"' in text
+    assert "TradeMindAI_Volume_v1_4" in text
+
+
+def test_installer_disables_old_independent_runtime_and_reconciliation_tasks() -> None:
+    text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    for task_name in (
+        "TradeMindAI-v1.32-ECN-LiveSignalRuntime",
+        "TradeMindAI-v1.21-LiveSignalRuntime",
+        "TradeMindAI-SER8-MT5-Reconciliation",
+    ):
+        assert task_name in text
+    assert "Disable-ScheduledTask" in text
 
 
 def test_wrapper_dispatches_to_hypothesis_ids_only_when_non_empty() -> None:

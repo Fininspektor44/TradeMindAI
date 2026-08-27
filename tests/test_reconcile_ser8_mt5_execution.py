@@ -171,6 +171,17 @@ def test_lock_file_prevents_overlapping_runs(tmp_path: Path) -> None:
     assert exit_code == 3  # refused -- never silently proceeds while a lock is held.
 
 
+def test_dead_reconciliation_process_lock_is_recovered(tmp_path: Path, monkeypatch) -> None:
+    lock_path = tmp_path / "dead-reconcile.lock"
+    lock_path.write_text("pid=999999 started_at=2026-08-26T10:00:00+00:00\n", encoding="utf-8")
+    monkeypatch.setattr(
+        reconcile_module._LockFile, "_owner_is_running", staticmethod(lambda _pid: False)
+    )
+    with reconcile_module._LockFile(lock_path):
+        assert lock_path.is_file()
+    assert not lock_path.exists()
+
+
 def test_lock_file_released_after_a_clean_run(tmp_path: Path) -> None:
     db_path = tmp_path / "ser8_registry.db"
     registry = HypothesisRegistry(db_path)

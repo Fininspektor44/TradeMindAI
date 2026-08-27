@@ -188,6 +188,28 @@ def test_one_shot_consume_before_send_preserved() -> None:
     assert consumed_index < first_send_index
 
 
+def test_failed_request_consume_refuses_broker_send() -> None:
+    source = _executor_source()
+    start = source.index("bool ReadAndConsumeRequest(")
+    end = source.index("void ProcessPendingRequest()")
+    body = source[start:end]
+    assert "if(!FileMove(filename,FILE_COMMON,RequestConsumedFilename(),FILE_COMMON|FILE_REWRITE))" in body
+    assert "return false;" in body[body.index("if(!FileMove("):]
+
+
+def test_executor_result_is_staged_retried_and_journaled() -> None:
+    source = _executor_source()
+    assert '#property version   "1.7"' in source
+    assert "ser8_demo_order_result_" in source
+    assert 'ResultPendingFilename()' in source
+    assert 'PublishPendingResult()' in source
+    assert "FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE" in source
+    assert "FileSeek(result,0,SEEK_END);" in source
+    assert "if(row_claim_id==claim_id)" in source
+    timer_body = source[source.index("void OnTimer()"):source.index("void OnDeinit(")]
+    assert timer_body.index("PublishPendingResult()") < timer_body.index("ProcessPendingRequest()")
+
+
 def test_demo_login_pin_preserved() -> None:
     source = _executor_source()
     assert "InpApprovedDemoLogin!=0 && AccountInfoInteger(ACCOUNT_LOGIN)!=InpApprovedDemoLogin" in source

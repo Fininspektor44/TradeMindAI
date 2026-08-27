@@ -65,6 +65,8 @@ from trademind.ser8_mt5_demo_order_send import (
     DemoOrderTransportResult,
     SER8DemoOrderSendControl,
     SER8DemoOrderSendError,
+    _classify_result,
+    load_demo_order_transport_results,
 )
 
 ORDER_HISTORY_REQUIRED_FIELDS = (
@@ -516,13 +518,14 @@ def run_reconciliation_cycle(
     account: str,
     orders_csv: Path,
     deals_csv: Path,
+    result_csv: Path | None = None,
     now: datetime | None = None,
     dry_run: bool = False,
 ) -> ReconciliationCycleResult:
     """ONE reconciliation cycle for ``account`` -- discovers every
-    persisted PENDING leg for that account (generic; never hard-codes a
-    claim or ticket), loads the two MT5 export CSVs ONCE, and evaluates
-    every leg against them. Never calls a transport (this function is
+    persisted PENDING/UNKNOWN leg for that account (generic; never hard-codes
+    a claim or ticket), loads the MT5 executor result journal plus the two
+    broker-history CSVs ONCE, and evaluates every leg against them. Never calls a transport (this function is
     never given one). A structurally invalid export CSV fails the WHOLE
     cycle closed (``cycle_status="EVIDENCE_ERROR"``) rather than silently
     skipping legs against partial/guessed evidence.
@@ -544,6 +547,17 @@ def run_reconciliation_cycle(
             cycle_status=f"EVIDENCE_ERROR: {exc}", outcomes=(),
         )
 
+    transport_results = (
+        load_demo_order_transport_results(result_csv)
+        if result_csv is not None and result_csv.is_file()
+        else ()
+    )
+    results_by_claim: dict[str, list[DemoOrderTransportResult]] = {}
+    for transport_result in transport_results:
+        distinct = results_by_claim.setdefault(transport_result.claim_id, [])
+        if transport_result not in distinct:
+            distinct.append(transport_result)
+
     outcomes: list[LegReconciliationOutcome] = []
     recovered_unknown = 0
     unknown_matches: dict[str, list[OrderHistoryRow]] = {leg_id: [] for leg_id in unknown_leg_ids}
@@ -563,6 +577,54 @@ def run_reconciliation_cycle(
             unknown_matches.setdefault(leg_id, []).append(row)
 
     for leg_id in unknown_leg_ids:
+        exact_results = results_by_claim.get(leg_id, [])
+        if len(exact_results) > 1:
+            outcomes.append(
+                LegReconciliationOutcome(
+                    leg_id,
+                    "AMBIGUOUS",
+                    "UNKNOWN recovery found conflicting executor-result rows for the exact claim_id",
+                )
+            )
+            continue
+        if len(exact_results) == 1:
+            request = control.get_leg_request(leg_id)
+            if request is None:
+                outcomes.append(LegReconciliationOutcome(leg_id, "AMBIGUOUS", "UNKNOWN request missing"))
+                continue
+            evidence = exact_results[0]
+            result_state = _classify_result(request, evidence)
+            if result_state in {"UNKNOWN", "MALFORMED"}:
+                outcomes.append(
+                    LegReconciliationOutcome(
+                        leg_id,
+                        "AMBIGUOUS",
+                        "exact executor-result row failed its persisted request identity/content checks",
+                    )
+                )
+                continue
+            if not dry_run:
+                control.reconcile_unknown_leg(leg_id, evidence=evidence, now=captured_at)
+            recovered_unknown += 1
+            outcome_status = (
+                "NEWLY_FILLED" if result_state == "FILLED" else
+                "UNKNOWN_RECOVERED" if result_state == "PENDING" else
+                "NEWLY_TERMINAL"
+            )
+            outcomes.append(
+                LegReconciliationOutcome(
+                    leg_id,
+                    outcome_status,
+                    (
+                        f"would recover UNKNOWN to {result_state} from exact executor result (dry-run)"
+                        if dry_run else
+                        f"recovered UNKNOWN to {result_state} from exact executor result"
+                    ),
+                    result_state,
+                )
+            )
+            continue
+
         matches = unknown_matches.get(leg_id, [])
         if len(matches) != 1:
             outcomes.append(

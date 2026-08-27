@@ -81,11 +81,23 @@ from trademind.risk_manager import (
     RiskProfile,
     evaluate_risk,
 )
+from trademind.ser8_core8_market_only_policy import (
+    CORE_8_SYMBOLS,
+    SER8Core8PolicyError,
+    verify_core8_market_only_execution,
+)
 from trademind.signal_intelligence import SignalCandidate
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
 
 SCHEMA_VERSION = "ser8-research-risk-gate-evidence-v1"
 _EVIDENCE_HASH_DOMAIN = b"trademind:ser8:research-risk-gate-evidence:v1"
+
+CORE8_OPERATIONAL_ROUTE_PREFIX = "core8-op:"
+CORE8_OPERATIONAL_SETUP_FAMILY = "SMC_OTE_PIVOT_BREAK"
+CORE8_AUTHORITATIVE_OTE_PROVENANCE = "OTE_ENGINE_BUILD_OTE_SIGNALS"
+CORE8_OPERATIONAL_FAMILY_ID = "core8-operational-v1"
+_CORE8_OPERATIONAL_ELIGIBILITY_HASH_DOMAIN = b"trademind:ser8:core8-operational-eligibility:v1"
+_CORE8_OPERATIONAL_SCOPE_HASH_DOMAIN = b"trademind:ser8:core8-operational-scope:v1"
 
 # The only signal_state this gate ever asserts to risk_manager.evaluate_risk.
 # "PUBLISHABLE" is the live signal_intelligence pipeline's own automatic
@@ -106,6 +118,115 @@ _GATE_STATE = "APPROVED_MANUAL"
 class SER8ResearchRiskGateError(RuntimeError):
     """Raised whenever any precondition in this gate's required input chain
     fails -- always before ``risk_manager.evaluate_risk`` is called."""
+
+
+@dataclass(frozen=True, slots=True)
+class Core8OperationalRouteV1:
+    """Closed, deterministic identity for one ``core8-op:<SYMBOL>`` route.
+
+    This is deliberately not a research eligibility artifact or hypothesis
+    scope.  It grants no execution authority; it only identifies the narrow
+    operational path whose genuine OTE candidate may skip those two legacy
+    research lookups while retaining every downstream gate.
+    """
+
+    route_id: str
+    symbol: str
+    hypothesis_family_id: str = CORE8_OPERATIONAL_FAMILY_ID
+    timeframe: str = "M5"
+    setup_family: str = CORE8_OPERATIONAL_SETUP_FAMILY
+    allowed_action_scope: str = "BOTH"
+    eligibility_hash: str = field(init=False)
+    scope_hash: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.route_id) is not str or type(self.symbol) is not str:
+            raise SER8ResearchRiskGateError("CORE8 operational route identity must be strings")
+        if self.symbol not in CORE_8_SYMBOLS or self.route_id != CORE8_OPERATIONAL_ROUTE_PREFIX + self.symbol:
+            raise SER8ResearchRiskGateError(
+                f"invalid CORE8 operational route {self.route_id!r}; only exact core8-op:<CORE8> routes are allowed"
+            )
+        if (
+            self.hypothesis_family_id != CORE8_OPERATIONAL_FAMILY_ID
+            or self.setup_family != CORE8_OPERATIONAL_SETUP_FAMILY
+            or self.timeframe != "M5"
+            or self.allowed_action_scope != "BOTH"
+        ):
+            raise SER8ResearchRiskGateError("CORE8 operational route constants cannot be widened")
+        projection = {"route_id": self.route_id, "symbol": self.symbol}
+        object.__setattr__(
+            self,
+            "eligibility_hash",
+            sha256_bytes(
+                _CORE8_OPERATIONAL_ELIGIBILITY_HASH_DOMAIN
+                + b"\x00"
+                + canonical_json_bytes(projection)
+            ),
+        )
+        object.__setattr__(
+            self,
+            "scope_hash",
+            sha256_bytes(
+                _CORE8_OPERATIONAL_SCOPE_HASH_DOMAIN
+                + b"\x00"
+                + canonical_json_bytes(projection)
+            ),
+        )
+
+    @property
+    def hypothesis_id(self) -> str:
+        return self.route_id
+
+
+def resolve_core8_operational_route(route_id: object) -> Core8OperationalRouteV1 | None:
+    """Resolve an exact operational route, or ``None`` for a legacy id.
+
+    A value beginning with the reserved prefix but not naming one of the
+    exact eight routes fails closed instead of falling back to research.
+    """
+    if type(route_id) is not str or not route_id.startswith(CORE8_OPERATIONAL_ROUTE_PREFIX):
+        return None
+    symbol = route_id.removeprefix(CORE8_OPERATIONAL_ROUTE_PREFIX)
+    return Core8OperationalRouteV1(route_id=route_id, symbol=symbol)
+
+
+def verify_core8_operational_candidate(
+    route: Core8OperationalRouteV1,
+    candidate: SignalCandidate,
+) -> None:
+    """Verify candidate-owned proof for the direct operational path."""
+    if type(route) is not Core8OperationalRouteV1:
+        raise SER8ResearchRiskGateError("operational_route must be a genuine Core8OperationalRouteV1")
+    if type(candidate) is not SignalCandidate:
+        raise SER8ResearchRiskGateError("candidate must be a genuine SignalCandidate")
+    if candidate.symbol != route.symbol:
+        raise SER8ResearchRiskGateError(
+            f"candidate symbol {candidate.symbol!r} does not match operational route {route.route_id!r}"
+        )
+    if candidate.symbol not in CORE_8_SYMBOLS:
+        raise SER8ResearchRiskGateError("operational candidate symbol is not in canonical CORE8")
+    if candidate.setup_family != CORE8_OPERATIONAL_SETUP_FAMILY:
+        raise SER8ResearchRiskGateError(
+            f"operational candidate setup_family must be {CORE8_OPERATIONAL_SETUP_FAMILY!r}"
+        )
+    if CORE8_AUTHORITATIVE_OTE_PROVENANCE not in candidate.provenance:
+        raise SER8ResearchRiskGateError(
+            f"operational candidate lacks authoritative OTE provenance marker "
+            f"{CORE8_AUTHORITATIVE_OTE_PROVENANCE!r}"
+        )
+    if candidate.generated_from_market_data is not True:
+        raise SER8ResearchRiskGateError("operational candidate is not marked as generated from market data")
+    try:
+        verify_core8_market_only_execution(
+            symbol=candidate.symbol,
+            order_types=[entry.order_type for entry in candidate.plan.entries],
+        )
+    except SER8Core8PolicyError as exc:
+        raise SER8ResearchRiskGateError(str(exc)) from exc
+    if candidate.plan.entries[0].allocation != 1.0:
+        raise SER8ResearchRiskGateError(
+            "CORE8 operational MARKET_ONLY entry allocation must be exactly 1.0"
+        )
 
 
 def _nonempty_str(value: object, *, field_name: str) -> str:
@@ -237,8 +358,8 @@ def _profile_hash(profile: RiskProfile) -> str:
 
 
 def evaluate_ser8_research_risk_gate(
-    eligibility: ResearchEligibilityArtifactV1,
-    scope: HypothesisTradeableScopeV1,
+    eligibility: ResearchEligibilityArtifactV1 | None,
+    scope: HypothesisTradeableScopeV1 | None,
     candidate: SignalCandidate,
     *,
     registry: HypothesisRegistry,
@@ -252,6 +373,7 @@ def evaluate_ser8_research_risk_gate(
     requested_risk_pct: float | None = None,
     pending_reservations: tuple[PendingRiskReservation, ...] = (),
     maximum_mt5_age_seconds: float = 120.0,
+    operational_route: Core8OperationalRouteV1 | None = None,
     now: datetime | None = None,
 ) -> SER8ResearchRiskGateResult:
     """Evaluate the SER8 research risk gate and STOP at a verified
@@ -263,49 +385,68 @@ def evaluate_ser8_research_risk_gate(
     """
     captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
-    # 1-2: re-verify ACCEPTED eligibility fresh; never trust the
-    # caller-supplied object at face value.
-    fresh_eligibility = present_eligible_artifact(
-        eligibility.hypothesis_id, registry=registry, final_verdict=final_verdict
-    )
-    if fresh_eligibility.artifact_hash != eligibility.artifact_hash:
-        raise SER8ResearchRiskGateError(
-            "supplied research eligibility artifact does not match a fresh, independent "
-            "re-verification of the same hypothesis_id -- refusing to trust it"
+    if operational_route is not None:
+        # The only direct-connect exception: there is deliberately no
+        # ResearchEligibilityArtifactV1 or HypothesisTradeableScopeV1 to
+        # look up.  The closed route plus candidate-owned OTE proof replace
+        # only those two legacy lookups; risk and every later gate remain.
+        if eligibility is not None or scope is not None:
+            raise SER8ResearchRiskGateError(
+                "CORE8 operational evaluation must not be combined with research lifecycle artifacts"
+            )
+        verify_core8_operational_candidate(operational_route, candidate)
+        hypothesis_id = operational_route.hypothesis_id
+        hypothesis_family_id = operational_route.hypothesis_family_id
+        eligibility_hash = operational_route.eligibility_hash
+        scope_hash = operational_route.scope_hash
+    else:
+        # 1-2: re-verify ACCEPTED eligibility fresh; never trust the
+        # caller-supplied object at face value.
+        fresh_eligibility = present_eligible_artifact(
+            eligibility.hypothesis_id, registry=registry, final_verdict=final_verdict
         )
+        if fresh_eligibility.artifact_hash != eligibility.artifact_hash:
+            raise SER8ResearchRiskGateError(
+                "supplied research eligibility artifact does not match a fresh, independent "
+                "re-verification of the same hypothesis_id -- refusing to trust it"
+            )
 
-    # 3: explicit identity cross-check between eligibility and scope, for a
-    # clear error before attempting to re-derive the scope at all.
-    if (
-        scope.hypothesis_id != eligibility.hypothesis_id
-        or scope.hypothesis_family_id != eligibility.hypothesis_family_id
-        or scope.bound_hypothesis_content_hash != eligibility.bound_hypothesis_content_hash
-        or scope.manifest_semantic_hash != eligibility.manifest_semantic_hash
-        or scope.manifest_artifact_hash_ref != eligibility.manifest_artifact_hash_ref
-    ):
-        raise SER8ResearchRiskGateError(
-            "supplied hypothesis tradeable scope does not belong to the same "
-            "hypothesis/family/content/manifest as the supplied eligibility artifact"
-        )
+        # 3: explicit identity cross-check between eligibility and scope,
+        # for a clear error before attempting to re-derive the scope at all.
+        if (
+            scope.hypothesis_id != eligibility.hypothesis_id
+            or scope.hypothesis_family_id != eligibility.hypothesis_family_id
+            or scope.bound_hypothesis_content_hash != eligibility.bound_hypothesis_content_hash
+            or scope.manifest_semantic_hash != eligibility.manifest_semantic_hash
+            or scope.manifest_artifact_hash_ref != eligibility.manifest_artifact_hash_ref
+        ):
+            raise SER8ResearchRiskGateError(
+                "supplied hypothesis tradeable scope does not belong to the same "
+                "hypothesis/family/content/manifest as the supplied eligibility artifact"
+            )
 
-    # 4: re-derive the scope fresh from trusted proposal/CAS provenance;
-    # never trust the caller-supplied scope object at face value either.
-    fresh_scope = bind_hypothesis_tradeable_scope(
-        eligibility.hypothesis_id, registry=registry, artifact_store=final_verdict.artifacts
-    )
-    if fresh_scope.scope_hash != scope.scope_hash:
-        raise SER8ResearchRiskGateError(
-            "supplied hypothesis tradeable scope does not match a fresh, independent "
-            "re-derivation from trusted proposal/CAS provenance -- refusing to trust it"
+        # 4: re-derive the scope fresh from trusted proposal/CAS provenance;
+        # never trust the caller-supplied scope object at face value either.
+        fresh_scope = bind_hypothesis_tradeable_scope(
+            eligibility.hypothesis_id, registry=registry, artifact_store=final_verdict.artifacts
         )
+        if fresh_scope.scope_hash != scope.scope_hash:
+            raise SER8ResearchRiskGateError(
+                "supplied hypothesis tradeable scope does not match a fresh, independent "
+                "re-derivation from trusted proposal/CAS provenance -- refusing to trust it"
+            )
 
-    # 5-6: the candidate is whatever the caller independently supplies; it
-    # must exactly match the (now doubly-verified) scope's identity.
-    if not verify_live_candidate_matches_scope(scope, candidate):
-        raise SER8ResearchRiskGateError(
-            "live candidate does not exactly match the hypothesis tradeable scope "
-            "(symbol/timeframe/setup_family/action)"
-        )
+        # 5-6: the candidate is whatever the caller independently supplies;
+        # it must exactly match the verified scope's identity.
+        if not verify_live_candidate_matches_scope(scope, candidate):
+            raise SER8ResearchRiskGateError(
+                "live candidate does not exactly match the hypothesis tradeable scope "
+                "(symbol/timeframe/setup_family/action)"
+            )
+        hypothesis_id = eligibility.hypothesis_id
+        hypothesis_family_id = eligibility.hypothesis_family_id
+        eligibility_hash = eligibility.artifact_hash
+        scope_hash = scope.scope_hash
 
     # 8-9: MT5/account snapshot freshness and symbol trade_mode/action
     # compatibility are enforced entirely inside adapt_mt5_exports, unchanged.
@@ -358,10 +499,10 @@ def evaluate_ser8_research_risk_gate(
 
     evidence = SER8ResearchRiskGateEvidenceV1(
         schema_version=SCHEMA_VERSION,
-        research_hypothesis_id=eligibility.hypothesis_id,
-        research_hypothesis_family_id=eligibility.hypothesis_family_id,
-        research_eligibility_artifact_hash=eligibility.artifact_hash,
-        hypothesis_tradeable_scope_hash=scope.scope_hash,
+        research_hypothesis_id=hypothesis_id,
+        research_hypothesis_family_id=hypothesis_family_id,
+        research_eligibility_artifact_hash=eligibility_hash,
+        hypothesis_tradeable_scope_hash=scope_hash,
         live_candidate_signal_id=candidate.signal_id,
         live_candidate_symbol=candidate.symbol,
         live_candidate_timeframe=candidate.timeframe,
@@ -380,9 +521,16 @@ def evaluate_ser8_research_risk_gate(
 
 
 __all__ = [
+    "CORE8_AUTHORITATIVE_OTE_PROVENANCE",
+    "CORE8_OPERATIONAL_FAMILY_ID",
+    "CORE8_OPERATIONAL_ROUTE_PREFIX",
+    "CORE8_OPERATIONAL_SETUP_FAMILY",
     "SCHEMA_VERSION",
+    "Core8OperationalRouteV1",
     "SER8ResearchRiskGateError",
     "SER8ResearchRiskGateEvidenceV1",
     "SER8ResearchRiskGateResult",
     "evaluate_ser8_research_risk_gate",
+    "resolve_core8_operational_route",
+    "verify_core8_operational_candidate",
 ]

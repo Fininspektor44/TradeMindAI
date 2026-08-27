@@ -25,6 +25,7 @@ from trademind.fx_research import (
     observed_symbols,
 )
 from trademind.live_signal_runtime import closed_volume_rows, run_live_runtime
+from trademind.ser8_core8_market_only_policy import CORE_8_SYMBOLS_ORDERED
 from trademind.signal_passport_factory import FactoryRun
 from trademind.signal_to_risk_bridge import BridgeRun
 from trademind.volume import VolumeCollectSummary
@@ -234,8 +235,9 @@ def test_frozen_prospective_symbols_are_disjoint_from_fx_majors() -> None:
 
 
 def test_live_observation_symbols_is_exactly_the_additive_union() -> None:
-    assert set(LIVE_OBSERVATION_SYMBOLS) == set(FX_MAJORS) | set(FROZEN_PROSPECTIVE_SYMBOLS)
-    assert len(LIVE_OBSERVATION_SYMBOLS) == len(FX_MAJORS) + len(FROZEN_PROSPECTIVE_SYMBOLS)
+    assert set(LIVE_OBSERVATION_SYMBOLS) == (
+        set(FX_MAJORS) | set(FROZEN_PROSPECTIVE_SYMBOLS) | set(CORE_8_SYMBOLS_ORDERED)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +446,7 @@ def test_live_observation_symbols_order_is_stable() -> None:
     assert LIVE_OBSERVATION_SYMBOLS == (
         "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
         ".USTECHCASH", ".US30CASH", "XAGUSD",
+        "CHFJPY", "EURJPY", "EURNZD", "GBPAUD", "GBPNZD", "NZDCAD", "NZDCHF",
     )
 
 

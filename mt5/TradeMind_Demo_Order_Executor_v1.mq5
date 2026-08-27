@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.6"
-#property description "TradeMind SER8 Demo Order Executor v1.6"
+#property version   "1.7"
+#property description "TradeMind SER8 Demo Order Executor v1.7"
 #property description "EXECUTOR ONLY. Reads at most one pending SER8 order"
 #property description "request per timer tick, independently verifies the"
 #property description "account/login and request identity, sends exactly"
@@ -69,6 +69,12 @@
 #property description "fallback. Order/symbol exports now expose expiration"
 #property description "mode, expiration timestamp, and order comment for"
 #property description "deterministic legacy inventory and fail-closed audit."
+#property description "v1.7 makes request consumption and result publication"
+#property description "durable: a request is never sent unless its atomic"
+#property description "rename to .consumed succeeds, and executor results"
+#property description "append to a journal through a persistent pending file"
+#property description "that is retried on later timer ticks. Python timeouts"
+#property description "remain UNKNOWN and are never automatically resent."
 
 #include <Trade\Trade.mqh>
 
@@ -128,6 +134,114 @@ string ResultFilename()
    return InpOutputFolder+"\\ser8_demo_order_result_"+LoginText()+".csv";
 }
 
+string ResultPendingFilename()
+{
+   return InpOutputFolder+"\\ser8_demo_order_result_"+LoginText()+".pending";
+}
+
+bool PublishPendingResult()
+{
+   string pending_filename=ResultPendingFilename();
+   if(!FileIsExist(pending_filename,FILE_COMMON))
+      return true;
+
+   int pending=FileOpen(
+      pending_filename,FILE_READ|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ,',');
+   if(pending==INVALID_HANDLE)
+   {
+      Print("TradeMind demo executor: pending result could not be opened, error=",GetLastError());
+      return false;
+   }
+   for(int i=0;i<11 && !FileIsEnding(pending);i++)
+      FileReadString(pending);
+   if(FileIsEnding(pending))
+   {
+      FileClose(pending);
+      Print("TradeMind demo executor: pending result is incomplete; refusing to discard it.");
+      return false;
+   }
+   string claim_id=FileReadString(pending);
+   string demo_account_id=FileReadString(pending);
+   string symbol=FileReadString(pending);
+   string retcode=FileReadString(pending);
+   string retcode_description=FileReadString(pending);
+   string order_ticket=FileReadString(pending);
+   string deal_ticket=FileReadString(pending);
+   string position_ticket=FileReadString(pending);
+   string filled_volume=FileReadString(pending);
+   string filled_price=FileReadString(pending);
+   string broker_send_performed=FileReadString(pending);
+   FileClose(pending);
+
+   int result=FileOpen(
+      ResultFilename(),
+      FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ|FILE_SHARE_WRITE,
+      ',');
+   if(result==INVALID_HANDLE)
+   {
+      Print("TradeMind demo executor: result journal could not be opened; pending result retained, error=",GetLastError());
+      return false;
+   }
+   bool empty=(FileSize(result)==0);
+   bool already_journaled=false;
+   if(!empty)
+   {
+      FileSeek(result,0,SEEK_SET);
+      for(int header_field=0;header_field<11 && !FileIsEnding(result);header_field++)
+         FileReadString(result);
+      while(!FileIsEnding(result))
+      {
+         string row_claim_id=FileReadString(result);
+         for(int result_field=1;result_field<11 && !FileIsEnding(result);result_field++)
+            FileReadString(result);
+         if(row_claim_id==claim_id)
+         {
+            already_journaled=true;
+            break;
+         }
+      }
+   }
+   if(already_journaled)
+   {
+      FileClose(result);
+      if(!FileDelete(pending_filename,FILE_COMMON))
+      {
+         Print("TradeMind demo executor: duplicate-safe pending marker cleanup failed; blocking new requests.");
+         return false;
+      }
+      return true;
+   }
+   FileSeek(result,0,SEEK_END);
+   if(empty)
+   {
+      if(FileWrite(
+         result,
+         "claim_id","demo_account_id","symbol","retcode","retcode_description",
+         "order_ticket","deal_ticket","position_ticket","filled_volume","filled_price","broker_send_performed")<=0)
+      {
+         FileClose(result);
+         Print("TradeMind demo executor: result journal header write failed; pending result retained.");
+         return false;
+      }
+   }
+   if(FileWrite(
+      result,claim_id,demo_account_id,symbol,retcode,retcode_description,
+      order_ticket,deal_ticket,position_ticket,filled_volume,filled_price,broker_send_performed)<=0)
+   {
+      FileClose(result);
+      Print("TradeMind demo executor: result journal row write failed; pending result retained.");
+      return false;
+   }
+   FileFlush(result);
+   FileClose(result);
+   if(!FileDelete(pending_filename,FILE_COMMON))
+   {
+      Print("TradeMind demo executor: result was journaled but pending marker could not be removed; blocking new requests.");
+      return false;
+   }
+   return true;
+}
+
 void WriteResult(
    string claim_id,
    string demo_account_id,
@@ -141,13 +255,19 @@ void WriteResult(
    string filled_price,
    bool broker_send_performed)
 {
+   string pending_filename=ResultPendingFilename();
+   if(FileIsExist(pending_filename,FILE_COMMON))
+   {
+      Print("TradeMind demo executor: prior pending result still exists; refusing to overwrite it.");
+      return;
+   }
    int handle=FileOpen(
-      ResultFilename(),
+      pending_filename,
       FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ,
       ',');
    if(handle==INVALID_HANDLE)
    {
-      Print("TradeMind demo executor: could not open result file for writing, error=",GetLastError());
+      Print("TradeMind demo executor: could not stage result for writing, error=",GetLastError());
       return;
    }
    FileWrite(
@@ -158,7 +278,9 @@ void WriteResult(
       handle,
       claim_id,demo_account_id,symbol,IntegerToString(retcode),retcode_description,
       order_ticket,deal_ticket,position_ticket,filled_volume,filled_price,(broker_send_performed ? 1 : 0));
+   FileFlush(handle);
    FileClose(handle);
+   PublishPendingResult();
 }
 
 void WriteMalformedResult(string claim_id,string demo_account_id,string symbol)
@@ -226,10 +348,18 @@ bool ReadAndConsumeRequest(
    // never be re-read on a later timer tick regardless of what happens
    // next (this is the file-level half of the one-shot guard; the
    // authoritative one-shot guard itself lives on the SER8/Python side).
-   FileMove(filename,FILE_COMMON,RequestConsumedFilename(),FILE_COMMON|FILE_REWRITE);
+   if(!FileMove(filename,FILE_COMMON,RequestConsumedFilename(),FILE_COMMON|FILE_REWRITE))
+   {
+      Print("TradeMind demo executor: request could not be atomically consumed; refusing broker send, error=",GetLastError());
+      return false;
+   }
 
    if(!ok || claim_id=="" || demo_account_id=="" || symbol=="")
+   {
+      if(claim_id!="")
+         WriteMalformedResult(claim_id,demo_account_id,symbol);
       return false;
+   }
 
    return true;
 }
@@ -1011,8 +1141,9 @@ int OnInit()
    g_last_order_poll_at=0;
    g_last_risk_snapshot_at=0;
    CollectRiskSnapshot();
+   PublishPendingResult();
    g_last_risk_snapshot_at=TimeGMT();
-   Print("TradeMind SER8 Demo Order Executor v1.4 started. One EA, one chart: SER8 one-shot order execution "
+   Print("TradeMind SER8 Demo Order Executor v1.7 started. One EA, one chart: SER8 one-shot order execution "
          "plus read-only risk/position/order/deal snapshot export. No strategy logic, no position sizing of "
          "any kind runs here.");
    return INIT_SUCCEEDED;
@@ -1026,7 +1157,8 @@ void OnTimer()
    if(now-g_last_order_poll_at>=InpPollSeconds)
    {
       g_last_order_poll_at=now;
-      ProcessPendingRequest();
+      if(PublishPendingResult())
+         ProcessPendingRequest();
    }
 
    // Risk snapshot refresh -- unconditional, independent of order outcome.

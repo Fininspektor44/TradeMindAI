@@ -104,6 +104,7 @@ from trademind.ser8_mt5_demo_order_send import (
     DemoOrderTransportResult,
     FakeDemoOrderTransport,
     FileBridgeDemoOrderTransport,
+    SER8DemoOrderBridgeBusyError,
     SER8DemoOrderAlreadyAttemptedError,
     SER8DemoOrderPartialExecutionError,
     SER8DemoOrderPendingError,
@@ -118,6 +119,7 @@ from trademind.ser8_mt5_demo_order_send import (
     build_demo_order_leg_request,
     build_demo_order_request,
     leg_identity,
+    load_demo_order_transport_results,
 )
 from trademind.ser8_research_risk_gate import evaluate_ser8_research_risk_gate
 from trademind.signal_intelligence import EntryOrder, SignalCandidate, TradePlan
@@ -1298,6 +1300,43 @@ def test_file_bridge_transport_ignores_stale_result_and_times_out(tmp_path: Path
 
     with pytest.raises(SER8DemoOrderTransportError, match="no matching result"):
         transport.send(request)
+
+
+def test_file_bridge_never_clobbers_an_unconsumed_request(tmp_path: Path) -> None:
+    context, claim, decision, candidate = _claim_case(tmp_path)
+    from trademind.ser8_demo_account_safety_gate import verify_demo_account_authorization
+
+    demo_authorization = verify_demo_account_authorization(claim, allowlist=_allowlist(LOGIN), now=NOW)
+    request = build_demo_order_request(claim, decision, candidate, demo_authorization=demo_authorization)
+    common_dir = tmp_path / "common_files"
+    common_dir.mkdir()
+    request_path = common_dir / f"ser8_demo_order_request_{LOGIN}.csv"
+    request_path.write_text("prior-unconsumed-request\n", encoding="utf-8")
+    transport = FileBridgeDemoOrderTransport(
+        common_files_dir=common_dir, login=LOGIN, poll_interval_seconds=0.01, timeout_seconds=0.05
+    )
+
+    with pytest.raises(SER8DemoOrderBridgeBusyError) as raised:
+        transport.send(request)
+    assert raised.value.broker_send_performed is False
+    assert request_path.read_text(encoding="utf-8") == "prior-unconsumed-request\n"
+
+
+def test_result_journal_keeps_older_exact_claim_recoverable(tmp_path: Path) -> None:
+    path = tmp_path / "results.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(RESULT_CSV_FIELDS))
+        writer.writeheader()
+        for claim_id in ("wanted", "newer-other"):
+            writer.writerow({
+                "claim_id": claim_id, "demo_account_id": LOGIN, "symbol": "EURJPY",
+                "retcode": "10009", "retcode_description": "done", "order_ticket": "1",
+                "deal_ticket": "2", "position_ticket": "3", "filled_volume": "0.47",
+                "filled_price": "185.7", "broker_send_performed": "1",
+            })
+    rows = load_demo_order_transport_results(path)
+    assert [row.claim_id for row in rows] == ["wanted", "newer-other"]
+    assert FileBridgeDemoOrderTransport._read_result(path, expected_claim_id="wanted") == rows[0]
 
 
 # ---------------------------------------------------------------------------

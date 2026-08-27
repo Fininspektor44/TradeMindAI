@@ -90,18 +90,21 @@ POLICY_VERSION = "ser8-core8-market-only-policy-v1"
 #: explicit, hand-verified literal (not discovered, ranked, or inferred at
 #: runtime): widening execution authority must be a reviewed source change,
 #: never a side effect of broker metadata or a screening run.
-CORE_8_SYMBOLS = frozenset(
-    {
-        "CHFJPY",
-        "EURJPY",
-        "EURNZD",
-        "GBPAUD",
-        "GBPNZD",
-        "NZDCAD",
-        "NZDCHF",
-        "USDJPY",
-    }
+CORE_8_SYMBOLS_ORDERED = (
+    "CHFJPY",
+    "EURJPY",
+    "EURNZD",
+    "GBPAUD",
+    "GBPNZD",
+    "NZDCAD",
+    "NZDCHF",
+    "USDJPY",
 )
+
+# Membership checks stay immutable and O(1), while every producer/deployer/
+# scheduler that needs stable routing order derives it from the ONE literal
+# above instead of maintaining another handwritten CORE8 list.
+CORE_8_SYMBOLS = frozenset(CORE_8_SYMBOLS_ORDERED)
 
 #: The only order type CORE_8 supervised demo execution may ever place.
 MARKET_ONLY_ORDER_TYPE = "MARKET"
@@ -220,6 +223,7 @@ def market_only_plan(plan: TradePlan) -> TradePlan:
 
 __all__ = [
     "CORE_8_SYMBOLS",
+    "CORE_8_SYMBOLS_ORDERED",
     "MARKET_ONLY_ORDER_TYPE",
     "POLICY_VERSION",
     "SER8Core8PolicyError",

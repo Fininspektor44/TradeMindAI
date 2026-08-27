@@ -29,6 +29,13 @@ EXPECTED_SYMBOLS = (
     "BRENT",
     "BTCUSD",
     "ETHUSD",
+    "CHFJPY",
+    "EURJPY",
+    "EURNZD",
+    "GBPAUD",
+    "GBPNZD",
+    "NZDCAD",
+    "NZDCHF",
 )
 
 

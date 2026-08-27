@@ -83,7 +83,12 @@ from trademind.discovery.research_eligibility_boundary import (
 )
 from trademind.hypothesis_live_candidate_matching import verify_live_candidate_matches_scope
 from trademind.risk_manager import RiskDecision
-from trademind.ser8_research_risk_gate import SER8ResearchRiskGateResult
+from trademind.ser8_research_risk_gate import (
+    Core8OperationalRouteV1,
+    SER8ResearchRiskGateError,
+    SER8ResearchRiskGateResult,
+    verify_core8_operational_candidate,
+)
 from trademind.signal_intelligence import SignalCandidate
 from trademind.signal_statistics_provenance import canonical_json_bytes, sha256_bytes
 
@@ -278,13 +283,14 @@ class SER8ExecutionAuthorizationControl:
 
     def authorize(
         self,
-        eligibility: ResearchEligibilityArtifactV1,
-        scope: HypothesisTradeableScopeV1,
+        eligibility: ResearchEligibilityArtifactV1 | None,
+        scope: HypothesisTradeableScopeV1 | None,
         candidate: SignalCandidate,
         result: SER8ResearchRiskGateResult,
         *,
         maximum_evidence_age_seconds: float = DEFAULT_MAXIMUM_EVIDENCE_AGE_SECONDS,
         authorization_ttl_seconds: float = DEFAULT_AUTHORIZATION_TTL_SECONDS,
+        operational_route: Core8OperationalRouteV1 | None = None,
         now: datetime | None = None,
     ) -> ExecutionAuthorizationV1:
         """Create (or idempotently return) an ``ExecutionAuthorizationV1``.
@@ -299,18 +305,8 @@ class SER8ExecutionAuthorizationControl:
         decision: RiskDecision = result.decision
         captured_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
 
-        # 4: supplied eligibility/scope/candidate genuinely correspond to
-        # what this evidence record was itself built from.
-        if evidence.research_eligibility_artifact_hash != eligibility.artifact_hash:
-            raise SER8ExecutionAuthorizationError(
-                "supplied eligibility artifact does not match the risk-gate evidence's own "
-                "recorded eligibility artifact hash"
-            )
-        if evidence.hypothesis_tradeable_scope_hash != scope.scope_hash:
-            raise SER8ExecutionAuthorizationError(
-                "supplied hypothesis tradeable scope does not match the risk-gate evidence's own "
-                "recorded scope hash"
-            )
+        # 4: supplied lineage/candidate genuinely corresponds to what this
+        # evidence record was itself built from.
         if (
             evidence.live_candidate_signal_id != candidate.signal_id
             or evidence.live_candidate_symbol != candidate.symbol
@@ -321,41 +317,83 @@ class SER8ExecutionAuthorizationControl:
                 "supplied live candidate does not match the risk-gate evidence's own recorded "
                 "candidate identity"
             )
-        if (
-            scope.hypothesis_id != eligibility.hypothesis_id
-            or scope.hypothesis_family_id != eligibility.hypothesis_family_id
-            or scope.bound_hypothesis_content_hash != eligibility.bound_hypothesis_content_hash
-        ):
-            raise SER8ExecutionAuthorizationError(
-                "supplied scope does not belong to the same hypothesis/family/content as the "
-                "supplied eligibility artifact"
+
+        if operational_route is not None:
+            if eligibility is not None or scope is not None:
+                raise SER8ExecutionAuthorizationError(
+                    "CORE8 operational authorization must not be combined with research lifecycle artifacts"
+                )
+            try:
+                verify_core8_operational_candidate(operational_route, candidate)
+            except SER8ResearchRiskGateError as exc:
+                raise SER8ExecutionAuthorizationError(str(exc)) from exc
+            if (
+                evidence.research_hypothesis_id != operational_route.hypothesis_id
+                or evidence.research_hypothesis_family_id != operational_route.hypothesis_family_id
+                or evidence.research_eligibility_artifact_hash != operational_route.eligibility_hash
+                or evidence.hypothesis_tradeable_scope_hash != operational_route.scope_hash
+            ):
+                raise SER8ExecutionAuthorizationError(
+                    "CORE8 operational route does not match the risk-gate evidence lineage"
+                )
+            hypothesis_id = operational_route.hypothesis_id
+            hypothesis_family_id = operational_route.hypothesis_family_id
+            eligibility_hash = operational_route.eligibility_hash
+            scope_hash = operational_route.scope_hash
+        else:
+            if type(eligibility) is not ResearchEligibilityArtifactV1:
+                raise SER8ExecutionAuthorizationError("a genuine research eligibility artifact is required")
+            if type(scope) is not HypothesisTradeableScopeV1:
+                raise SER8ExecutionAuthorizationError("a genuine hypothesis tradeable scope is required")
+            if evidence.research_eligibility_artifact_hash != eligibility.artifact_hash:
+                raise SER8ExecutionAuthorizationError(
+                    "supplied eligibility artifact does not match the risk-gate evidence's own "
+                    "recorded eligibility artifact hash"
+                )
+            if evidence.hypothesis_tradeable_scope_hash != scope.scope_hash:
+                raise SER8ExecutionAuthorizationError(
+                    "supplied hypothesis tradeable scope does not match the risk-gate evidence's own "
+                    "recorded scope hash"
+                )
+            if (
+                scope.hypothesis_id != eligibility.hypothesis_id
+                or scope.hypothesis_family_id != eligibility.hypothesis_family_id
+                or scope.bound_hypothesis_content_hash != eligibility.bound_hypothesis_content_hash
+            ):
+                raise SER8ExecutionAuthorizationError(
+                    "supplied scope does not belong to the same hypothesis/family/content as the "
+                    "supplied eligibility artifact"
+                )
+
+            # 1-3: re-verify the eligibility/scope/candidate lineage fresh;
+            # never trust any caller-supplied object at face value.
+            fresh_eligibility = present_eligible_artifact(
+                eligibility.hypothesis_id, registry=self.registry, final_verdict=self.final_verdict
             )
+            if fresh_eligibility.artifact_hash != eligibility.artifact_hash:
+                raise SER8ExecutionAuthorizationError(
+                    "supplied eligibility artifact does not match a fresh, independent re-verification"
+                )
+            fresh_scope = bind_hypothesis_tradeable_scope(
+                eligibility.hypothesis_id, registry=self.registry, artifact_store=self.final_verdict.artifacts
+            )
+            if fresh_scope.scope_hash != scope.scope_hash:
+                raise SER8ExecutionAuthorizationError(
+                    "supplied hypothesis tradeable scope does not match a fresh, independent re-derivation"
+                )
+            if not verify_live_candidate_matches_scope(scope, candidate):
+                raise SER8ExecutionAuthorizationError(
+                    "live candidate no longer matches the hypothesis tradeable scope on re-verification"
+                )
+            hypothesis_id = eligibility.hypothesis_id
+            hypothesis_family_id = eligibility.hypothesis_family_id
+            eligibility_hash = eligibility.artifact_hash
+            scope_hash = scope.scope_hash
 
         # 5: evidence <-> decision pairing.
         if evidence.risk_decision_id != decision.decision_id or evidence.risk_decision_state != decision.state:
             raise SER8ExecutionAuthorizationError(
                 "risk-gate evidence does not belong to the exact supplied RiskDecision"
-            )
-
-        # 1-3: re-verify the eligibility/scope/candidate lineage fresh;
-        # never trust any caller-supplied object at face value.
-        fresh_eligibility = present_eligible_artifact(
-            eligibility.hypothesis_id, registry=self.registry, final_verdict=self.final_verdict
-        )
-        if fresh_eligibility.artifact_hash != eligibility.artifact_hash:
-            raise SER8ExecutionAuthorizationError(
-                "supplied eligibility artifact does not match a fresh, independent re-verification"
-            )
-        fresh_scope = bind_hypothesis_tradeable_scope(
-            eligibility.hypothesis_id, registry=self.registry, artifact_store=self.final_verdict.artifacts
-        )
-        if fresh_scope.scope_hash != scope.scope_hash:
-            raise SER8ExecutionAuthorizationError(
-                "supplied hypothesis tradeable scope does not match a fresh, independent re-derivation"
-            )
-        if not verify_live_candidate_matches_scope(scope, candidate):
-            raise SER8ExecutionAuthorizationError(
-                "live candidate no longer matches the hypothesis tradeable scope on re-verification"
             )
 
         # 6: BLOCK never produces an authorization.
@@ -393,7 +431,7 @@ class SER8ExecutionAuthorizationControl:
                     WHERE hypothesis_id=? AND account_id=? AND expires_at > ?
                     ORDER BY authorized_at DESC LIMIT 1
                     """,
-                    (eligibility.hypothesis_id, evidence.account_id, authorized_at),
+                    (hypothesis_id, evidence.account_id, authorized_at),
                 ).fetchone()
                 if active is not None:
                     if active["approval_key_hash"] == approval_key_hash:
@@ -408,10 +446,10 @@ class SER8ExecutionAuthorizationControl:
                 authorization = ExecutionAuthorizationV1(
                     schema_version=SCHEMA_VERSION,
                     authorization_id=authorization_id,
-                    hypothesis_id=eligibility.hypothesis_id,
-                    hypothesis_family_id=eligibility.hypothesis_family_id,
-                    research_eligibility_artifact_hash=eligibility.artifact_hash,
-                    hypothesis_tradeable_scope_hash=scope.scope_hash,
+                    hypothesis_id=hypothesis_id,
+                    hypothesis_family_id=hypothesis_family_id,
+                    research_eligibility_artifact_hash=eligibility_hash,
+                    hypothesis_tradeable_scope_hash=scope_hash,
                     live_candidate_signal_id=candidate.signal_id,
                     risk_gate_evidence_hash=evidence.evidence_hash,
                     risk_decision_id=decision.decision_id,

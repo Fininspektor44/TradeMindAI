@@ -174,6 +174,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -238,12 +239,20 @@ from trademind.ser8_core8_market_only_policy import (  # noqa: E402
     verify_core8_market_only_execution,
 )
 from trademind.ser8_research_risk_gate import (  # noqa: E402
+    Core8OperationalRouteV1,
     SER8ResearchRiskGateError,
     evaluate_ser8_research_risk_gate,
+    resolve_core8_operational_route,
+    verify_core8_operational_candidate,
 )
 
 DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 DEFAULT_CLAIMANT_ID = "worker:ser8-autonomous-demo-execution"
+
+
+def _utc_now() -> datetime:
+    """Fresh timezone-aware cycle clock; factored for deterministic tests."""
+    return datetime.now(timezone.utc)
 
 
 class _AlreadyRunningError(RuntimeError):
@@ -264,16 +273,63 @@ class _LockFile:
         self.path = path
         self._acquired = False
 
-    def acquire(self) -> None:
+    @staticmethod
+    def _owner_is_running(pid: int) -> bool:
+        if pid <= 0:
+            return True
         try:
-            handle = self.path.open("x", encoding="utf-8")
-        except FileExistsError as exc:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            # Unknown platform-specific failure: fail closed, never steal.
+            return True
+        return True
+
+    def _remove_dead_owner(self) -> bool:
+        try:
+            content = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            raise _AlreadyRunningError(f"existing lock file cannot be verified: {self.path}: {exc}") from exc
+        first = content.splitlines()[0] if content.splitlines() else ""
+        fields = dict(
+            item.split("=", 1) for item in first.split() if "=" in item
+        )
+        try:
+            pid = int(fields["pid"])
+            datetime.fromisoformat(fields["started_at"])
+        except (KeyError, TypeError, ValueError) as exc:
             raise _AlreadyRunningError(
-                f"lock file already exists: {self.path} -- another autonomous execution process may "
-                "already be running; if you are certain none is, remove this file by hand and retry"
+                f"existing lock file has no verifiable pid/start timestamp: {self.path}; refusing to steal it"
             ) from exc
+        if self._owner_is_running(pid):
+            return False
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+
+    def acquire(self) -> None:
+        for _attempt in range(2):
+            try:
+                handle = self.path.open("x", encoding="utf-8")
+                break
+            except FileExistsError as exc:
+                if not self._remove_dead_owner():
+                    raise _AlreadyRunningError(
+                        f"lock file belongs to a running autonomous execution process: {self.path}"
+                    ) from exc
+        else:
+            raise _AlreadyRunningError(
+                f"lock file contention persisted while recovering a dead owner: {self.path}"
+            )
         with handle:
-            handle.write(f"pid={__import__('os').getpid()} started_at={datetime.now(timezone.utc).isoformat()}\n")
+            handle.write(f"pid={os.getpid()} started_at={datetime.now(timezone.utc).isoformat()}\n")
         self._acquired = True
 
     def release(self) -> None:
@@ -610,9 +666,29 @@ def _group_ambiguous_hypotheses(scopes: dict[str, object]) -> set[str]:
     return ambiguous_hypothesis_ids
 
 
+def _select_core8_operational_candidate(
+    candidates: dict[str, object], route: Core8OperationalRouteV1,
+):
+    """Select the newest genuine journal candidate for the exact route symbol.
+
+    Candidate proof is verified separately immediately after selection, so
+    a newer wrong-family or wrong-provenance record blocks rather than
+    silently falling back to an older candidate.
+    """
+    matching = [candidate for candidate in candidates.values() if candidate.symbol == route.symbol]
+    if not matching:
+        raise pipeline_module.PipelineGapError(
+            [f"no journaled SignalCandidate matches CORE8 operational route {route.route_id!r}"]
+        )
+    matching.sort(key=lambda item: item.observed_at, reverse=True)
+    return matching[0]
+
+
 def run_one_cycle(args: argparse.Namespace, *, now: datetime | None = None) -> CycleSummary:
-    now = now or datetime.now(timezone.utc)
     prepared = _prepare_cycle_inputs(args)
+    # Capture after input discovery: a concurrent EA refresh that lands while
+    # discovery runs must not be compared with an older, frozen cycle clock.
+    now = now or _utc_now()
     return _run_cycle_for_hypothesis(
         args, args.hypothesis_id, pipeline=prepared.pipeline, inputs=prepared.inputs,
         deals_csv=prepared.deals_csv, orders_csv=prepared.orders_csv, now=now,
@@ -635,20 +711,26 @@ def _run_cycle_for_hypothesis(
     there is exactly one place this logic lives."""
     summary = CycleSummary(account=args.account)
 
-    # This worker NEVER advances the research lifecycle -- the hypothesis
-    # must already be ACCEPTED (a prior, separate, human-reviewed action)
-    # before autonomous execution runs. present_eligible_artifact fails
-    # closed for anything else.
-    eligibility = present_eligible_artifact(
-        hypothesis_id, registry=pipeline.registry, final_verdict=pipeline.final_verdict
-    )
-    scope = bind_hypothesis_tradeable_scope(
-        hypothesis_id, registry=pipeline.registry, artifact_store=pipeline.artifacts
-    )
-
+    operational_route = resolve_core8_operational_route(hypothesis_id)
     candidates = pipeline_module.load_candidates(inputs.candidates_path)
     try:
-        candidate = pipeline_module.select_candidate(candidates, scope=scope, signal_id=None)
+        if operational_route is not None:
+            # Direct-connect bypasses only the two legacy research lookups.
+            # Selection still consumes an already-journaled candidate; no
+            # candidate, signal, SL, TP, or execution geometry is invented.
+            eligibility = None
+            scope = None
+            candidate = _select_core8_operational_candidate(candidates, operational_route)
+        else:
+            # Legacy behavior is unchanged: a normal hypothesis must still
+            # be ACCEPTED and bind a genuine tradeable scope.
+            eligibility = present_eligible_artifact(
+                hypothesis_id, registry=pipeline.registry, final_verdict=pipeline.final_verdict
+            )
+            scope = bind_hypothesis_tradeable_scope(
+                hypothesis_id, registry=pipeline.registry, artifact_store=pipeline.artifacts
+            )
+            candidate = pipeline_module.select_candidate(candidates, scope=scope, signal_id=None)
     except pipeline_module.PipelineGapError:
         summary.cycle_status = "NO_ELIGIBLE_CANDIDATE"
         return summary
@@ -732,11 +814,13 @@ def _run_cycle_for_hypothesis(
     #     MARKET+LIMIT+LIMIT geometry is refused rather than executed, so
     #     only candidates generated under this policy can ever trade.
     try:
+        if operational_route is not None:
+            verify_core8_operational_candidate(operational_route, candidate)
         verify_core8_market_only_execution(
             symbol=candidate.symbol,
             order_types=[entry.order_type for entry in candidate.plan.entries],
         )
-    except SER8Core8PolicyError as exc:
+    except (SER8Core8PolicyError, SER8ResearchRiskGateError) as exc:
         summary.candidate_status = "CORE8_MARKET_ONLY_POLICY_BLOCKED"
         summary.cycle_status = "CORE8_MARKET_ONLY_POLICY_BLOCKED"
         summary.risk_block_reason = str(exc)
@@ -911,6 +995,7 @@ def _run_cycle_for_hypothesis(
         account_csv=inputs.account_csv, positions_csv=inputs.positions_csv, symbols_csv=inputs.symbols_csv,
         profile=profile, correlations=inputs.correlations_path, requested_risk_pct=args.requested_risk_pct,
         pending_reservations=pending_reservations,
+        operational_route=operational_route,
         now=now,
     )
     summary.risk_state = result.decision.state
@@ -950,7 +1035,9 @@ def _run_cycle_for_hypothesis(
     summary.candidate_status = "ELIGIBLE_ALLOW"
 
     try:
-        authorization = authorization_control.authorize(eligibility, scope, candidate, result, now=now)
+        authorization = authorization_control.authorize(
+            eligibility, scope, candidate, result, operational_route=operational_route, now=now
+        )
     except SER8ExecutionAuthorizationConflict as exc:
         summary.cycle_status = "FAIL_CLOSED_AUTHORIZATION_CONFLICT"
         summary.risk_block_reason = str(exc)
@@ -1059,6 +1146,14 @@ def _resolve_scope_for_ambiguity_check(
     whole multi-hypothesis cycle."""
     summary = CycleSummary(account="-")
     try:
+        operational_route = resolve_core8_operational_route(hypothesis_id)
+    except SER8ResearchRiskGateError as exc:
+        summary.cycle_status = "FAIL_CLOSED_INVALID_CORE8_OPERATIONAL_ROUTE"
+        summary.risk_block_reason = str(exc)
+        return None, summary
+    if operational_route is not None:
+        return operational_route, None
+    try:
         present_eligible_artifact(hypothesis_id, registry=pipeline.registry, final_verdict=pipeline.final_verdict)
     except ResearchEligibilityError as exc:
         summary.cycle_status = "FAIL_CLOSED_NOT_ACCEPTED"
@@ -1124,7 +1219,6 @@ def run_one_cycle_for_hypotheses(
     fewer, never more, and never raises for an individual hypothesis's
     own failure -- every failure mode is reported as that hypothesis's
     own ``cycle_status``."""
-    now = now or datetime.now(timezone.utc)
     prepared = _prepare_cycle_inputs(args)
 
     scopes: dict[str, object] = {}
@@ -1169,9 +1263,15 @@ def run_one_cycle_for_hypotheses(
         # does not block fresh candidate B" applies to failures, not only
         # to stale candidates.
         try:
+            # A transport wait for an earlier symbol can last up to 60s while
+            # the unified EA continues refreshing MT5 snapshots. Use a fresh
+            # aware UTC clock for each hypothesis so those genuinely newer
+            # snapshots are never mislabeled "in the future". An explicit
+            # ``now`` remains deterministic for tests/audits.
+            hypothesis_now = now or _utc_now()
             summaries[hypothesis_id] = _run_cycle_for_hypothesis(
                 args, hypothesis_id, pipeline=prepared.pipeline, inputs=prepared.inputs,
-                deals_csv=prepared.deals_csv, orders_csv=prepared.orders_csv, now=now,
+                deals_csv=prepared.deals_csv, orders_csv=prepared.orders_csv, now=hypothesis_now,
             )
         except (
             ResearchEligibilityError, HypothesisTradeableScopeError, SER8ResearchRiskGateError,

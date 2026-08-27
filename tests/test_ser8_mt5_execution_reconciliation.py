@@ -16,6 +16,7 @@ modules).
 
 from __future__ import annotations
 
+import csv
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -675,4 +676,65 @@ def test_broker_accept_local_receipt_crash_recovers_unknown_once_by_request_iden
     )
     assert again.unknown_legs_seen == 0
     assert control.get_leg_receipt(leg_id).order_ticket == "333"
+    assert control.transport.calls == []
+
+
+def test_unknown_recovers_from_exact_late_executor_result_without_resend(tmp_path: Path) -> None:
+    control, _ = _control(tmp_path)
+    leg_id = _seed_leg(
+        control, claim_id="EAC-late-result", entry_index=1, total_legs=1,
+        order_ticket="", order_type="MARKET", result_state="UNKNOWN",
+        symbol="EURJPY", price=185.664116848, volume=0.47,
+    )
+    orders_csv = tmp_path / "orders.csv"
+    deals_csv = tmp_path / "deals.csv"
+    result_csv = tmp_path / f"ser8_demo_order_result_{ACCOUNT}.csv"
+    _write_orders_csv(orders_csv, [])
+    _write_deals_csv(deals_csv, [])
+    with result_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[
+            "claim_id", "demo_account_id", "symbol", "retcode", "retcode_description",
+            "order_ticket", "deal_ticket", "position_ticket", "filled_volume", "filled_price",
+            "broker_send_performed",
+        ])
+        writer.writeheader()
+        writer.writerow({
+            "claim_id": leg_id, "demo_account_id": ACCOUNT, "symbol": "EURJPY",
+            "retcode": "10009", "retcode_description": "Request completed",
+            "order_ticket": "881", "deal_ticket": "882", "position_ticket": "883",
+            "filled_volume": "0.47", "filled_price": "185.70", "broker_send_performed": "1",
+        })
+
+    result = run_reconciliation_cycle(
+        control, account=ACCOUNT, orders_csv=orders_csv, deals_csv=deals_csv,
+        result_csv=result_csv, now=NOW,
+    )
+    receipt = control.get_leg_receipt(leg_id)
+    assert result.unknown_legs_seen == 1
+    assert result.unknown_recovered == 1
+    assert result.newly_filled == 1
+    assert receipt.result_state == "FILLED"
+    assert receipt.order_ticket == "881"
+    assert receipt.broker_send_performed is True
+    assert control.transport.calls == []
+
+
+def test_unknown_without_executor_or_broker_evidence_remains_ambiguous(tmp_path: Path) -> None:
+    control, _ = _control(tmp_path)
+    leg_id = _seed_leg(
+        control, claim_id="EAC-no-evidence", entry_index=1, total_legs=1,
+        order_ticket="", order_type="MARKET", result_state="UNKNOWN", symbol="EURJPY",
+    )
+    orders_csv = tmp_path / "orders.csv"
+    deals_csv = tmp_path / "deals.csv"
+    _write_orders_csv(orders_csv, [])
+    _write_deals_csv(deals_csv, [])
+
+    result = run_reconciliation_cycle(
+        control, account=ACCOUNT, orders_csv=orders_csv, deals_csv=deals_csv,
+        result_csv=tmp_path / "missing-results.csv", now=NOW,
+    )
+    assert result.unknown_recovered == 0
+    assert result.ambiguous == 1
+    assert control.get_leg_receipt(leg_id).result_state == "UNKNOWN"
     assert control.transport.calls == []

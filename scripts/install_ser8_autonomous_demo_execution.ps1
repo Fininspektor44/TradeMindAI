@@ -14,14 +14,38 @@ param(
     [string]$DatabasePath = ".\data\ser8_registry.db",
 
     [Parameter(Mandatory=$false)]
-    [string]$HypothesisId = "rpi-v1:sha256:205b5260711f7578a59cef2feea59550b777b3df0956ffd192076b37c4e5866d:0",
+    [string]$HypothesisId = "",
 
     # SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1: see
     # run_ser8_autonomous_demo_execution.ps1's own comment on this exact
     # same parameter. Empty by default -- the proven single-hypothesis
     # deployment above ($HypothesisId) is completely unaffected.
     [Parameter(Mandatory=$false)]
-    [string[]]$HypothesisIds = @(),
+    [string[]]$HypothesisIds = @(
+        "core8-op:CHFJPY",
+        "core8-op:EURJPY",
+        "core8-op:EURNZD",
+        "core8-op:GBPAUD",
+        "core8-op:GBPNZD",
+        "core8-op:NZDCAD",
+        "core8-op:NZDCHF",
+        "core8-op:USDJPY"
+    ),
+
+    [Parameter(Mandatory=$false)]
+    [string]$MarketDataAccount = "77053345",
+
+    [Parameter(Mandatory=$false)]
+    [int]$ServerUTCOffsetHours = 3,
+
+    [Parameter(Mandatory=$false)]
+    [string]$VolumeSourceDir = "",
+
+    [Parameter(Mandatory=$false)]
+    [string]$CommonFilesRoot = "",
+
+    [Parameter(Mandatory=$false)]
+    [string]$CanonicalVolume = ".\data\volume_v1_4\volume_bars.csv",
 
     [Parameter(Mandatory=$false)]
     [string]$Account = "67206924",
@@ -33,7 +57,7 @@ param(
     [string]$RuntimeRoot = ".\data\live_signal_runtime_ecN_77053345",
 
     [Parameter(Mandatory=$false)]
-    [string]$Mt5ExportDir = ".\data\mt5",
+    [string]$Mt5ExportDir = "",
 
     [Parameter(Mandatory=$false)]
     [string]$SealedHoldoutPath = ".\data\ser8_bootstrap_datasets\9aac0c46f54e51df3c04c9dc9a51ce906da501ed7c7fd9b9ad1ac1055b582a05.final-holdout.sealed.json",
@@ -45,7 +69,7 @@ param(
     [string]$RiskProfile = ".\config\risk_profiles\ser8_supervised_demo_v1.json",
 
     [Parameter(Mandatory=$false)]
-    [string]$CommonFilesDir = ".\data\mt5_common",
+    [string]$CommonFilesDir = "",
 
     [switch]$DryRun,
 
@@ -55,6 +79,21 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+
+$defaultCommonFilesRoot = Join-Path $env:APPDATA "MetaQuotes\Terminal\Common\Files\TradeMindAI"
+$defaultVolumeSourceDir = Join-Path $env:APPDATA "MetaQuotes\Terminal\Common\Files\TradeMindAI_Volume_v1_4"
+if ([string]::IsNullOrWhiteSpace($VolumeSourceDir)) {
+    $VolumeSourceDir = $defaultVolumeSourceDir
+}
+if ([string]::IsNullOrWhiteSpace($CommonFilesRoot)) {
+    $CommonFilesRoot = $defaultCommonFilesRoot
+}
+if ([string]::IsNullOrWhiteSpace($Mt5ExportDir)) {
+    $Mt5ExportDir = $defaultCommonFilesRoot
+}
+if ([string]::IsNullOrWhiteSpace($CommonFilesDir)) {
+    $CommonFilesDir = $defaultCommonFilesRoot
+}
 
 if ($Remove) {
     try {
@@ -91,6 +130,9 @@ $allowlistArgument = ($DemoAccountAllowlist | ForEach-Object { "`"$_`"" }) -join
 $taskArguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watchScript`" " +
     "-DatabasePath `"$DatabasePath`" -HypothesisId `"$HypothesisId`" -Account `"$Account`" " +
     "-DemoAccountAllowlist $allowlistArgument -RuntimeRoot `"$RuntimeRoot`" -Mt5ExportDir `"$Mt5ExportDir`" " +
+    "-MarketDataAccount `"$MarketDataAccount`" -ServerUTCOffsetHours $ServerUTCOffsetHours " +
+    "-VolumeSourceDir `"$VolumeSourceDir`" -CommonFilesRoot `"$CommonFilesRoot`" " +
+    "-CanonicalVolume `"$CanonicalVolume`" " +
     "-SealedHoldoutPath `"$SealedHoldoutPath`" " +
     "-RiskProfile `"$RiskProfile`" -CommonFilesDir `"$CommonFilesDir`""
 # -HoldoutPrimaryMetric is irrelevant to autonomous execution of an
@@ -118,6 +160,7 @@ $logPath = Join-Path $repo "data\ser8_autonomous_execution\logs\autonomous_execu
 
 Write-Host "Installing scheduled task: $TaskName" -ForegroundColor Cyan
 Write-Host "TaskName: $TaskName"
+Write-Host "MarketDataAccount: $MarketDataAccount"
 Write-Host "Account: $Account"
 Write-Host "RuntimeRoot: $RuntimeRoot"
 Write-Host "RiskProfile: $RiskProfile"
@@ -142,6 +185,19 @@ $currentUser = "$env:USERDOMAIN\$env:USERNAME"
 $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType S4U -RunLevel Highest
 
 try {
+    # This task now owns the complete producer -> execution -> reconciliation
+    # cadence. Disable the former independently-scheduled producer/reconciler
+    # so they cannot overlap this sequence. Missing legacy tasks are harmless.
+    foreach ($legacyTaskName in @(
+        "TradeMindAI-v1.32-ECN-LiveSignalRuntime",
+        "TradeMindAI-v1.21-LiveSignalRuntime",
+        "TradeMindAI-SER8-MT5-Reconciliation"
+    )) {
+        $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+        if ($null -ne $legacyTask) {
+            Disable-ScheduledTask -TaskName $legacyTaskName -ErrorAction Stop | Out-Null
+        }
+    }
     # -Force safely replaces any existing task of the same name in one step.
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction Stop | Out-Null
 }
@@ -157,10 +213,8 @@ catch {
 }
 
 Write-Host "`nInstalled: $TaskName" -ForegroundColor Green
-Write-Host "Each run is one bounded cycle (--once) guarded by both a Windows Global Mutex and an"
-Write-Host "internal lock file -- overlapping runs are always skipped, never queued."
+Write-Host "Each run is one bounded producer -> execution -> reconciliation cycle guarded by one"
+Write-Host "Windows Global Mutex plus internal worker locks -- overlapping runs are skipped."
 Write-Host "This task ONLY produces authorized execution requests; the ONLY component that ever"
 Write-Host "sends a real order to the broker is the unified MT5 executor EA (TradeMind_Demo_Order_Executor_v1.mq5)."
-Write-Host "Coexists with TradeMindAI-v1.32-ECN-LiveSignalRuntime (candidate generation) and"
-Write-Host "TradeMindAI-SER8-MT5-Reconciliation (broker-truth reconciliation) -- three separate tasks,"
-Write-Host "three separate responsibilities."
+Write-Host "Former independently-scheduled producer/reconciliation tasks are disabled to prevent overlap."

@@ -48,7 +48,7 @@ def _mql5_header_fields(body: str) -> list[str]:
 
 def test_version_includes_or_supersedes_profit_export_v1_5() -> None:
     source = _source()
-    assert '#property version   "1.6"' in source
+    assert '#property version   "1.7"' in source
     assert "v1.5 adds ONE new read-only column" in source
 
 

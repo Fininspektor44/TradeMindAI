@@ -8,7 +8,7 @@ param(
     [string]$DatabasePath = ".\data\ser8_registry.db",
 
     [Parameter(Mandatory=$false)]
-    [string]$HypothesisId = "rpi-v1:sha256:205b5260711f7578a59cef2feea59550b777b3df0956ffd192076b37c4e5866d:0",
+    [string]$HypothesisId = "",
 
     # SER8 FULL SYMBOL UNIVERSE + RESEARCH RANKING V1: an explicitly
     # configured SET of ACCEPTED hypotheses for the generalized, symbol-
@@ -18,7 +18,31 @@ param(
     # exclusive with $HypothesisId, exactly like the Python CLI's own
     # --hypothesis-id / --hypothesis-ids.
     [Parameter(Mandatory=$false)]
-    [string[]]$HypothesisIds = @(),
+    [string[]]$HypothesisIds = @(
+        "core8-op:CHFJPY",
+        "core8-op:EURJPY",
+        "core8-op:EURNZD",
+        "core8-op:GBPAUD",
+        "core8-op:GBPNZD",
+        "core8-op:NZDCAD",
+        "core8-op:NZDCHF",
+        "core8-op:USDJPY"
+    ),
+
+    [Parameter(Mandatory=$false)]
+    [string]$MarketDataAccount = "77053345",
+
+    [Parameter(Mandatory=$false)]
+    [int]$ServerUTCOffsetHours = 3,
+
+    [Parameter(Mandatory=$false)]
+    [string]$VolumeSourceDir = "",
+
+    [Parameter(Mandatory=$false)]
+    [string]$CommonFilesRoot = "",
+
+    [Parameter(Mandatory=$false)]
+    [string]$CanonicalVolume = ".\data\volume_v1_4\volume_bars.csv",
 
     [Parameter(Mandatory=$false)]
     [string]$Account = "67206924",
@@ -30,7 +54,7 @@ param(
     [string]$RuntimeRoot = ".\data\live_signal_runtime_ecN_77053345",
 
     [Parameter(Mandatory=$false)]
-    [string]$Mt5ExportDir = ".\data\mt5",
+    [string]$Mt5ExportDir = "",
 
     [Parameter(Mandatory=$false)]
     [string]$SealedHoldoutPath = ".\data\ser8_bootstrap_datasets\9aac0c46f54e51df3c04c9dc9a51ce906da501ed7c7fd9b9ad1ac1055b582a05.final-holdout.sealed.json",
@@ -42,7 +66,7 @@ param(
     [string]$RiskProfile = ".\config\risk_profiles\ser8_supervised_demo_v1.json",
 
     [Parameter(Mandatory=$false)]
-    [string]$CommonFilesDir = ".\data\mt5_common",
+    [string]$CommonFilesDir = "",
 
     [switch]$DryRun
 )
@@ -50,6 +74,21 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
+
+$defaultCommonFilesRoot = Join-Path $env:APPDATA "MetaQuotes\Terminal\Common\Files\TradeMindAI"
+$defaultVolumeSourceDir = Join-Path $env:APPDATA "MetaQuotes\Terminal\Common\Files\TradeMindAI_Volume_v1_4"
+if ([string]::IsNullOrWhiteSpace($VolumeSourceDir)) {
+    $VolumeSourceDir = $defaultVolumeSourceDir
+}
+if ([string]::IsNullOrWhiteSpace($CommonFilesRoot)) {
+    $CommonFilesRoot = $defaultCommonFilesRoot
+}
+if ([string]::IsNullOrWhiteSpace($Mt5ExportDir)) {
+    $Mt5ExportDir = $defaultCommonFilesRoot
+}
+if ([string]::IsNullOrWhiteSpace($CommonFilesDir)) {
+    $CommonFilesDir = $defaultCommonFilesRoot
+}
 
 # Single-instance guard -- the SAME Global Mutex pattern
 # run_ser8_mt5_reconciliation.ps1 / run_v121_live_signal_watch.ps1 already
@@ -76,6 +115,21 @@ if (-not (Test-Path $python)) {
 $script = Join-Path $PSScriptRoot "run_ser8_autonomous_demo_execution.py"
 
 try {
+    # One mutex covers the complete operational chain. The producer is the
+    # existing v1.22 runtime (canonical volume collector -> authoritative OTE
+    # observations -> candidates.jsonl), followed by the existing autonomous
+    # worker and the existing read-only reconciliation entrypoint. A slow
+    # transport therefore cannot overlap the next producer/execution tick.
+    $producerScript = Join-Path $PSScriptRoot "run_v121_live_signal_runtime.ps1"
+    & $producerScript `
+        -Login $MarketDataAccount `
+        -VolumeSourceDir $VolumeSourceDir `
+        -CommonFilesRoot $CommonFilesRoot `
+        -CanonicalVolume $CanonicalVolume `
+        -RuntimeRoot $RuntimeRoot `
+        -ServerUTCOffsetHours $ServerUTCOffsetHours 2>&1 |
+        Tee-Object -FilePath $logPath -Append
+
     $usingMultiHypothesis = $HypothesisIds.Count -gt 0
     $started = Get-Date
     if ($usingMultiHypothesis) {
@@ -147,19 +201,40 @@ try {
     }
 
     & $python @arguments 2>&1 | Tee-Object -FilePath $logPath -Append
-    if ($LASTEXITCODE -eq 3) {
+    $executionExitCode = $LASTEXITCODE
+    if ($executionExitCode -eq 3) {
         # Lock file contention -- another instance is genuinely running;
         # not an error worth alarming on, the mutex above already proves
         # this shouldn't normally happen.
         Write-Host "Autonomous execution cycle skipped: lock file busy."
     }
-    elseif ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) {
+    elseif ($executionExitCode -ne 0 -and $executionExitCode -ne 1) {
         # Exit code 1 means the cycle ran but reported a non-fatal,
         # self-healing status (e.g. an authorization/claim conflict that
         # clears on its own once the existing TTL expires, or a
         # PENDING/PARTIAL execution state awaiting reconciliation) --
         # expected, non-fatal. Anything else is a genuine failure.
-        throw "SER8 autonomous demo execution returned exit code $LASTEXITCODE"
+        throw "SER8 autonomous demo execution returned exit code $executionExitCode"
+    }
+
+    $reconciliationScript = Join-Path $PSScriptRoot "reconcile_ser8_mt5_execution.py"
+    $reconciliationArguments = @(
+        $reconciliationScript,
+        "--db", $DatabasePath,
+        "--account", $Account,
+        "--mt5-export-dir", $Mt5ExportDir,
+        "--once"
+    )
+    if ($DryRun) {
+        $reconciliationArguments += "--dry-run"
+    }
+    & $python @reconciliationArguments 2>&1 | Tee-Object -FilePath $logPath -Append
+    $reconciliationExitCode = $LASTEXITCODE
+    if ($reconciliationExitCode -eq 3) {
+        Write-Host "Reconciliation cycle skipped: lock file busy."
+    }
+    elseif ($reconciliationExitCode -ne 0 -and $reconciliationExitCode -ne 1) {
+        throw "SER8 MT5 reconciliation returned exit code $reconciliationExitCode"
     }
 
     $finished = Get-Date
